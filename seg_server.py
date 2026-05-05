@@ -6,40 +6,45 @@ Flask server for MIT App Inventor image processing pipeline.
 Routes:
   GET  /health                   — health check
   POST /segment                  — remove background (rembg)
-  POST /classify                 — identify object + infer rigging hints (Gemini)
-  POST /augment_image?prompt=... — edit image via fal.ai
-  POST /rig?type=bird            — full pipeline: Meshy → rig.py → rigged GLB URL
- 
+  POST /classify                 — identify object + infer rigging hints
+  POST /augment_image?tag=...    — edit image via fal.ai
+  POST /rig                      — full pipeline: Meshy → rig.py → rigged GLB URL
+  GET  /gallery?user_id=...      — list user's models from model_store
+  GET  /gallery_page?user_id=... — serve gallery HTML page
+  GET  /gallery_data?user_id=... — gallery records as JSON for HTML page
 
 Pipeline:
   1. User takes photo
   2. POST /segment               → remove background, user approves clean subject
-  3. POST /classify?tag=...      → Gemini analyzes segmented image + optional tag
-                                   tag has two jobs:
-                                     identity:   "bicycle" — what it is
-                                     descriptor: "rolling" — how it moves
+  3. POST /classify?tag=...      → vision model analyzes segmented image
   4. if needs_augmentation
-       POST /augment_image       → add wings/elements, user chooses original or augmented
-  
-   5. POST /rig                   → Meshy 3D + skeleton → rigged GLB URL for ModelNode
- 
+       POST /augment_image       → add wings/elements, user chooses result
+  5. POST /rig                   → Meshy 3D + skeleton → rigged GLB
 
-Requirements:
-  pip install flask rembg pillow requests fal-client google-genai
+File naming convention — everything keyed on classify_id:
+  {classify_id}_segmented.png
+  {classify_id}_mesh.glb / .usdz
+  {classify_id}_decimated.glb
+  {classify_id}_rigged.glb
+  {classify_id}_viz.glb
+  {classify_id}_skeleton.json
 
 Environment variables:
-  GEMINI_API_KEY  — free at aistudio.google.com
-  FAL_KEY         — get at fal.ai
-  MESHY_API_KEY   — get at meshy.ai (paid)
+  GEMINI_API_KEY, CLAUDE_API_KEY, OPENAI_API_KEY
+  FAL_KEY, MESHY_API_KEY
+  MODEL_STORE_BACKEND (tinydb|clouddb), RESULTS_DIR
 """
 
 import os
+from flask_cors import CORS
+
 import sys
 import io
 import base64
 import json
 import logging
 import time
+import uuid
 from flask import Flask, request, jsonify, send_file
 from werkzeug.exceptions import HTTPException, RequestEntityTooLarge
 from rembg import remove, new_session
@@ -48,55 +53,66 @@ import requests
 import urllib3
 import subprocess
 import threading
-from pathlib import Path
 import hashlib
 import numpy as np
 
-_rig_tasks = {}
+import utils
+import model_store
+
+# ── Init model store (once at startup) ────────────────────────────────────────
+model_store.init()
+
+_rig_tasks      = {}
 _classify_cache = {}
-_blender_lock = threading.Lock()
+_mesh_cache     = {}
+_blender_lock   = threading.Lock()
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-_mesh_cache    = {}
-
 HUMANOID_KEYWORDS = {'human', 'person', 'character', 'humanoid', 'man',
-                             'woman', 'boy', 'girl', 'robot', 'alien', 'zombie',
-                             'totoro', 'creature', 'figure', 'monster'}
-                             
-VEHICLE_KEYWORDS = {'car', 'vehicle', 'wheels', 'truck', 'auto', 'bus', 'bike', 'motorcycle', 'van'}
+                     'woman', 'boy', 'girl', 'robot', 'alien', 'zombie',
+                     'totoro', 'creature', 'figure', 'monster'}
 
-# ── App setup ─────────────────────────────────────────────────────────────────
+VEHICLE_KEYWORDS = {'car', 'vehicle', 'wheels', 'truck', 'auto', 'bus',
+                    'bike', 'motorcycle', 'van'}
+
+# ── App setup ──────────────────────────────────────────────────────────────────
 RESULTS_DIR = "results"
 app = Flask(__name__)
+CORS(app)
 app.config['MAX_CONTENT_LENGTH'] = 64 * 1024 * 1024
 logging.basicConfig(level=logging.INFO)
 log = app.logger
 
 os.makedirs(RESULTS_DIR, exist_ok=True)
+dummy_user_id = "fb712dd7-73cc-43a5-8158-74f7cb8a7fb4"
 
-# ── Load rembg once at startup ────────────────────────────────────────────────
-
+# ── Load rembg once at startup ─────────────────────────────────────────────────
 log.info("Loading rembg model...")
 rembg_session = new_session("u2net")
 log.info("rembg ready.\n")
 
-
+# ── Cache files ────────────────────────────────────────────────────────────────
 CLASSIFY_CACHE_FILE = os.path.join(RESULTS_DIR, '_classify_cache.json')
+MESH_CACHE_FILE     = os.path.join(RESULTS_DIR, '_mesh_cache.json')
 
 def load_classify_cache():
     if os.path.exists(CLASSIFY_CACHE_FILE):
         try:
             with open(CLASSIFY_CACHE_FILE) as f:
                 data = json.load(f)
-            log.info(f"Loaded {len(data)} cached classifications from disk")
+            log.info(f"Loaded {len(data)} cached classifications")
             return data
         except Exception as e:
             log.warning(f"Could not load classify cache: {e}")
     return {}
-    
-    
-    
-MESH_CACHE_FILE = os.path.join(RESULTS_DIR, '_mesh_cache.json')
+
+def save_classify_cache():
+    try:
+        with open(CLASSIFY_CACHE_FILE, 'w') as f:
+            json.dump(_classify_cache, f, indent=2)
+    except Exception as e:
+        log.warning(f"Could not save classify cache: {e}")
 
 def load_mesh_cache():
     if os.path.exists(MESH_CACHE_FILE):
@@ -166,17 +182,13 @@ def segment():
         img_bytes = request.stream.read()
         if not img_bytes:
             return jsonify({'error': 'No data received'}), 400
-
-        log.info(f"Bytes received: {len(img_bytes)}")
         img    = Image.open(io.BytesIO(img_bytes)).convert('RGBA')
-        img    = resize_if_needed(img, max_size=1024)
+        img    = utils.resize_if_needed(img, max_size=1024)
         output = remove(img, session=rembg_session)
-
-        buf = io.BytesIO()
+        buf    = io.BytesIO()
         output.save(buf, format='PNG')
         buf.seek(0)
         return send_file(buf, mimetype='image/png')
-
     except HTTPException:
         raise
     except Exception as e:
@@ -185,113 +197,90 @@ def segment():
 
 
 def get_image_bytes() -> bytes:
-    """Read image from wherever App Inventor's PostFile puts it."""
-    # Raw bytes (curl --data-binary)
     data = request.stream.read()
     if data:
         return data
-    # Multipart form upload (App Inventor PostFile)
     if request.files:
-        f = next(iter(request.files.values()))
-        return f.read()
-    # form data body
+        return next(iter(request.files.values())).read()
     if request.data:
         return request.data
     return b''
 
+
+# ── fal.ai image editing ───────────────────────────────────────────────────────
+
+def edit_image_fal(img: Image.Image, prompt: str):
+    import fal_client
+    data_uri  = f"data:image/png;base64,{utils.img_to_b64(img)}"
+    log.info(f"fal.ai: {prompt[:80]}...")
+    result    = fal_client.subscribe(
+        "fal-ai/qwen-image-2/edit",
+        arguments={"prompt": prompt, "image_urls": [data_uri], "num_images": 2}
+    )
+    responseA = requests.get(result["images"][0]["url"], verify=False)
+    responseB = requests.get(result["images"][1]["url"], verify=False)
+    return (Image.open(io.BytesIO(responseA.content)).convert('RGB'),
+            Image.open(io.BytesIO(responseB.content)).convert('RGB'))
+
+
+# ── Classification ─────────────────────────────────────────────────────────────
+
 def classify_with_vision(img_bytes, mime_type, user_tag=None,
-                         mesh_bounds_size=None, requested_joints=None):  # ← add param
-    
-    import json
-    import time
+                         mesh_bounds_size=None, requested_joints=None):
     import re
-    import base64
-    import os
 
-    tag_context = f"\nThe user identified this as: '{user_tag}'." if user_tag else ""
-
-    # Resize BEFORE base64 encoding
     print(f"Original image size: {len(img_bytes)} bytes")
     img = Image.open(io.BytesIO(img_bytes))
-    print(f"Image dimensions: {img.size}")
-    
-    # Resize to fit Claude's 5MB limit
-    img = resize_if_needed(img, max_size=1024)
-    
-    # Re-encode to bytes
+    img = utils.resize_if_needed(img, max_size=1024)
     buf = io.BytesIO()
-    img.save(buf, format='PNG', optimize=True)  # optimize=True compresses better
+    img.save(buf, format='PNG', optimize=True)
     img_bytes = buf.getvalue()
-    
-    print(f"Resized image size: {len(img_bytes)} bytes")
-    
-    tag_context = f"\nThe user identified this as: '{user_tag}'." if user_tag else ""
+    print(f"Resized: {len(img_bytes)} bytes")
 
+    better_mime_type = utils.detect_mime_type(img_bytes)
+    tag_context      = f"\nThe user identified this as: '{user_tag}'." if user_tag else ""
 
-    better_mime_type = detect_mime_type(img_bytes)
-    MIN_JOINTS = 3
-    MAX_JOINTS = 16
+    MIN_JOINTS, MAX_JOINTS = 3, 16
     if requested_joints:
         try:
             requested_joints = max(MIN_JOINTS, min(MAX_JOINTS, int(requested_joints)))
         except (ValueError, TypeError):
-            requested_joints = None  # ignore bad input
+            requested_joints = None
+
     joints_instruction = (
-        f"\nYou MUST generate EXACTLY {requested_joints} joints in joint_hints. "
+        f"\nYou MUST generate EXACTLY {requested_joints} joints. "
         f"Set suggested_joints to {requested_joints}."
     ) if requested_joints else (
-        f"\nGenerate between {MIN_JOINTS} and {MAX_JOINTS} joints. "
-        f"Choose the count that best represents the object's articulation."
+        f"\nGenerate between {MIN_JOINTS} and {MAX_JOINTS} joints."
     )
-    
-    bounds_info = ""
-    if mesh_bounds_size:
-        bounds_info = (
-            f"\nMesh bounding box: {mesh_bounds_size:.3f} units. "
-            f"Scale keyframe values to max {mesh_bounds_size * 0.05:.4f} units."
-        )
-        
 
+    bounds_info = (f"\nMesh bounding box: {mesh_bounds_size:.3f} units."
+                   if mesh_bounds_size else "")
 
     tag_words = set((user_tag or '').lower().split('+'))
+    prompt    = (utils._build_vehicle_prompt()
+                 if tag_words & VEHICLE_KEYWORDS
+                 else utils._build_animal_prompt(tag_context, bounds_info,
+                                                 joints_instruction, requested_joints))
 
-    if tag_words & VEHICLE_KEYWORDS:  # set intersection — any keyword matches
-        prompt = VEHICLE_PROMPT
-    else:
-        prompt = animal_prompt
-    
     img_base64 = base64.b64encode(img_bytes).decode('utf-8')
 
-
-
-    # 🔴  CLAUDE
-    print("🔴 attempting Claude...")
-    result = _try_claude(img_base64, better_mime_type, prompt)
-    if result:
-        print("✅ Claude succeeded")
-        return result
-        
-    # 🔷 TRY GEMINI FIRST
-    print("🔷 Attempting Gemini...")
-    result = _try_gemini(img_bytes, better_mime_type, prompt)
-    if result:
-        print("✅ Gemini succeeded")
-        return result
-    # 🟠 FALLBACK TO OPENAI
-    print("🟠 Claude failed, attempting OpenAI...")
-    result = _try_openai(img_base64, better_mime_type, prompt)
-    if result:
-        print("✅ OpenAI succeeded")
-        return result
+    for label, fn, args in [
+        ("🔴 Claude",  _try_claude,  (img_base64, better_mime_type, prompt)),
+        ("🔷 Gemini",  _try_gemini,  (img_bytes,  better_mime_type, prompt)),
+        ("🟠 OpenAI",  _try_openai,  (img_base64, better_mime_type, prompt)),
+    ]:
+        print(f"{label} attempting...")
+        result = fn(*args)
+        if result:
+            print(f"✅ {label.split()[1]} succeeded")
+            return result
 
     raise RuntimeError("All vision APIs exhausted or unavailable")
 
+
 def _try_gemini(img_bytes: bytes, mime_type: str, prompt: str):
-    """Try Gemini models with retry logic"""
-    import os
-    import time
     import re
-    import json
     from google import genai
     from google.genai import types
 
@@ -567,99 +556,52 @@ def _try_openai(img_base64: str, mime_type: str, prompt: str):
                 if raw.startswith('```'):
                     raw = raw.split('\n', 1)[1].rsplit('```', 1)[0]
                 return json.loads(raw.strip())
-
-            except openai.RateLimitError as e:
-                if attempt == 0:
-                    print(f"  Rate limited, waiting 30s...")
-                    time.sleep(30)
-                else:
-                    raise
-
+            except openai.RateLimitError:
+                if attempt == 0: time.sleep(30)
+                else: raise
     except Exception as e:
         print(f"  ❌ OpenAI failed: {str(e)[:100]}")
-        return None
-        
-        
-def save_classify_cache():
-    try:
-        with open(CLASSIFY_CACHE_FILE, 'w') as f:
-            json.dump(_classify_cache, f, indent=2)
-    except Exception as e:
-        log.warning(f"Could not save classify cache: {e}")
-        
-        
+    return None
+
+
 @app.route('/classify', methods=['GET', 'POST'])
 def classify():
-    """
-    Step 2: Identify object + infer rigging using Gemini.
-    Receives the SEGMENTED image — clean subject, transparent background.
-
-    Accepts:
-      raw image bytes (segmented PNG from /segment)
-      optional ?tag=flying+bird
-
-    Returns JSON:
-      {
-        "object_type":        "glass bird figurine",
-        "base_object":        "bird",
-        "descriptor":         "flying",
-        "fantasy_elements":   "",
-        "suggested_joints":   8,
-        "joint_hints":        ["root", "spine", ...],
-        "movement_type":      "flaps wings and glides",
-        "needs_augmentation": true,
-        "augment_prompt":     "Extend wings outward as if in mid-flight...",
-        "notes":              "wings currently folded"
-      }
-
-    App Inventor:
-      if needs_augmentation = true
-        POST /augment_image?prompt=augment_prompt
-        show user original vs augmented, let them choose
-      else
-        POST /reconstruct directly
-    """
     if request.method == 'GET':
         return jsonify({'status': 'ok'}), 200
-
     try:
-        tag = request.args.get('tag', '').strip()
+        tag       = request.args.get('tag', '').strip()
         img_bytes = request.stream.read()
         if not img_bytes:
             return jsonify({'error': 'No data received'}), 400
-            
-        hash_input = img_bytes + tag.encode() # csb not yet + joints_str.encode()
-        img_hash   = hashlib.md5(hash_input).hexdigest()[:8]
 
-        # Check if we already have a result for this image
-        existing = next(
-            (cid for cid, data in _classify_cache.items()
-             if data.get('img_hash') == img_hash),
-            None
-        )
-        if existing:
-            log.info(f"Cache hit for image hash {img_hash}, reusing {existing}")
-            return jsonify({**_classify_cache[existing], 'classify_id': existing})
+        # classify_id is a stable hash of image + tag
+        classify_id = hashlib.md5(img_bytes + tag.encode()).hexdigest()[:8]
 
+        # Cache hit
+        if classify_id in _classify_cache:
+            log.info(f"Cache hit: classify_id={classify_id}")
+            return jsonify({**_classify_cache[classify_id], 'classify_id': classify_id})
 
-        user_tag      = request.args.get('tag', '').strip()
-        
-        requested_joints = request.args.get('joints', '').strip()  # ← add this
-        mime_type     = 'image/png' if img_bytes[:4] == b'\x89PNG' else 'image/jpeg'
+        mime_type        = 'image/png' if img_bytes[:4] == b'\x89PNG' else 'image/jpeg'
+        requested_joints = request.args.get('joints', '').strip()
 
-        info = classify_with_vision(img_bytes, mime_type, user_tag or None,
+        info = classify_with_vision(img_bytes, mime_type, tag or None,
                                     requested_joints=requested_joints or None)
 
-        import uuid
-        classify_id = str(uuid.uuid4())[:8]
-        _classify_cache[classify_id] = info
+        # Save segmented image with classify_id prefix (RGBA PNG, keeps transparency)
+        segmented_image_path = os.path.join(RESULTS_DIR, f"{classify_id}_segmented.png")
+        if not os.path.exists(segmented_image_path):
+            img = Image.open(io.BytesIO(img_bytes)).convert('RGBA')
+            img.save(segmented_image_path, format='PNG')
+            log.info(f"Segmented image saved: {segmented_image_path}")
 
-        info['img_hash'] = img_hash
-        classify_id = img_hash  # use hash as the ID for natural deduplication
+        info['classify_id']     = classify_id
+        info['segmented_image'] = segmented_image_path
+
         _classify_cache[classify_id] = info
         save_classify_cache()
 
-        return jsonify({**info, 'classify_id': classify_id})  # ← add classify_id to response
+        return jsonify({**info, 'classify_id': classify_id})
 
     except HTTPException:
         raise
@@ -690,10 +632,9 @@ def augment_image():
             return jsonify({'error': 'No image data'}), 400
 
         img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
-        img = resize_if_needed(img, max_size=1024)
+        img = utils.resize_if_needed(img, max_size=1024)
         resultA, resultB = edit_image_fal(img, prompt)
 
-        import uuid
         uid    = str(uuid.uuid4())[:8]
         path_a = os.path.join(RESULTS_DIR, f"aug_{uid}_a.png")
         path_b = os.path.join(RESULTS_DIR, f"aug_{uid}_b.png")
@@ -803,25 +744,21 @@ def reconstruct():
                 err = task.get("task_error", {}).get("message", "Unknown")
                 return jsonify({'error': f"Meshy failed: {err}"}), 500
 
-        return jsonify({'error': 'Meshy timed out after 5 minutes'}), 504
-
+        return jsonify({'error': 'Meshy timed out'}), 504
     except HTTPException:
         raise
     except Exception as e:
         log.error(f"/reconstruct error: {e}")
         return jsonify({'error': str(e)}), 500
-        
-# ── Rig pipeline helpers ──────────────────────────────────────────────────────
- 
-def meshy_reconstruct(img: Image.Image, object_type: str) -> str:
-    """
-    Submit image to Meshy, poll until done, return GLB URL.
-    Raises RuntimeError on failure or timeout.
-    """
+
+
+# ── Rig pipeline helpers ───────────────────────────────────────────────────────
+
+def meshy_reconstruct(img: Image.Image, object_type: str):
     meshy_key = os.environ.get('MESHY_API_KEY')
     if not meshy_key:
         raise RuntimeError("MESHY_API_KEY not set")
- 
+
     headers   = {"Authorization": f"Bearer {meshy_key}"}
     pose_mode = (
         "t-pose" if object_type in ['human', 'person', 'humanoid']
@@ -830,9 +767,8 @@ def meshy_reconstruct(img: Image.Image, object_type: str) -> str:
                               'fish', 'animal', 'creature'])
         else ""
     )
- 
     payload = {
-        "image_url":      f"data:image/png;base64,{img_to_b64(img)}",
+        "image_url":      f"data:image/png;base64,{utils.img_to_b64(img)}",
         "ai_model":       "meshy-6",
         "should_texture": True,
         "should_remesh":  False,
@@ -917,105 +853,25 @@ def run_skeleton_inference(glb_path: str, rigged_path: str,
 
 
 def run_blender_rig(glb_path: str, json_path: str, rigged_path: str):
-    with _blender_lock:  # only one Blender at a time
-        rig_script = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), 'rig.py'
-        )
-        
-        blender_bin = os.environ.get(
-            'BLENDER_PATH',
-            '/Applications/Blender.app/Contents/MacOS/blender'
-        )
-        cmd = [
-            blender_bin, '--background', '--python', rig_script,
-            '--',
-            '--from-json', os.path.abspath(json_path),
-            '--input',     os.path.abspath(glb_path),
-            '--output',    os.path.abspath(rigged_path),
-        ]
+    with _blender_lock:
+        blender_bin = os.environ.get('BLENDER_PATH',
+                                     '/Applications/Blender.app/Contents/MacOS/blender')
+        rig_script  = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'rig.py')
+        cmd = [blender_bin, '--background', '--python', rig_script, '--',
+               '--from-json', os.path.abspath(json_path),
+               '--input',     os.path.abspath(glb_path),
+               '--output',    os.path.abspath(rigged_path)]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         log.info(result.stdout[-2000:])
-        log.error(f"Blender stderr: {result.stderr[-1000:]}")  # ← add this
+        log.error(f"Blender stderr: {result.stderr[-1000:]}")
         if result.returncode != 0:
             raise RuntimeError(f"Blender failed: {result.stderr[-200:]}")
         if not os.path.exists(rigged_path):
-            raise RuntimeError(f"Rigged GLB not created. stdout: {result.stdout[-500:]}")
+            raise RuntimeError(f"Rigged GLB not created: {result.stdout[-500:]}")
 
-
-def snap_to_nearest_vertex(world_pos, verts, radius_fraction=0.15):
-    """Snap a position to the centroid of nearby mesh vertices."""
-    mesh_size = np.linalg.norm(verts.max(axis=0) - verts.min(axis=0))
-    radius    = mesh_size * radius_fraction
-    dists     = np.linalg.norm(verts - world_pos, axis=1)
-    nearby    = verts[dists < radius]
-    if len(nearby) >= 5:
-        return nearby.mean(axis=0)
-    # No nearby vertices — return nearest single vertex
-    return verts[np.argmin(dists)]
-    
-def snap_shoulder_to_elbow_attachment(world_pos, verts, elbow_direction='left'):
-    """Find the outermost edge of mesh where elbow branches."""
-    import numpy as np
-    
-    # Get vertices at similar Y height (shoulder height)
-    height_tolerance = 0.15  # ±15% of mesh height
-    mesh_size = np.linalg.norm(verts.max(axis=0) - verts.min(axis=0))
-    height_band = verts[np.abs(verts[:, 1] - world_pos[1]) < (mesh_size * height_tolerance)]
-    
-    if len(height_band) < 20:
-        height_band = verts  # fallback to all verts
-    
-    # Split by left/right and pick the EXTREME edge
-    verts_x_center = height_band[:, 0].mean()
-    
-    if elbow_direction == 'left':
-        # LEFT: pick the leftmost (minimum x)
-        attachment = height_band[np.argmin(height_band[:, 0])]
-        log.info(f"Left shoulder snapped to x={attachment[0]:.3f} (leftmost)")
-    else:
-        # RIGHT: pick the rightmost (maximum x)
-        attachment = height_band[np.argmax(height_band[:, 0])]
-        log.info(f"Right shoulder snapped to x={attachment[0]:.3f} (rightmost)")
-    
-    return attachment
-
-def find_extremity_vertex(world_pos, verts, body_part, name):
-    """Find vertex for terminal joint, respecting left/right for feet."""
-
-    mesh_size = np.linalg.norm(verts.max(axis=0) - verts.min(axis=0))
-    body_part = (body_part or '').lower()
-    is_left = 'left' in name.lower()
-
-    if body_part in ('leg', 'foot'):
-        # Split verts into left/right halves by x-coordinate
-        verts_center = verts[:, 0].mean()
-        if is_left:
-            candidates = verts[verts[:, 0] < verts_center]
-        else:
-            candidates = verts[verts[:, 0] > verts_center]
-        
-        if len(candidates) < 5:
-            candidates = verts
-        
-        # Find bottommost in the half
-        return candidates[np.argmin(candidates[:, 1])]
-
-    elif body_part in ('elbow', 'hand', 'wing'):
-        if is_left:
-            return verts[np.argmin(verts[:, 0])]  # leftmost
-        else:
-            return verts[np.argmax(verts[:, 0])]  # rightmost
-
-    elif body_part == 'head':
-        return verts[np.argmax(verts[:, 1])]  # topmost
-
-    else:
-        dists = np.linalg.norm(verts - world_pos, axis=1)
-        return verts[np.argmin(dists)]
 
 def joints_from_model(classify_data, glb_path):
     import trimesh
-    import numpy as np
 
     if not classify_data:
         return None, None, None
@@ -1048,14 +904,12 @@ def joints_from_model(classify_data, glb_path):
 
     # Build hierarchy
     hierarchy = []
-    skeleton = classify_data.get('skeleton', [])
-    for bone in skeleton:
-        parent_name = bone.get('parent')
-        child_name = bone.get('child')
-        if parent_name in name_to_idx and child_name in name_to_idx:
-            hierarchy.append((name_to_idx[parent_name], name_to_idx[child_name]))
+    for bone in classify_data.get('skeleton', []):
+        p = name_to_idx.get(bone.get('parent'))
+        c = name_to_idx.get(bone.get('child'))
+        if p is not None and c is not None:
+            hierarchy.append((p, c))
 
-    joints = [tuple(j) for j in joints]
     return joints, hierarchy, hint_objects
     
 def _decimate_mesh(input_path: str, output_path: str, ratio: float = 0.1):
@@ -1068,9 +922,6 @@ def _decimate_mesh(input_path: str, output_path: str, ratio: float = 0.1):
     )
 
     script = textwrap.dedent(f"""
-        import sys
-        sys.path.insert(0, '/tmp/blender_packages')
-        import numpy as np
         import bpy
         bpy.ops.wm.read_factory_settings(use_empty=True)
         bpy.ops.import_scene.gltf(filepath=r'{input_path}')
@@ -1084,49 +935,41 @@ def _decimate_mesh(input_path: str, output_path: str, ratio: float = 0.1):
         bpy.ops.export_scene.gltf(filepath=r'{output_path}', export_format='GLB')
         print('Decimate done')
     """).strip()
-
     script_file = tempfile.mktemp(suffix='.py')
     with open(script_file, 'w') as f:
         f.write(script)
-
-    result = subprocess.run(
-        [blender_bin, '--background', '--python', script_file],
-        capture_output=True, text=True, timeout=120
-    )
+    result = subprocess.run([blender_bin, '--background', '--python', script_file],
+                            capture_output=True, text=True, timeout=120)
     os.unlink(script_file)
-
-    log.info(f"Blender decimate stdout: {result.stdout[-500:]}")
     if not os.path.exists(output_path):
         raise RuntimeError(f"Decimation failed: {result.stderr[-300:]}")
     log.info(f"Decimation complete: {output_path}")
 
-def run_vehicle_pipeline(glb_path: str, classify_data: dict, uid: str, host: str) -> str:
 
-    blender_bin = os.environ.get('BLENDER_PATH', '/Applications/Blender.app/Contents/MacOS/blender')
-    seg_dir     = os.path.dirname(os.path.abspath(__file__))
+def run_vehicle_pipeline(classify_id: str, glb_path: str,
+                         classify_data: dict, host: str) -> str:
+    blender_bin = os.environ.get('BLENDER_PATH',
+                                 '/Applications/Blender.app/Contents/MacOS/blender')
+    seg_dir = os.path.dirname(os.path.abspath(__file__))
 
-    separated_path  = os.path.join(RESULTS_DIR, f"{uid}_separated.glb")
-    animated_path   = os.path.join(RESULTS_DIR, f"{uid}_animated.glb")
-    rigged_path     = os.path.join(RESULTS_DIR, f"{uid}_rigged.glb")
-    classify_json   = os.path.join(RESULTS_DIR, f"{uid}_classify.json")
-    tire_verts_path = os.path.join(RESULTS_DIR, f"{uid}_tire_verts.json")
-    texture_path    = os.path.join(RESULTS_DIR, f"{uid}_texture.png")
+    # All intermediate files keyed on classify_id
+    separated_path  = os.path.join(RESULTS_DIR, f"{classify_id}_separated.glb")
+    animated_path   = os.path.join(RESULTS_DIR, f"{classify_id}_animated.glb")
+    rigged_path     = os.path.join(RESULTS_DIR, f"{classify_id}_rigged.glb")
+    classify_json   = os.path.join(RESULTS_DIR, f"{classify_id}_classify.json")
+    tire_verts_path = os.path.join(RESULTS_DIR, f"{classify_id}_tire_verts.json")
+    texture_path    = os.path.join(RESULTS_DIR, f"{classify_id}_texture.png")
 
-    # Save classify data
     with open(classify_json, 'w') as f:
         json.dump(classify_data, f, indent=2)
 
-    # Step 1 — Extract texture from GLB
-    log.info("Extracting texture from GLB...")
     import struct
     with open(glb_path, 'rb') as f:
         f.read(12)
-        json_len = struct.unpack('<I', f.read(4))[0]
-        f.read(4)
-        j       = json.loads(f.read(json_len))
-        bin_len = struct.unpack('<I', f.read(4))[0]
-        f.read(4)
-        binary  = f.read(bin_len)
+        json_len = struct.unpack('<I', f.read(4))[0]; f.read(4)
+        j        = json.loads(f.read(json_len))
+        bin_len  = struct.unpack('<I', f.read(4))[0]; f.read(4)
+        binary   = f.read(bin_len)
 
     for img_data in j.get('images', []):
         bv   = j['bufferViews'][img_data['bufferView']]
@@ -1136,51 +979,28 @@ def run_vehicle_pipeline(glb_path: str, classify_data: dict, uid: str, host: str
         log.info(f"Texture extracted: {texture_path}")
         break
 
-    # Step 2 — Find tire vertices by texture color + Gemini wheel colors
-    log.info("Finding tire vertices...")
-    find_script = os.path.join(seg_dir, 'find_tire_verts.py')
-    result = subprocess.run([
-        sys.executable, find_script,
-        glb_path, classify_json, tire_verts_path, texture_path
-    ], capture_output=True, text=True, timeout=60)
-    log.info(result.stdout)
-    if result.returncode != 0:
-        raise RuntimeError(f"find_tire_verts failed: {result.stderr[-200:]}")
+    for script_name, out_path, runner in [
+        ('find_tire_verts.py',  tire_verts_path, 'python'),
+        ('classify_wheels.py',  separated_path,  'blender'),
+        ('animatesam.py',       animated_path,   'blender'),
+        ('merge_animations.py', rigged_path,     'python'),
+    ]:
+        script = os.path.join(seg_dir, script_name)
+        if runner == 'blender':
+            extra = [tire_verts_path] if script_name == 'classify_wheels.py' else []
+            cmd   = [blender_bin, '--background', '--factory-startup',
+                     '--python', script, '--',
+                     glb_path, out_path, classify_json] + extra
+        else:
+            args = ([glb_path, classify_json, tire_verts_path, texture_path]
+                    if script_name == 'find_tire_verts.py'
+                    else [animated_path, rigged_path])
+            cmd  = [sys.executable, script] + args
 
-    # Step 3 — Separate wheels
-    log.info("Separating wheels...")
-    classify_script = os.path.join(seg_dir, 'classify_wheels.py')
-    result = subprocess.run([
-        blender_bin, '--background', '--factory-startup',
-        '--python', classify_script, '--',
-        glb_path, separated_path, classify_json, tire_verts_path
-    ], capture_output=True, text=True, timeout=120)
-    log.info(result.stdout[-500:])
-    if not os.path.exists(separated_path):
-        raise RuntimeError(f"classify_wheels failed: {result.stderr[-200:]}")
-
-    # Step 4 — Animate wheels
-    log.info("Animating wheels...")
-    animate_script = os.path.join(seg_dir, 'animatesam.py')
-    result = subprocess.run([
-        blender_bin, '--background', '--factory-startup',
-        '--python', animate_script, '--',
-        separated_path, animated_path, classify_json
-    ], capture_output=True, text=True, timeout=120)
-    log.info(result.stdout[-500:])
-    if not os.path.exists(animated_path):
-        raise RuntimeError(f"animatesam failed: {result.stderr[-200:]}")
-
-    # Step 5 — Merge into single drive animation
-    log.info("Merging animations...")
-    merge_script = os.path.join(seg_dir, 'merge_animations.py')
-    result = subprocess.run([
-        sys.executable, merge_script,
-        animated_path, rigged_path
-    ], capture_output=True, text=True, timeout=60)
-    log.info(result.stdout)
-    if not os.path.exists(rigged_path):
-        raise RuntimeError(f"merge_animations failed: {result.stderr[-200:]}")
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        log.info(result.stdout[-500:])
+        if not os.path.exists(out_path):
+            raise RuntimeError(f"{script_name} failed: {result.stderr[-200:]}")
 
     log.info(f"Vehicle pipeline complete: {rigged_path}")
     return rigged_path
@@ -1392,8 +1212,6 @@ def decimate():
         if not glb_bytes:
             return jsonify({'error': 'No GLB data'}), 400
 
-        # Save input
-        import uuid
         uid      = str(uuid.uuid4())[:8]
         in_path  = os.path.join(RESULTS_DIR, f"{uid}_input.glb")
         out_path = os.path.join(RESULTS_DIR, f"{uid}_decimated.glb")
@@ -1430,7 +1248,7 @@ def rig():
         if not img_bytes:
             return jsonify({'error': 'No image data'}), 400
 
-        user_id     = request.args.get('user_id', '').strip() or str(uuid.uuid4())
+        user_id     = request.args.get('user_id', '').strip() or dummy_user_id
         classify_id = request.args.get('classify_id', '').strip()
         log.info(f"classify_id: '{classify_id}'")
 
@@ -1492,12 +1310,10 @@ def gallery():
     ?format=json          — full records with URLs (default)
     ?format=listview      — pipe-separated strings for App Inventor ListView
     """
-    user_id = request.args.get('user_id', '').strip()
     tag     = request.args.get('tag', '').strip().lower()
     fmt     = request.args.get('format', 'json').strip()
 
-    if not user_id:
-        return jsonify({'error': 'user_id is required'}), 400
+    user_id     = request.args.get('user_id', '').strip() or dummy_user_id
 
     try:
         records = (model_store.store.search_by_tag(user_id, tag)
@@ -1527,16 +1343,16 @@ def gallery_page():
 
 @app.route('/gallery_data')
 def gallery_data():
-    """JSON consumed by gallery.html — minimal fields for display."""
-    user_id = request.args.get('user_id', 'default').strip()
+    user_id     = request.args.get('user_id', '').strip() or dummy_user_id
     try:
         records = model_store.store.user_records_with_urls(user_id, request.host)
         return jsonify([{
-            'url':         r.get('rigged_url'),
-            'label':       r.get('object_type', 'model'),
-            'tags':        r.get('tags', []),
-            'classify_id': r.get('classify_id'),
-            'created_at':  r.get('created_at'),
+            'url':             r.get('rigged_url'),
+            'label':           r.get('object_type', 'model'),
+            'tags':            r.get('tags', []),
+            'classify_id':     r.get('classify_id'),
+            'segmented_image': r.get('segmented_image'),   # ← add this
+            'created_at':      r.get('created_at'),
         } for r in records])
     except Exception as e:
         log.error(f"/gallery_data error: {e}")
