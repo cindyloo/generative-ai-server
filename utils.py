@@ -1,4 +1,3 @@
-
 import os
 import sys
 import io
@@ -21,9 +20,10 @@ import numpy as np
 VEHICLE_KEYWORDS = {'car', 'truck', 'vehicle', 'bus', 'bike', 'motorcycle', 'van', 'auto', 'wheels'}
 
 HUMANOID_KEYWORDS = {'human', 'person', 'character', 'humanoid', 'man',
-                             'woman', 'boy', 'girl', 'robot', 'alien', 'zombie',
-                             'totoro', 'creature', 'figure', 'monster'}
- # ── Helpers ────────────────────────────────────────────────────────────────────
+                     'woman', 'boy', 'girl', 'robot', 'alien', 'zombie',
+                     'totoro', 'creature', 'figure', 'monster'}
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
 
 def resize_if_needed(img: Image.Image, max_size: int = 1024) -> Image.Image:
     if max(img.size) > max_size:
@@ -52,41 +52,34 @@ def detect_mime_type(img_bytes: bytes) -> str:
 
 # ── Keyframe injection (procedural, replaces hardcoded animations) ─────────────
 
-# axis, phase (+1 normal / -1 inverted), base amplitude in radians
 WALK_KEYFRAMES = {
     "root":      None,
     "pelvis":    ("z",  1,  0.05),
-    "spine":     ("y", -1,  0.06),   # counter-rotates vs pelvis
+    "spine":     ("y", -1,  0.06),
     "chest":     ("y", -1,  0.05),
     "neck":      ("z",  1,  0.02),
     "head":      ("z", -1,  0.02),
-    "shoulder":  ("x",  1,  0.35),   # phase flipped per side below
+    "shoulder":  ("x",  1,  0.35),
     "elbow":     ("x",  1,  0.20),
     "hand":      ("x",  1,  0.10),
-    "hip":       ("x",  1,  0.20),   # phase flipped per side below
-    "leg":       ("x",  1,  0.50),
+    "hip":       ("x",  1,  0.20),
+    "leg":       ("x",  1,  0.50),   # Increased knee bend
     "foot":      ("x",  1,  0.10),
     "wing_base": ("z",  1,  0.30),
     "wing_mid":  ("z",  1,  0.20),
     "wing_tip":  ("z",  1,  0.10),
-    "axle":      None,               # static — child wheels spin
-    "body":      None,               # static
-    # "wheel" is special-cased in build_walk_keyframes
+    "axle":      None,
+    "body":      None,
 }
 
-# Right-side joints get their phase flipped so left/right oppose each other
 RIGHT_SIDE_FLIP = {"shoulder", "elbow", "hand", "hip", "leg", "foot",
                    "wing_base", "wing_mid", "wing_tip"}
 
 def build_walk_keyframes(body_part: str, joint_name: str,
                          bone_length: float = None) -> list:
-    """
-    Returns an animations list for a joint given its body_part label.
-    bone_length: world-space distance to nearest child, used to scale amplitude.
-    """
+    """Returns an animations list for a joint given its body_part label."""
     body_part_lower = (body_part or '').lower()
 
-    # Wheels spin continuously — not an oscillation
     if body_part_lower == "wheel":
         return [{
             "clip":      "drive",
@@ -103,14 +96,12 @@ def build_walk_keyframes(body_part: str, joint_name: str,
     axis, phase, base_amp = params
     is_right = "right" in joint_name.lower()
 
-    # Flip phase for right-side limbs so they oppose left
     if is_right and body_part_lower in RIGHT_SIDE_FLIP:
         phase *= -1
 
-    # Scale amplitude by bone length so longer bones don't over-rotate
     amp = base_amp
     if bone_length is not None:
-        REFERENCE_BONE = 0.4   # world units for a typical mesh
+        REFERENCE_BONE = 0.4
         amp = base_amp * min(1.5, max(0.5, REFERENCE_BONE / bone_length))
 
     kf = [
@@ -131,14 +122,9 @@ def build_walk_keyframes(body_part: str, joint_name: str,
 
 
 def inject_keyframes(skel: dict) -> dict:
-    """
-    Walk every joint in the skeleton and inject procedural walk keyframes
-    based on its body_part label. Called after skel is assembled, before
-    run_blender_rig.
-    """
+    """Inject procedural walk keyframes based on body_part labels."""
     positions = {j['id']: np.array(j['position']) for j in skel['joints']}
 
-    # Build parent→children map for bone-length calculation
     children = {}
     for bone in skel['bones']:
         p, c = bone['parent'], bone['child']
@@ -149,7 +135,6 @@ def inject_keyframes(skel: dict) -> dict:
         body_part = hint.get('body_part', '')
         name      = joint.get('name', '')
 
-        # Bone length = distance to first child joint
         bone_length = None
         child_ids   = children.get(joint['id'], [])
         if child_ids:
@@ -170,34 +155,27 @@ def inject_keyframes(skel: dict) -> dict:
 
 # ── fal.ai image editing ───────────────────────────────────────────────────────
 
-def edit_image_fal(img: Image.Image, prompt: str) -> Image.Image:
-    """Edit image using fal.ai Qwen Image 2.0. No mask needed."""
+def edit_image_fal(img: Image.Image, prompt: str):
+    """Edit image using fal.ai Qwen Image 2.0."""
     import fal_client
 
     data_uri = f"data:image/png;base64,{img_to_b64(img)}"
     log.info(f"fal.ai: {prompt[:80]}...")
 
-    result  = fal_client.subscribe(
+    result   = fal_client.subscribe(
         "fal-ai/qwen-image-2/edit",
         arguments={"prompt": prompt, "image_urls": [data_uri], "num_images": 2}
     )
-    out_url  = result["images"][0]["url"]
-    out_url2 = result["images"][1]["url"]
-    responseA = requests.get(out_url,  verify=False)
-    responseB = requests.get(out_url2, verify=False)
+    responseA = requests.get(result["images"][0]["url"], verify=False)
+    responseB = requests.get(result["images"][1]["url"], verify=False)
     return (Image.open(io.BytesIO(responseA.content)).convert('RGB'),
             Image.open(io.BytesIO(responseB.content)).convert('RGB'))
 
 
 # ── Vision prompts ─────────────────────────────────────────────────────────────
-#
-#  vehicle_prompt  — keeps animations (wheels spin, axles static)
-#  animal_prompt   — NO animations; inject_keyframes() adds them procedurally
-#
-# Both are built inside classify_with_vision() so they can reference the local
-# variables tag_context, bounds_info, joints_instruction, requested_joints.
 
 def _build_vehicle_prompt() -> str:
+    """Prompt for vehicle classification and rigging."""
     return """Analyze this vehicle image for 3D rigging.
 
 Return ONLY valid JSON with no markdown, no extra text, no backticks.
@@ -300,18 +278,80 @@ Rules:
 """
 
 
-def _build_animal_prompt(tag_context: str, bounds_info: str,
-                         joints_instruction: str, requested_joints) -> str:
-    return f"""Analyze this 3D object for Blender rigging. Return ONLY valid JSON.{tag_context}{bounds_info}{joints_instruction}
+def _build_classify_prompt(tag_context: str = "") -> str:
+    """
+    STEP 1: Lightweight classification-only prompt.
+    Model evaluates: object_type, category, pose suitability, augmentation needs.
+    Returns: object_type, category, needs_augmentation, augment_prompt, suggested_joints.
+    Does NOT place joints yet — that depends on augmentation decision.
+    """
+    return f"""Analyze this image and classify the object for 3D rigging. Return ONLY valid JSON.{tag_context}
+
+{{
+  "object_type": "bronze dog statue",
+  "category": "animal|vehicle|humanoid|other",
+  "needs_augmentation": false,
+  "augment_prompt": "",
+  "suggested_joints": 12
+}}
+
+YOUR TASK:
+  • object_type: brief, specific description (e.g., "bronze dog statue", "toy car", "robot")
+  • category: one of [animal, vehicle, humanoid, other]
+  
+  • EVALUATE POSE FOR RIGGING:
+    needs_augmentation should be TRUE if:
+      ✗ Limbs are bent/contracted (legs bent, arms folded)
+      ✗ Pose is curled up, hunched, or closed
+      ✗ Wings are folded or not extended
+      ✗ Object is lying down or in unnatural pose
+      ✗ Articulated parts are touching/overlapping
+    
+    needs_augmentation should be FALSE if:
+      ✓ Limbs are extended/relaxed
+      ✓ Object in T-pose, A-pose, or standing naturally
+      ✓ All articulated parts are clearly separated and visible
+      ✓ Pose allows clear joint placement and rigging
+  
+  • augment_prompt: ONLY if needs_augmentation=true
+    - Describe what to change to make pose suitable for rigging
+    - Example: "Straighten the dog's legs into a standing pose with arms extended"
+    - Leave empty string if needs_augmentation=false
+  
+  • suggested_joints: estimated joint count for this object (3-16)
+    - Simple objects (2-3 wheels): 3-5
+    - Animals/humanoids: 8-16
+    - Complex vehicles: 6-12
+
+CRITICAL:
+  - If ANY limb is bent/folded/hidden, needs_augmentation MUST be true
+  - Do NOT estimate joints if pose is unsuitable (needs_augmentation=true)
+  - Be strict about pose quality — rigging requires clear separation
+"""
+
+
+def _build_joints_prompt(object_type: str, category: str,
+                         bounds_info: str = "", requested_joints: int = None) -> str:
+    """
+    STEP 2: Joint placement prompt.
+    Receives object_type and category as context.
+    Places joints based on actual image anatomy.
+    """
+    joints_instruction = (
+        f"\nYou MUST generate EXACTLY {requested_joints} joints. "
+        f"Set suggested_joints to {requested_joints}."
+    ) if requested_joints else "\nGenerate between 3 and 16 joints."
+    
+    bounds_info_text = f"\nMesh bounding box: {bounds_info} units." if bounds_info else ""
+
+    return f"""Analyze this image and place rigging joints. Return ONLY valid JSON.
+
+Object type: {object_type}
+Category: {category}{bounds_info_text}{joints_instruction}
 
 COORDINATES: x=0(left) 1(right), y=0(bottom) 1(top), z=0(front) 1(back)
 
 {{
-  "object_type": "...",
-  "category": "animal|vehicle|humanoid|other",
-  "needs_augmentation": false,
-  "augment_prompt": "",
-  "suggested_joints": {requested_joints or 12},
   "joint_hints": [
     {{
       "name": "joint_root",
@@ -445,44 +485,28 @@ COORDINATES: x=0(left) 1(right), y=0(bottom) 1(top), z=0(front) 1(back)
 
 YOUR TASK:
   • Look at the image and FIND where limbs physically attach to the body
-  • position_normalized must reflect the ACTUAL ATTACHMENT POINT, not the example values
-  • Shoulders: at the visual junction where arms branch FROM the body
-  • Neck: where head visibly connects to body
-  • Hips: where legs branch from body
-  • Elbows/knees: midpoint along the limb
-  • Hands/feet: at the tips/extremities
-  • Do NOT include any "animations" key — animations are added automatically
-  • Adjust joint positions to match where limbs actually are in the image
+  • position_normalized must reflect ACTUAL ATTACHMENT POINTS
+  • Adjust positions to match this specific object's anatomy
   • Left/right sides must be symmetric
-  • If object has no arms (e.g. snake, fish), remove shoulder/elbow/hand joints
+  • If object has no arms (snake, fish), remove shoulder/elbow/hand joints
   • If object has wings, rename: shoulder→wing_base, elbow→wing_mid, hand→wing_tip
-  • needs_augmentation: true if pose prevents animation (e.g. wings folded, curled up)
-  • augment_prompt: describe what to change if needs_augmentation is true
+  • Do NOT add facial joints (jaw, eyes, ears) — these are mesh features
+  • All joint names UNIQUE
 
-POSITION GUIDE (use FULL range 0.0–1.0):
-  • Chest:     y≈0.55
+POSITION GUIDE:
+  • Chest: y≈0.55
   • Shoulders: x≈0.15 (left), x≈0.85 (right), y≈0.45–0.55
-  • Elbows:    x≈0.08 (left), x≈0.92 (right), y≈0.40–0.45
-  • Hands:     x=0.0  (left), x=1.0  (right), y≈0.35
-  • Pelvis:    y≈0.20–0.25, parent of all leg joints
-  • Hips:      x≈0.38 (left), x≈0.62 (right), y≈0.22
-  • Knees:     x≈0.38 (left), x≈0.62 (right), y≈0.15
-  • Feet:      x≈0.35 (left), x≈0.65 (right), y≈0.0
+  • Elbows: x≈0.08 (left), x≈0.92 (right), y≈0.40–0.45
+  • Hands: x=0.0 (left), x=1.0 (right), y≈0.35
+  • Hips: x≈0.38 (left), x≈0.62 (right), y≈0.22
+  • Knees: x≈0.38 (left), x≈0.62 (right), y≈0.15
+  • Feet: x≈0.35 (left), x≈0.65 (right), y≈0.0
 
-CRITICAL RULES:
-  - DO NOT cluster joints near center (x=0.5) — spread across FULL WIDTH
-  - Left side clearly left (x < 0.5), right side clearly right (x > 0.5)
-  - Extremities at actual mesh edges (x≈0.0 or x≈1.0)
-  - All joint names UNIQUE
-  - Complete chains for BOTH sides
-  - Shoulders are children of CHEST, not spine or pelvis
-  - Shoulder positioned at LEFT/RIGHT OUTER EDGE of mesh, not body center
-  - Do NOT add joints for facial features (jaw, teeth, tongue, eyes, ears)
-    — these are static parts of the mesh, not articulated limbs
-
-SKELETON HIERARCHY vs PHYSICAL POSITION:
-  ✗ WRONG:   shoulder_left at chest center (x=0.5, y=0.5)
-  ✓ CORRECT: shoulder_left at left branch point (x=0.15, y=0.45),
-             skeleton still shows chest → shoulder_left
+CRITICAL:
+  - Spread joints across FULL WIDTH, don't cluster at center
+  - Left < 0.5, Right > 0.5
+  - Extremities at mesh edges (x≈0 or x≈1)
+  - Shoulders are children of CHEST
+  - Shoulder at LEFT/RIGHT EDGE, not body center
 """
 

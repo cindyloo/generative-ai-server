@@ -4,50 +4,63 @@ pipeline_store.py
 Single source of truth for the 3D rigging pipeline.
 Replaces model_store.py, _classify_cache, and _mesh_cache entirely.
 
-Every pipeline run produces one record, keyed on classify_id
-(md5(image_bytes + tag)[:8]).  The record has three sub-objects that are
-filled in progressively as the pipeline advances:
+Pipeline stages and the store fields they populate
+---------------------------------------------------
+  /segment          (stateless — client holds bytes)
+  /classify         → classify{}, active_image_path = segmented_image_path
+  /augment_image    → saves augmented PNGs to disk
+  /augment_image/confirm → active_image_path = chosen augmented PNG
+  /joints           → joints{}          ← repeatable with force=true
+  /mesh             → mesh{}            ← cached, never re-runs without force=true
+  /rig              → rig{}             ← repeatable with force=true
 
-  classify  — filled by /classify
-  mesh      — filled when Meshy finishes
-  rig       — filled when Blender finishes
-
-Schema
-------
+Schema (one record per classify_id)
+------------------------------------
 {
   "classify_id":      "a1b2c3d4",
-  "tag":              "dragon",          # raw user input, e.g. "fire+dragon"
-  "tags":             ["dragon","fire"], # extracted search tokens
-  "pipeline_version": 1,
+  "tag":              "dragon",
+  "tags":             ["animal", "dragon"],
+  "pipeline_version": 2,
+
+  "active_image_path": "results/a1b2c3d4_segmented.png",
+  // set to segmented_image_path on /classify
+  // overwritten to augmented path on /augment_image/confirm
+  // /joints, /mesh, /rig all read this field — never the segmented path directly
 
   "classify": {
     "object_type":        "fire-breathing dragon",
-    "category":           "animal",         # animal | humanoid | vehicle | other
+    "category":           "animal",
     "needs_augmentation": false,
     "augment_prompt":     "",
-    "suggested_joints":   8,
-    "joint_hints":        [...],
-    "skeleton":           [...],
     "segmented_image_path": "results/a1b2c3d4_segmented.png",
     "created_at":         "2025-01-01T00:00:00Z"
   },
 
-  "mesh": {                               # null until Meshy finishes
-    "mesh_hash":          "abc123456789", # md5(image_bytes + object_type)[:12]
+  "joints": {                             // null until /joints completes
+    "source_image_path":  "results/a1b2c3d4_segmented.png",
+    "joint_hints":        [...],
+    "skeleton":           [...],
+    "suggested_joints":   8,
+    "model_used":         "gemini-2.5-flash",
+    "created_at":         "2025-01-01T00:00:05Z"
+  },
+
+  "mesh": {                               // null until /mesh completes
+    "mesh_hash":          "abc123456789",
     "meshy_task_id":      "task-xyz",
     "glb_path":           "results/a1b2c3d4_mesh.glb",
-    "glb_url":            "https://cdn.meshy.ai/...",   # CDN URL, may expire
-    "usdz_path":          "results/a1b2c3d4_mesh.usdz", # None if not produced
+    "glb_url":            "https://cdn.meshy.ai/...",
+    "usdz_path":          "results/a1b2c3d4_mesh.usdz",
     "usdz_url":           "https://cdn.meshy.ai/...",
     "decimated_glb_path": "results/a1b2c3d4_decimated.glb",
     "created_at":         "2025-01-01T00:00:10Z"
   },
 
-  "rig": {                                # null until rigging finishes
+  "rig": {                                // null until /rig completes
     "rigged_glb_path":    "results/a1b2c3d4_rigged.glb",
     "viz_glb_path":       "results/a1b2c3d4_viz.glb",
     "skeleton_json_path": "results/a1b2c3d4_skeleton.json",
-    "status":             "ok",           # started|meshy|rigging|ok|error
+    "status":             "ok",
     "error":              null,
     "user_id":            "fb712dd7-...",
     "created_at":         "2025-01-01T00:01:00Z"
@@ -60,8 +73,8 @@ Backends
   PIPELINE_STORE_BACKEND=tinydb   TinyDB, good for single-server deployments
   PIPELINE_STORE_BACKEND=clouddb  MIT App Inventor CloudDB / Redis
 
-All three backends expose the same public interface via get_store():
-
+Public API
+----------
   store = get_store()
 
   # reads
@@ -69,11 +82,13 @@ All three backends expose the same public interface via get_store():
   records = store.get_all()
   records = store.get_by_user(user_id)
   records = store.search_by_tag(user_id, tag)
-  mesh    = store.get_mesh_by_hash(mesh_hash)   # returns mesh sub-object | None
+  mesh    = store.get_mesh_by_hash(mesh_hash)
   tags    = store.all_tags_for_user(user_id)
 
   # writes
   store.upsert_classify(classify_id, tag, classify_data)
+  store.set_active_image(classify_id, image_path)
+  store.upsert_joints(classify_id, joints_data)
   store.upsert_mesh(classify_id, mesh_data)
   store.upsert_rig(classify_id, rig_data)
   store.set_rig_status(classify_id, status, error=None)
@@ -85,9 +100,7 @@ Environment variables
 ---------------------
   PIPELINE_STORE_BACKEND   json | tinydb | clouddb
   RESULTS_DIR              directory for local files (default: 'results')
-  CLOUDDB_URL
-  CLOUDDB_TOKEN
-  CLOUDDB_PROJECT
+  CLOUDDB_URL, CLOUDDB_TOKEN, CLOUDDB_PROJECT
 """
 
 from __future__ import annotations
@@ -101,17 +114,15 @@ from typing import Optional
 
 log = logging.getLogger(__name__)
 
-PIPELINE_VERSION = 1
+PIPELINE_VERSION = 2
 
 
-# ── Tag extraction (ported from model_store.py) ───────────────────────────────
+# ── Tag extraction ────────────────────────────────────────────────────────────
 
-# Joint names that are internal skeleton landmarks, not useful search terms
 _SKIP_BODY_PARTS = {
     'torso', 'spine', 'chest', 'pelvis', 'axle', 'body', 'root',
 }
 
-# Generic words stripped from user tags and object_type strings
 _STOP_WORDS = {
     'a', 'an', 'the', 'in', 'or', 'for', 'no', 'on', 'and',
     't-pose', 'a-pose', 'easy', 'rigging', 'statue', 'two', 'walks',
@@ -120,14 +131,12 @@ _STOP_WORDS = {
 
 def extract_tags(classify_data: dict, user_tag: str = '') -> list[str]:
     """
-    Build a sorted list of search tokens from the user tag and classify result.
+    Build sorted search tokens from user tag + classify result.
 
-    Sources (in priority order):
+    Sources:
       1. user_tag                      e.g. "bronze+dog"
-      2. classify_data['object_type']  e.g. "bronze dog statue (bipedal, no arms)"
+      2. classify_data['object_type']  e.g. "bronze dog statue (bipedal)"
       3. classify_data['category']     e.g. "animal"
-      4. joint_hints[*]['body_part']   e.g. "hip", "shoulder"
-                                       (excludes _SKIP_BODY_PARTS)
     """
     tags: set[str] = set()
 
@@ -137,7 +146,6 @@ def extract_tags(classify_data: dict, user_tag: str = '') -> list[str]:
 
     if classify_data:
         object_type = classify_data.get('object_type', '')
-        # Strip parens, commas, periods so "bipedal," doesn't become a tag
         cleaned = object_type.lower().translate(str.maketrans('(),.-', '     '))
         words = cleaned.split()
         tags.update(w for w in words if w not in _STOP_WORDS and len(w) > 2)
@@ -145,13 +153,6 @@ def extract_tags(classify_data: dict, user_tag: str = '') -> list[str]:
         category = classify_data.get('category', '')
         if category:
             tags.add(category.lower())
-
-        for hint in classify_data.get('joint_hints', []):
-            if not isinstance(hint, dict):
-                continue
-            bp = hint.get('body_part', '')
-            if bp and bp.lower() not in _SKIP_BODY_PARTS:
-                tags.add(bp.lower())
 
     return sorted(t for t in tags if t)
 
@@ -163,7 +164,6 @@ def _now() -> str:
 
 
 def _local_url(path: str | None, host: str) -> str | None:
-    """Convert a local file path to an http:// URL served by this host."""
     if not path:
         return None
     return f"http://{host}/results/{os.path.basename(path)}"
@@ -171,37 +171,42 @@ def _local_url(path: str | None, host: str) -> str | None:
 
 def _inject_urls(record: dict, host: str) -> dict:
     """
-    Return a shallow copy of *record* with computed http:// URLs added to each
-    sub-object.  The original CDN glb_url / usdz_url are preserved unchanged
-    alongside the new local_* variants.
+    Return a shallow copy of record with http:// URLs added for all local paths.
+    CDN urls (glb_url, usdz_url) are preserved unchanged.
     """
-    r   = dict(record)
-    cls = dict(r.get('classify') or {})
-    msh = dict(r.get('mesh')     or {})
-    rig = dict(r.get('rig')      or {})
+    r      = dict(record)
+    cls    = dict(r.get('classify') or {})
+    joints = dict(r.get('joints')   or {})
+    msh    = dict(r.get('mesh')     or {})
+    rig    = dict(r.get('rig')      or {})
 
-    cls['segmented_url']       = _local_url(cls.get('segmented_image_path'), host)
-    msh['glb_local_url']       = _local_url(msh.get('glb_path'),             host)
-    msh['usdz_local_url']      = _local_url(msh.get('usdz_path'),            host)
-    msh['decimated_local_url'] = _local_url(msh.get('decimated_glb_path'),   host)
-    rig['rigged_url']          = _local_url(rig.get('rigged_glb_path'),      host)
-    rig['viz_url']             = _local_url(rig.get('viz_glb_path'),         host)
+    r['active_image_url']          = _local_url(r.get('active_image_path'),          host)
+    cls['segmented_url']           = _local_url(cls.get('segmented_image_path'),     host)
+    joints['source_image_url']     = _local_url(joints.get('source_image_path'),     host)
+    msh['glb_local_url']           = _local_url(msh.get('glb_path'),                 host)
+    msh['usdz_local_url']          = _local_url(msh.get('usdz_path'),                host)
+    msh['decimated_local_url']     = _local_url(msh.get('decimated_glb_path'),       host)
+    rig['rigged_url']              = _local_url(rig.get('rigged_glb_path'),          host)
+    rig['viz_url']                 = _local_url(rig.get('viz_glb_path'),             host)
 
-    r['classify'] = cls if cls else None
-    r['mesh']     = msh if msh else None
-    r['rig']      = rig if rig else None
+    r['classify'] = cls    or None
+    r['joints']   = joints or None
+    r['mesh']     = msh    or None
+    r['rig']      = rig    or None
     return r
 
 
 def _blank_record(classify_id: str, tag: str = '') -> dict:
     return {
-        'classify_id':      classify_id,
-        'tag':              tag,
-        'tags':             [],
-        'pipeline_version': PIPELINE_VERSION,
-        'classify':         None,
-        'mesh':             None,
-        'rig':              None,
+        'classify_id':       classify_id,
+        'tag':               tag,
+        'tags':              [],
+        'pipeline_version':  PIPELINE_VERSION,
+        'active_image_path': None,
+        'classify':          None,
+        'joints':            None,
+        'mesh':              None,
+        'rig':               None,
     }
 
 
@@ -209,9 +214,8 @@ def _blank_record(classify_id: str, tag: str = '') -> dict:
 
 class JsonStore:
     """
-    In-process JSON file store.  Thread-safe via RLock.
-    Writes are atomic: write to .tmp then os.replace().
-    Zero external dependencies — the default backend.
+    In-process JSON file store. Thread-safe via RLock.
+    Writes are atomic: .tmp then os.replace(). Zero external dependencies.
     """
 
     def __init__(self, path: str):
@@ -219,8 +223,6 @@ class JsonStore:
         self._lock = threading.RLock()
         self._data: dict[str, dict] = {}
         self._load()
-
-    # ── persistence ───────────────────────────────────────────────────────────
 
     def _load(self):
         if os.path.exists(self._path):
@@ -240,8 +242,6 @@ class JsonStore:
             os.replace(tmp, self._path)
         except Exception as e:
             log.error(f"pipeline_store(json): save failed: {e}")
-
-    # ── internal ──────────────────────────────────────────────────────────────
 
     def _get_or_create(self, classify_id: str, tag: str = '') -> dict:
         if classify_id not in self._data:
@@ -279,11 +279,7 @@ class JsonStore:
             ]
 
     def get_mesh_by_hash(self, mesh_hash: str) -> dict | None:
-        """
-        Return the mesh sub-object for the record whose mesh_hash matches,
-        but only if the local GLB file still exists on disk.
-        Returns None if the file is gone (Meshy will be re-called).
-        """
+        """Return mesh sub-object if mesh_hash matches and GLB file exists on disk."""
         with self._lock:
             for r in self._data.values():
                 msh = r.get('mesh') or {}
@@ -304,13 +300,47 @@ class JsonStore:
     # ── writes ────────────────────────────────────────────────────────────────
 
     def upsert_classify(self, classify_id: str, tag: str, classify_data: dict):
+        """
+        Store classify result and set active_image_path to the segmented image.
+        active_image_path is the single path all downstream steps read from.
+        """
         with self._lock:
             record = self._get_or_create(classify_id, tag)
-            record['tag']      = tag
-            record['tags']     = extract_tags(classify_data, tag)
+            record['tag']  = tag
+            record['tags'] = extract_tags(classify_data, tag)
             record['classify'] = {
                 **classify_data,
                 'created_at': classify_data.get('created_at') or _now(),
+            }
+            # Set active_image_path to segmented image on first classify.
+            # Only overwrite if not already set to an augmented image —
+            # a force re-classify should not lose a previously confirmed augment.
+            if not record.get('active_image_path'):
+                record['active_image_path'] = classify_data.get('segmented_image_path')
+            self._save()
+
+    def set_active_image(self, classify_id: str, image_path: str):
+        """
+        Called by /augment_image/confirm to point all downstream steps
+        at the chosen augmented image instead of the segmented original.
+        """
+        with self._lock:
+            record = self._get_or_create(classify_id)
+            record['active_image_path'] = image_path
+            self._save()
+
+    def upsert_joints(self, classify_id: str, joints_data: dict):
+        """
+        Store joint placement result from /joints.
+        Overwrites any previous joints result — /joints is freely repeatable.
+        joints_data should include: joint_hints, skeleton, suggested_joints,
+        source_image_path, model_used.
+        """
+        with self._lock:
+            record = self._get_or_create(classify_id)
+            record['joints'] = {
+                **joints_data,
+                'created_at': joints_data.get('created_at') or _now(),
             }
             self._save()
 
@@ -352,9 +382,8 @@ class JsonStore:
 
 class TinyDbStore:
     """
-    TinyDB backend.  Same schema as JsonStore — one document per classify_id
-    with classify / mesh / rig sub-dicts.  Good for single-server deployments
-    where you want a proper document store without running a full database.
+    TinyDB backend. Same schema as JsonStore.
+    Good for single-server deployments without running a full database.
     """
 
     def __init__(self, path: str):
@@ -365,8 +394,6 @@ class TinyDbStore:
         self._Q     = Query()
         self._lock  = threading.RLock()
         log.info(f"pipeline_store(tinydb): {len(self._table)} records in {path}")
-
-    # ── internal ──────────────────────────────────────────────────────────────
 
     def _get_raw(self, classify_id: str) -> dict | None:
         return self._table.get(self._Q.classify_id == classify_id)
@@ -429,11 +456,25 @@ class TinyDbStore:
     def upsert_classify(self, classify_id: str, tag: str, classify_data: dict):
         with self._lock:
             classify_data.setdefault('created_at', _now())
-            self._upsert(classify_id, {
+            existing = self._get_raw(classify_id) or {}
+            updates = {
                 'tag':      tag,
                 'tags':     extract_tags(classify_data, tag),
                 'classify': classify_data,
-            })
+            }
+            # Only set active_image_path if not already pointing at an augmented image
+            if not existing.get('active_image_path'):
+                updates['active_image_path'] = classify_data.get('segmented_image_path')
+            self._upsert(classify_id, updates)
+
+    def set_active_image(self, classify_id: str, image_path: str):
+        with self._lock:
+            self._upsert(classify_id, {'active_image_path': image_path})
+
+    def upsert_joints(self, classify_id: str, joints_data: dict):
+        with self._lock:
+            joints_data.setdefault('created_at', _now())
+            self._upsert(classify_id, {'joints': joints_data})
 
     def upsert_mesh(self, classify_id: str, mesh_data: dict):
         with self._lock:
@@ -470,11 +511,7 @@ class CloudDbStore:
     ----------
       pipeline:{classify_id}   full pipeline record as JSON
       user_index:{user_id}     JSON list of classify_ids, newest first
-      mesh_index:{mesh_hash}   classify_id string (secondary index for mesh lookup)
-
-    The mesh_index avoids a full scan in get_mesh_by_hash().
-    Note: CloudDB has no local filesystem, so get_mesh_by_hash() cannot verify
-    that the GLB file still exists — it trusts the stored record.
+      mesh_index:{mesh_hash}   classify_id string (O(1) mesh lookup)
     """
 
     def __init__(self, url: str, token: str, project: str):
@@ -486,15 +523,13 @@ class CloudDbStore:
         self._lock     = threading.RLock()
         log.info(f"pipeline_store(clouddb): {self._url} project={self._project}")
 
-    # ── low-level HTTP ────────────────────────────────────────────────────────
-
     def _headers(self) -> dict:
         return {
             'Authorization': f'Bearer {self._token}',
             'Content-Type':  'application/json',
         }
 
-    def _get(self, key: str) -> Optional[dict | list | str]:
+    def _get(self, key: str):
         try:
             resp = self._requests.get(
                 f"{self._url}/v1/{self._project}/{key}",
@@ -534,8 +569,6 @@ class CloudDbStore:
             log.error(f"CloudDB DELETE {key}: {e}")
             return False
 
-    # ── index helpers ─────────────────────────────────────────────────────────
-
     def _get_user_index(self, user_id: str) -> list[str]:
         return self._get(f"user_index:{user_id}") or []
 
@@ -545,9 +578,8 @@ class CloudDbStore:
             index.insert(0, classify_id)
             self._set(f"user_index:{user_id}", index)
 
-    def _remove_from_user_index(self, user_id: str, classify_id: str):
-        index = [i for i in self._get_user_index(user_id) if i != classify_id]
-        self._set(f"user_index:{user_id}", index)
+    def _load_or_blank(self, classify_id: str, tag: str = '') -> dict:
+        return self.get(classify_id) or _blank_record(classify_id, tag)
 
     # ── reads ─────────────────────────────────────────────────────────────────
 
@@ -555,7 +587,6 @@ class CloudDbStore:
         return self._get(f"pipeline:{classify_id}")
 
     def get_all(self) -> list[dict]:
-        # No global index in CloudDB — not practical without a separate list
         log.warning("CloudDB get_all(): not supported, returning []")
         return []
 
@@ -578,7 +609,6 @@ class CloudDbStore:
         if not record:
             return None
         msh = record.get('mesh') or {}
-        # Validate the hash matches (guards against stale index entries)
         return dict(msh) if msh.get('mesh_hash') == mesh_hash else None
 
     def all_tags_for_user(self, user_id: str) -> list[str]:
@@ -589,9 +619,6 @@ class CloudDbStore:
 
     # ── writes ────────────────────────────────────────────────────────────────
 
-    def _load_or_blank(self, classify_id: str, tag: str = '') -> dict:
-        return self.get(classify_id) or _blank_record(classify_id, tag)
-
     def upsert_classify(self, classify_id: str, tag: str, classify_data: dict):
         with self._lock:
             record = self._load_or_blank(classify_id, tag)
@@ -601,6 +628,23 @@ class CloudDbStore:
                 **classify_data,
                 'created_at': classify_data.get('created_at') or _now(),
             }
+            if not record.get('active_image_path'):
+                record['active_image_path'] = classify_data.get('segmented_image_path')
+            self._set(f"pipeline:{classify_id}", record)
+
+    def set_active_image(self, classify_id: str, image_path: str):
+        with self._lock:
+            record = self._load_or_blank(classify_id)
+            record['active_image_path'] = image_path
+            self._set(f"pipeline:{classify_id}", record)
+
+    def upsert_joints(self, classify_id: str, joints_data: dict):
+        with self._lock:
+            record = self._load_or_blank(classify_id)
+            record['joints'] = {
+                **joints_data,
+                'created_at': joints_data.get('created_at') or _now(),
+            }
             self._set(f"pipeline:{classify_id}", record)
 
     def upsert_mesh(self, classify_id: str, mesh_data: dict):
@@ -609,7 +653,6 @@ class CloudDbStore:
             mesh_data.setdefault('created_at', _now())
             record['mesh'] = mesh_data
             self._set(f"pipeline:{classify_id}", record)
-            # Secondary index so get_mesh_by_hash() is O(1) not O(n)
             if mesh_data.get('mesh_hash'):
                 self._set(f"mesh_index:{mesh_data['mesh_hash']}", classify_id)
 
@@ -621,7 +664,6 @@ class CloudDbStore:
             rig_data.setdefault('created_at', _now())
             record['rig'] = rig_data
             self._set(f"pipeline:{classify_id}", record)
-            # Maintain user index so get_by_user() works
             user_id = rig_data.get('user_id', '')
             if user_id:
                 self._prepend_user_index(user_id, classify_id)
@@ -649,11 +691,7 @@ _store_lock = threading.Lock()
 def get_store() -> JsonStore | TinyDbStore | CloudDbStore:
     """
     Return the module-level singleton, creating it on first call.
-
-    Backend is selected by the PIPELINE_STORE_BACKEND environment variable:
-      json     (default)  results/_pipeline_store.json  (no extra deps)
-      tinydb              results/_pipeline_store.json  (via TinyDB)
-      clouddb             requires CLOUDDB_URL, CLOUDDB_TOKEN, CLOUDDB_PROJECT
+    Backend selected by PIPELINE_STORE_BACKEND env var: json | tinydb | clouddb
     """
     global _store_instance
     if _store_instance is not None:
@@ -682,7 +720,7 @@ def get_store() -> JsonStore | TinyDbStore | CloudDbStore:
             path = os.path.join(results_dir, '_pipeline_store.json')
             _store_instance = TinyDbStore(path)
 
-        else:  # json (default)
+        else:
             path = os.path.join(results_dir, '_pipeline_store.json')
             _store_instance = JsonStore(path)
 
@@ -700,35 +738,63 @@ if __name__ == '__main__':
     with tempfile.TemporaryDirectory() as tmp:
         store = JsonStore(os.path.join(tmp, '_pipeline_store.json'))
 
+        seg_path = f'{tmp}/a1b2c3d4_segmented.png'
+        aug_path = f'{tmp}/a1b2c3d4_augmented_a.png'
+
         classify_data = {
             'object_type':        'bronze dog statue (bipedal, no arms)',
             'category':           'animal',
             'needs_augmentation': False,
             'augment_prompt':     '',
-            'suggested_joints':   6,
-            'joint_hints': [
-                {'name': 'hip',      'body_part': 'hip'},
-                {'name': 'spine',    'body_part': 'spine'},    # skipped
-                {'name': 'shoulder', 'body_part': 'shoulder'},
-            ],
-            'segmented_image_path': f'{tmp}/a1b2c3d4_segmented.png',
+            'segmented_image_path': seg_path,
         }
 
-        # ── classify ──────────────────────────────────────────────────────────
+        # ── classify sets active_image_path to segmented ──────────────────────
         store.upsert_classify('a1b2c3d4', 'bronze+dog', classify_data)
         r = store.get('a1b2c3d4')
-        assert r is not None
-        assert r['classify']['object_type'] == 'bronze dog statue (bipedal, no arms)'
-        assert 'dog'      in r['tags'], f"missing 'dog' in {r['tags']}"
-        assert 'bronze'   in r['tags'], f"missing 'bronze'"
-        assert 'animal'   in r['tags'], f"missing 'animal' (category)"
-        assert 'hip'      in r['tags'], f"missing 'hip' (joint body_part)"
-        assert 'shoulder' in r['tags'], f"missing 'shoulder'"
-        assert 'spine' not in r['tags'], "spine should be skipped"
+        assert r['active_image_path'] == seg_path,          "active = segmented initially"
+        assert 'dog'    in r['tags'],                        "tag: dog"
+        assert 'bronze' in r['tags'],                        "tag: bronze"
+        assert 'animal' in r['tags'],                        "tag: category"
+        assert 'spine'  not in r['tags'],                    "spine not in tags"
         print(f"tags: {r['tags']}")
         print("upsert_classify: OK")
 
-        # ── mesh (file absent → cache miss) ───────────────────────────────────
+        # ── force re-classify does not overwrite a confirmed augmented image ──
+        store.set_active_image('a1b2c3d4', aug_path)
+        store.upsert_classify('a1b2c3d4', 'bronze+dog', classify_data)  # force re-classify
+        r = store.get('a1b2c3d4')
+        assert r['active_image_path'] == aug_path,           "augmented path preserved on re-classify"
+        print("set_active_image / re-classify preservation: OK")
+
+        # ── joints ────────────────────────────────────────────────────────────
+        store.upsert_joints('a1b2c3d4', {
+            'source_image_path': aug_path,
+            'joint_hints':       [{'name': 'hip'}, {'name': 'shoulder'}],
+            'skeleton':          [{'parent': 0, 'child': 1}],
+            'suggested_joints':  8,
+            'model_used':        'gemini-2.5-flash',
+        })
+        r = store.get('a1b2c3d4')
+        assert r['joints']['model_used']       == 'gemini-2.5-flash', "model_used stored"
+        assert r['joints']['source_image_path']== aug_path,           "source_image_path stored"
+        assert len(r['joints']['joint_hints']) == 2,                  "joint_hints stored"
+        print("upsert_joints: OK")
+
+        # ── joints are overwritable (re-iteration) ────────────────────────────
+        store.upsert_joints('a1b2c3d4', {
+            'source_image_path': aug_path,
+            'joint_hints':       [{'name': 'hip'}, {'name': 'knee'}, {'name': 'shoulder'}],
+            'skeleton':          [],
+            'suggested_joints':  10,
+            'model_used':        'claude-sonnet-4-6',
+        })
+        r = store.get('a1b2c3d4')
+        assert len(r['joints']['joint_hints']) == 3,                  "joints overwritten"
+        assert r['joints']['model_used']       == 'claude-sonnet-4-6'
+        print("joints re-iteration (overwrite): OK")
+
+        # ── mesh ──────────────────────────────────────────────────────────────
         store.upsert_mesh('a1b2c3d4', {
             'mesh_hash':     'abc123456789',
             'meshy_task_id': 'task-xyz',
@@ -737,14 +803,11 @@ if __name__ == '__main__':
             'usdz_path':     None,
             'usdz_url':      None,
         })
-        assert store.get_mesh_by_hash('abc123456789') is None, \
-            "should be None when GLB file absent"
-
-        # create file → cache hit
+        assert store.get_mesh_by_hash('abc123456789') is None, "miss when file absent"
         open(f'{tmp}/a1b2c3d4_mesh.glb', 'w').close()
         msh = store.get_mesh_by_hash('abc123456789')
-        assert msh is not None,                     "cache hit after file created"
-        assert msh['meshy_task_id'] == 'task-xyz',  "task id matches"
+        assert msh is not None,                    "hit after file created"
+        assert msh['meshy_task_id'] == 'task-xyz'
         print("upsert_mesh / get_mesh_by_hash: OK")
 
         # ── rig ───────────────────────────────────────────────────────────────
@@ -755,45 +818,45 @@ if __name__ == '__main__':
             'user_id':            'user_42',
         })
         r = store.get('a1b2c3d4')
-        assert r['rig']['status']  == 'ok',      "default status ok"
-        assert r['rig']['user_id'] == 'user_42', "user_id stored"
+        assert r['rig']['status']  == 'ok'
+        assert r['rig']['user_id'] == 'user_42'
         print("upsert_rig: OK")
 
-        # ── set_rig_status ────────────────────────────────────────────────────
         store.set_rig_status('a1b2c3d4', 'error', 'Blender crashed')
         r = store.get('a1b2c3d4')
-        assert r['rig']['status'] == 'error',           "status updated"
-        assert r['rig']['error']  == 'Blender crashed', "error message stored"
+        assert r['rig']['status'] == 'error'
+        assert r['rig']['error']  == 'Blender crashed'
         print("set_rig_status: OK")
 
         # ── gallery queries ───────────────────────────────────────────────────
-        by_user = store.get_by_user('user_42')
-        assert len(by_user) == 1, "get_by_user"
-        assert store.search_by_tag('user_42', 'dog')    == [by_user[0]], "tag hit"
-        assert store.search_by_tag('user_42', 'cat')    == [],           "tag miss"
-        assert 'dog' in store.all_tags_for_user('user_42'), "all_tags"
+        assert len(store.get_by_user('user_42'))           == 1,  "get_by_user"
+        assert len(store.search_by_tag('user_42', 'dog'))  == 1,  "tag hit"
+        assert len(store.search_by_tag('user_42', 'cat'))  == 0,  "tag miss"
+        assert 'dog' in store.all_tags_for_user('user_42'),       "all_tags"
         print("get_by_user / search_by_tag / all_tags_for_user: OK")
 
         # ── with_urls ─────────────────────────────────────────────────────────
         wu = store.with_urls(store.get('a1b2c3d4'), 'localhost:6000')
-        assert wu['rig']['rigged_url']    == 'http://localhost:6000/results/a1b2c3d4_rigged.glb'
-        assert wu['mesh']['glb_local_url']== 'http://localhost:6000/results/a1b2c3d4_mesh.glb'
-        assert wu['mesh']['glb_url']      == 'https://cdn.meshy.ai/a1b2c3d4.glb', \
-            "CDN URL preserved"
+        assert wu['active_image_url']      == f'http://localhost:6000/results/a1b2c3d4_augmented_a.png'
+        assert wu['rig']['rigged_url']     == 'http://localhost:6000/results/a1b2c3d4_rigged.glb'
+        assert wu['mesh']['glb_local_url'] == 'http://localhost:6000/results/a1b2c3d4_mesh.glb'
+        assert wu['mesh']['glb_url']       == 'https://cdn.meshy.ai/a1b2c3d4.glb', "CDN URL preserved"
+        assert wu['joints']['source_image_url'] == f'http://localhost:6000/results/a1b2c3d4_augmented_a.png'
         print("with_urls: OK")
 
-        # ── disk persistence (reload) ─────────────────────────────────────────
+        # ── disk persistence ──────────────────────────────────────────────────
         store2 = JsonStore(os.path.join(tmp, '_pipeline_store.json'))
         r2 = store2.get('a1b2c3d4')
         assert r2 is not None
-        assert r2['classify']['object_type'] == 'bronze dog statue (bipedal, no arms)'
+        assert r2['joints']['suggested_joints'] == 10
+        assert r2['active_image_path'] == aug_path
         print("disk persistence: OK")
 
         # ── extract_tags edge cases ───────────────────────────────────────────
         assert extract_tags({}, '') == []
         assert 'the' not in extract_tags({'object_type': 'the big dog'}, 'the+dog')
+        assert 'cat'     in extract_tags({}, 'a+cat')
         assert 'a'   not in extract_tags({}, 'a+cat')
-        assert 'cat' in     extract_tags({}, 'a+cat')
         print("extract_tags edge cases: OK")
 
     print("\n✅ All tests passed")
