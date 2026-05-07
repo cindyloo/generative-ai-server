@@ -51,16 +51,20 @@ log = logging.getLogger(__name__)
 # ── Tag extraction ─────────────────────────────────────────────────────────────
 
 def extract_tags(classify_data: dict, user_tag: str = '') -> list:
-    """Build a deduplicated sorted tag list from classify_data + user_tag."""
     SKIP_PARTS = {'torso', 'spine', 'chest', 'pelvis', 'axle', 'body', 'root'}
+    # Strip pose hint appended by /rig route
+    STOP_WORDS = {'a', 'an', 'the', 'in', 'or', 'for', 'no', 'on', 'and',
+                  't-pose', 'a-pose', 'easy', 'rigging', 'statue', 'two', 'walks'}
     tags = set()
 
     if user_tag:
-        tags.update(user_tag.lower().replace('+', ' ').split())
+        words = user_tag.lower().replace('+', ' ').split()
+        tags.update(w for w in words if w not in STOP_WORDS and len(w) > 2)
 
     if classify_data:
         object_type = classify_data.get('object_type', '')
-        tags.update(object_type.lower().split())
+        words = object_type.lower().replace('(', ' ').replace(')', ' ').split()
+        tags.update(w for w in words if w not in STOP_WORDS and len(w) > 2)
 
         category = classify_data.get('category', '')
         if category:
@@ -72,8 +76,6 @@ def extract_tags(classify_data: dict, user_tag: str = '') -> list:
                 tags.add(bp.lower())
 
     return sorted(t for t in tags if t)
-
-
 # ── Record builder ─────────────────────────────────────────────────────────────
 
 def build_record(classify_id: str,
@@ -154,6 +156,7 @@ class TinyDBBackend:
 
     def search_by_tag(self, user_id: str, tag: str) -> list:
         records = self.get_by_user(user_id)
+        log.info(f"TinyDB search by tag {records}")
         tag     = tag.lower().strip()
         return [r for r in records if tag in r.get('tags', [])]
 
