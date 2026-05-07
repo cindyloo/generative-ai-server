@@ -609,6 +609,7 @@ def classify():
         log.error(f"/classify error: {e}")
         return jsonify({'error': str(e)}), 500
 
+
 @app.route('/augment_image', methods=['GET', 'POST'])
 def augment_image():
     if request.method == 'GET':
@@ -647,7 +648,6 @@ def augment_image():
             'image_a': f"http://{host}/results/aug_{uid}_a.png",
             'image_b': f"http://{host}/results/aug_{uid}_b.png",
         })
-
     except HTTPException:
         raise
     except Exception as e:
@@ -823,6 +823,14 @@ def download_glb(glb_url: str, dest_path: str):
         f.write(resp.content)
     log.info(f"GLB saved: {dest_path}")
  
+def download_file(url: str, dest_path: str):
+    """Download file from URL to local path."""
+    log.info(f"Downloading: {url}")
+    resp = requests.get(url, verify=False, timeout=120)
+    resp.raise_for_status()
+    with open(dest_path, 'wb') as f:
+        f.write(resp.content)
+    log.info(f"Saved: {dest_path}")
  
 def run_skeleton_inference(glb_path: str, rigged_path: str,
                            n_joints: str = None) -> str:
@@ -888,21 +896,12 @@ def joints_from_model(classify_data, glb_path):
 
     name_to_idx = {h['name']: i for i, h in enumerate(hint_objects)}
 
-    # ✅ SIMPLE: Just use position_normalized as-is, no offset math
     joints = []
     for hint in hint_objects:
-        p = hint.get('position_normalized', {})
+        p        = hint.get('position_normalized', {})
         norm_pos = np.array([p.get('x', 0.5), p.get('y', 0.5), p.get('z', 0.5)])
-        
-        world = np.array([
-            bmin[0] + norm_pos[0] * brange[0],
-            bmin[1] + norm_pos[1] * brange[1],
-            bmin[2] + norm_pos[2] * brange[2],
-        ])
-        
-        joints.append(world)
+        joints.append(tuple(bmin + norm_pos * brange))
 
-    # Build hierarchy
     hierarchy = []
     for bone in classify_data.get('skeleton', []):
         p = name_to_idx.get(bone.get('parent'))
@@ -911,7 +910,6 @@ def joints_from_model(classify_data, glb_path):
             hierarchy.append((p, c))
 
     return joints, hierarchy, hint_objects
-    
 def _decimate_mesh(input_path: str, output_path: str, ratio: float = 0.1):
     import tempfile
     import textwrap
@@ -1288,9 +1286,9 @@ def rig():
         log.error(f"/rig error: {e}")
         return jsonify({'error': str(e)}), 500
 
+
 @app.route('/rig/status/<task_id>', methods=['GET'])
 def rig_status(task_id: str):
-    """Poll this until status = 'ok'."""
     task = _rig_tasks.get(task_id)
     if not task:
         return jsonify({'error': 'Task not found'}), 404
@@ -1344,18 +1342,74 @@ def gallery_page():
 @app.route('/gallery_data')
 def gallery_data():
     user_id     = request.args.get('user_id', '').strip() or dummy_user_id
+
     try:
-        records = model_store.store.user_records_with_urls(user_id, request.host)
+        records = model_store.store.get_user_records(user_id)  # raw records, no URL injection
         return jsonify([{
-            'url':             r.get('rigged_url'),
+            'rigged_path':     r.get('rigged_path'),      # just the filename
+            'segmented_image': r.get('segmented_image'),  # just the filename
             'label':           r.get('object_type', 'model'),
             'tags':            r.get('tags', []),
             'classify_id':     r.get('classify_id'),
-            'segmented_image': r.get('segmented_image'),   # ← add this
             'created_at':      r.get('created_at'),
         } for r in records])
     except Exception as e:
         log.error(f"/gallery_data error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+def convert_glb_to_usdz(glb_path: str, usdz_path: str):
+    """Convert GLB to USDZ using meshio (simplest, no Blender)."""
+    try:
+        import meshio
+        
+        log.info(f"Converting {glb_path} → {usdz_path}")
+        
+        # Read GLB
+        mesh = meshio.read(glb_path)
+        
+        # Write USDZ
+        meshio.write(usdz_path, mesh)
+        
+        log.info(f"✓ Converted: {usdz_path}")
+        return usdz_path
+        
+    except Exception as e:
+        log.error(f"meshio conversion failed: {e}")
+        raise
+
+@app.route('/convert_to_usdz', methods=['GET', 'POST'])  # ✅ Add GET
+def convert_to_usdz():
+    """Convert GLB to USDZ preserving animations."""
+    if request.method == 'GET':
+        return jsonify({'status': 'ok'}), 200  # Health check
+    
+    try:
+        glb_url = request.args.get('glb_url', '').strip()
+        if not glb_url:
+            return jsonify({'error': 'Missing glb_url parameter'}), 400
+        
+        # Download GLB
+        resp = requests.get(glb_url, verify=False, timeout=60)
+        resp.raise_for_status()
+        
+        uid = str(uuid.uuid4())[:8]
+        glb_path = os.path.join(RESULTS_DIR, f"{uid}_temp.glb")
+        usdz_path = os.path.join(RESULTS_DIR, f"{uid}_converted.usdz")
+        
+        with open(glb_path, 'wb') as f:
+            f.write(resp.content)
+        
+        convert_glb_to_usdz(glb_path, usdz_path)
+        os.unlink(glb_path)
+        
+        host = request.host
+        return jsonify({
+            'status': 'ok',
+            'usdz_url': f"http://{host}/results/{uid}_converted.usdz"
+        })
+    
+    except Exception as e:
+        log.error(f"/convert_to_usdz error: {e}")
         return jsonify({'error': str(e)}), 500
 
 
