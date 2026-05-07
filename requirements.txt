@@ -1,0 +1,33 @@
+# Web Framework
+Flask==3.0.0
+flask-cors==4.0.0
+Werkzeug==3.0.0
+
+# Image Processing
+Pillow==10.1.0
+rembg==2.0.58
+
+# HTTP & APIs
+requests==2.31.0
+urllib3==2.1.0
+
+# Vision AI Models
+anthropic==0.25.0
+google-genai==0.3.0
+openai==1.3.0
+
+# Image Editing (FAL.ai)
+fal-client==0.5.0
+
+# 3D Mesh Processing
+trimesh==4.0.0
+numpy==1.24.3
+
+# Scientific Computing (for skeleton inference: KDTree, kmeans, MST)
+scipy==1.11.4
+
+# Model Storage
+tinydb==4.8.0
+
+# Mesh I/O (for GLB↔USDZ conversion)
+meshio==5.3.4
