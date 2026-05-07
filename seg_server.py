@@ -57,7 +57,10 @@ import hashlib
 import numpy as np
 
 import utils
-import model_store
+import model_store as ms
+
+_store = ms.get_store()
+ 
 
 # ── Init model store (once at startup) ────────────────────────────────────────
 model_store.init()
@@ -96,41 +99,7 @@ log.info("rembg ready.\n")
 CLASSIFY_CACHE_FILE = os.path.join(RESULTS_DIR, '_classify_cache.json')
 MESH_CACHE_FILE     = os.path.join(RESULTS_DIR, '_mesh_cache.json')
 
-def load_classify_cache():
-    if os.path.exists(CLASSIFY_CACHE_FILE):
-        try:
-            with open(CLASSIFY_CACHE_FILE) as f:
-                data = json.load(f)
-            log.info(f"Loaded {len(data)} cached classifications")
-            return data
-        except Exception as e:
-            log.warning(f"Could not load classify cache: {e}")
-    return {}
 
-def save_classify_cache():
-    try:
-        with open(CLASSIFY_CACHE_FILE, 'w') as f:
-            json.dump(_classify_cache, f, indent=2)
-    except Exception as e:
-        log.warning(f"Could not save classify cache: {e}")
-
-def load_mesh_cache():
-    if os.path.exists(MESH_CACHE_FILE):
-        try:
-            with open(MESH_CACHE_FILE) as f:
-                return json.load(f)
-        except Exception as e:
-            log.warning(f"Could not load mesh cache: {e}")
-    return {}
-
-def save_mesh_cache():
-    try:
-        with open(MESH_CACHE_FILE, 'w') as f:
-            json.dump(_mesh_cache, f, indent=2)
-    except Exception as e:
-        log.warning(f"Could not save mesh cache: {e}")
-
-_classify_cache = load_classify_cache()
 # ── fal.ai image editing ──────────────────────────────────────────────────────
 
 def edit_image_fal(img: Image.Image, prompt: str) -> Image.Image:
@@ -564,42 +533,55 @@ def _try_openai(img_base64: str, mime_type: str, prompt: str):
     return None
 
 
+def _get_classify_data(classify_id: str | None) -> dict | None:
+    """Fetch classify sub-object from unified store."""
+    if not classify_id:
+        return None
+    record = _store.get(classify_id)
+    if record and record.get("classify"):
+        return record["classify"]
+    log.warning(f"classify_id '{classify_id}' not in store — rigging without hints")
+    return None
+
 @app.route('/classify', methods=['GET', 'POST'])
 def classify():
     if request.method == 'GET':
         return jsonify({'status': 'ok'}), 200
     try:
-        tag       = request.args.get('tag', '').strip()
-        img_bytes = request.stream.read()
+        tag         = request.args.get('tag', '').strip()
+        force       = request.args.get('force', '').lower() in ('1', 'true', 'yes')
+        img_bytes   = request.stream.read()
         if not img_bytes:
             return jsonify({'error': 'No data received'}), 400
 
-        # classify_id is a stable hash of image + tag
         classify_id = hashlib.md5(img_bytes + tag.encode()).hexdigest()[:8]
 
-        # Cache hit
-        if classify_id in _classify_cache:
-            log.info(f"Cache hit: classify_id={classify_id}")
-            return jsonify({**_classify_cache[classify_id], 'classify_id': classify_id})
+        # ── Cache hit (skipped when force=true) ───────────────────────────────
+        if not force:
+            record = _store.get(classify_id)
+            if record and record.get('classify'):
+                log.info(f"Cache hit: classify_id={classify_id}")
+                return jsonify({**record['classify'], 'classify_id': classify_id})
+        else:
+            log.info(f"Force re-classify: classify_id={classify_id}")
 
+        # ── Run vision classification ─────────────────────────────────────────
         mime_type        = 'image/png' if img_bytes[:4] == b'\x89PNG' else 'image/jpeg'
         requested_joints = request.args.get('joints', '').strip()
 
         info = classify_with_vision(img_bytes, mime_type, tag or None,
                                     requested_joints=requested_joints or None)
 
-        # Save segmented image with classify_id prefix (RGBA PNG, keeps transparency)
         segmented_image_path = os.path.join(RESULTS_DIR, f"{classify_id}_segmented.png")
         if not os.path.exists(segmented_image_path):
             img = Image.open(io.BytesIO(img_bytes)).convert('RGBA')
             img.save(segmented_image_path, format='PNG')
             log.info(f"Segmented image saved: {segmented_image_path}")
 
-        info['classify_id']     = classify_id
-        info['segmented_image'] = segmented_image_path
+        info['segmented_image_path'] = segmented_image_path
 
-        _classify_cache[classify_id] = info
-        save_classify_cache()
+        # ── Persist (overwrites on force=true) ────────────────────────────────
+        _store.upsert_classify(classify_id, tag, info)
 
         return jsonify({**info, 'classify_id': classify_id})
 
@@ -608,8 +590,8 @@ def classify():
     except Exception as e:
         log.error(f"/classify error: {e}")
         return jsonify({'error': str(e)}), 500
-
-
+        
+        
 @app.route('/augment_image', methods=['GET', 'POST'])
 def augment_image():
     if request.method == 'GET':
@@ -1004,103 +986,83 @@ def run_vehicle_pipeline(classify_id: str, glb_path: str,
     return rigged_path
 
 
-def run_rig_pipeline(task_id, img, object_type, n_joints,
+ef run_rig_pipeline(task_id, img, object_type, n_joints,
                      classify_data, classify_id, user_id,
                      rig_hash, mesh_hash, host):
     """
-    Parameters
-    ----------
-    task_id         — internal task UUID for status polling
-    img             — PIL Image (RGBA, already resized)
-    object_type     — user tag + pose hint string
-    n_joints        — optional joint count override
-    classify_data   — full dict from /classify (may be None)
-    classify_id     — stable hash ID from /classify — used for ALL file names
-    user_id         — owner identifier from App Inventor
-    rig_hash        — hash for rig deduplication (unused currently)
-    mesh_hash       — hash for mesh cache lookup
-    host            — request.host for building URLs
+    Parameters are unchanged — only the cache/store calls are different.
     """
     try:
         _rig_tasks[task_id] = {'status': 'meshy', 'progress': 0}
-
-        # Segmented image was saved in /classify with this path
+        _store.set_rig_status(classify_id, 'meshy')
+ 
         segmented_image_path = os.path.join(RESULTS_DIR, f"{classify_id}_segmented.png")
-
-        # ── Mesh cache check ──────────────────────────────────────────────────
-        glb_path  = None
-        glb_url   = None
-        usdz_path = None
-
-        if mesh_hash and mesh_hash in _mesh_cache:
-            cached = _mesh_cache[mesh_hash]
-            if os.path.exists(cached.get('glb_path', '')):
-                log.info(f"Mesh cache hit: {mesh_hash}")
-                glb_path  = cached['glb_path']
-                glb_url   = cached['glb_url']
-                usdz_path = cached.get('usdz_path')   # local path, may be None
-            else:
-                log.warning("Mesh cache points to missing file, re-running Meshy")
-                del _mesh_cache[mesh_hash]
-                save_mesh_cache()
-
-        if glb_path is None:
+ 
+        # ── Mesh cache check via unified store ────────────────────────────────
+        cached_mesh = _store.get_mesh_by_hash(mesh_hash)
+        if cached_mesh:
+            log.info(f"Mesh cache hit: {mesh_hash}")
+            glb_path  = cached_mesh['glb_path']
+            glb_url   = cached_mesh['glb_url']
+            usdz_path = cached_mesh.get('usdz_path')
+            mesh_uid  = cached_mesh.get('meshy_task_id', classify_id)
+        else:
             meshy_task_id, glb_url, usdz_url = meshy_reconstruct(img, object_type)
-            mesh_uid = meshy_task_id[:8]
-
-            # Name all files with classify_id for consistency
-            glb_path = os.path.join(RESULTS_DIR, f"{classify_id}_mesh.glb")
-            download_file(glb_url, glb_path)
-
+            mesh_uid  = meshy_task_id[:8]
+            glb_path  = os.path.join(RESULTS_DIR, f"{classify_id}_mesh.glb")
             usdz_path = None
+ 
+            download_file(glb_url, glb_path)
             if usdz_url:
                 usdz_path = os.path.join(RESULTS_DIR, f"{classify_id}_mesh.usdz")
                 download_file(usdz_url, usdz_path)
-
-            _mesh_cache[mesh_hash] = {
-                'glb_path':  glb_path,
-                'glb_url':   glb_url,
-                'usdz_path': usdz_path,  # local path (stable)
-                'usdz_url':  usdz_url,   # CDN URL (may expire)
-                'mesh_uid':  mesh_uid,
-            }
-            save_mesh_cache()
-
-        mesh_uid = _mesh_cache[mesh_hash].get('mesh_uid', classify_id)
-
+ 
+            # ── Persist mesh immediately so a crash doesn't lose Meshy credits ─
+            _store.upsert_mesh(classify_id, {
+                "mesh_hash":     mesh_hash,
+                "meshy_task_id": meshy_task_id,
+                "glb_path":      glb_path,
+                "glb_url":       glb_url,
+                "usdz_path":     usdz_path,
+                "usdz_url":      usdz_url,
+            })
+ 
         # ── Branch: vehicle vs character ──────────────────────────────────────
+        _rig_tasks[task_id] = {'status': 'rigging', 'progress': 60}
+        _store.set_rig_status(classify_id, 'rigging')
+ 
         category  = (classify_data or {}).get('category', '')
         tag_words = set(object_type.lower().split())
-
+ 
         is_vehicle = (category == 'vehicle' or
                       (category not in ('animal', 'humanoid', 'other') and
                        bool(tag_words & VEHICLE_KEYWORDS)))
-
+ 
         log.info(f"Category: '{category}' is_vehicle: {is_vehicle}")
-
+ 
+        decimated_glb_path = None
+        skeleton_json_path = None
+        viz_glb_path       = None
+ 
         if is_vehicle:
-            _rig_tasks[task_id] = {'status': 'rigging', 'progress': 60}
             rigged_path = run_vehicle_pipeline(classify_id, glb_path,
                                                classify_data or {}, host)
         else:
-            decimated_path = os.path.join(RESULTS_DIR, f"{classify_id}_decimated.glb")
-            _decimate_mesh(glb_path, decimated_path, ratio=0.1)
-            glb_path = decimated_path
-
-            rigged_path = os.path.join(RESULTS_DIR, f"{classify_id}_rigged.glb")
-            _rig_tasks[task_id] = {'status': 'rigging', 'progress': 70}
-            json_path   = run_skeleton_inference(glb_path, rigged_path, n_joints)
-
+            decimated_glb_path = os.path.join(RESULTS_DIR, f"{classify_id}_decimated.glb")
+            _decimate_mesh(glb_path, decimated_glb_path, ratio=0.1)
+            active_glb = decimated_glb_path
+ 
+            rigged_path        = os.path.join(RESULTS_DIR, f"{classify_id}_rigged.glb")
+            skeleton_json_path = run_skeleton_inference(active_glb, rigged_path, n_joints)
+ 
             if classify_data:
-                joints, hierarchy, hint_objects = joints_from_model(classify_data, glb_path)
-
+                joints, hierarchy, hint_objects = joints_from_model(classify_data, active_glb)
                 if joints:
                     if not hierarchy:
-                        with open(json_path) as f:
+                        with open(skeleton_json_path) as f:
                             existing_skel = json.load(f)
                         hierarchy = [(b['parent'], b['child'])
                                      for b in existing_skel['bones']]
-
                     skel = {
                         'joints': [
                             {'id': i,
@@ -1117,7 +1079,7 @@ def run_rig_pipeline(task_id, img, object_type, n_joints,
                         ]
                     }
                 else:
-                    with open(json_path) as f:
+                    with open(skeleton_json_path) as f:
                         skel = json.load(f)
                     for i, joint in enumerate(skel['joints']):
                         if i < len(hint_objects):
@@ -1125,45 +1087,51 @@ def run_rig_pipeline(task_id, img, object_type, n_joints,
                             joint['name'] = h.get('name', joint['name']) if isinstance(h, dict) else h
                             joint['hint'] = h if isinstance(h, dict) else None
             else:
-                with open(json_path) as f:
+                with open(skeleton_json_path) as f:
                     skel = json.load(f)
-
+ 
             skel = utils.inject_keyframes(skel)
-
-            with open(json_path, 'w') as f:
+ 
+            with open(skeleton_json_path, 'w') as f:
                 json.dump(skel, f, indent=2)
-
+ 
             try:
                 from rig import visualize_skeleton
-                viz_path = os.path.join(RESULTS_DIR, f"{classify_id}_viz.glb")
+                viz_glb_path = os.path.join(RESULTS_DIR, f"{classify_id}_viz.glb")
                 visualize_skeleton(
-                    glb_path,
+                    active_glb,
                     [tuple(j['position']) for j in skel['joints']],
                     [(b['parent'], b['child']) for b in skel['bones']],
-                    viz_path,
+                    viz_glb_path,
                     labels=[j['name'] for j in skel['joints']],
                     labels_raw=[j.get('hint') for j in skel['joints']],
                 )
-                log.info(f"Skeleton viz: {viz_path}")
+                log.info(f"Skeleton viz: {viz_glb_path}")
             except Exception as e:
                 log.warning(f"Viz failed (non-fatal): {e}")
-
-            run_blender_rig(glb_path, json_path, rigged_path)
-
-        # ── Persist to gallery ────────────────────────────────────────────────
-        model_store.store.save_model_record(
-            classify_id     = classify_id,
-            mesh_id         = mesh_uid,
-            user_id         = user_id,
-            classify_data   = classify_data,
-            segmented_image = segmented_image_path,
-            glb_path        = glb_path,
-            glb_url         = glb_url,
-            usdz_path       = usdz_path,
-            rigged_path     = rigged_path,
-            user_tag        = object_type,
-        )
-
+ 
+            run_blender_rig(active_glb, skeleton_json_path, rigged_path)
+ 
+        # ── Update mesh record with decimated path (if computed) ──────────────
+        if decimated_glb_path:
+            _store.upsert_mesh(classify_id, {
+                "mesh_hash":          mesh_hash,
+                "meshy_task_id":      mesh_uid,
+                "glb_path":           glb_path,
+                "glb_url":            glb_url,
+                "usdz_path":          usdz_path,
+                "decimated_glb_path": decimated_glb_path,
+            })
+ 
+        # ── Persist rig record ────────────────────────────────────────────────
+        _store.upsert_rig(classify_id, {
+            "rigged_glb_path":   rigged_path,
+            "viz_glb_path":      viz_glb_path,
+            "skeleton_json_path":skeleton_json_path,
+            "status":            "ok",
+            "user_id":           user_id,
+        })
+ 
         rigged_url = f"http://{host}/results/{os.path.basename(rigged_path)}"
         _rig_tasks[task_id] = {
             'status':      'ok',
@@ -1172,12 +1140,13 @@ def run_rig_pipeline(task_id, img, object_type, n_joints,
             'glb_url':     glb_url,
             'classify_id': classify_id,
         }
-
+ 
     except Exception as e:
         log.error(f"Rig task {task_id} failed: {e}")
         _rig_tasks[task_id] = {'status': 'error', 'error': str(e)}
-        
-        
+        _store.set_rig_status(classify_id, 'error', str(e))
+ 
+ 
 @app.route('/decimate', methods=['GET', 'POST'])
 def decimate():
     """
@@ -1300,59 +1269,58 @@ def serve_result(filename):
     return send_file(os.path.join(RESULTS_DIR, filename))
 
 
-@app.route('/gallery', methods=['GET'])
-def gallery():
-    """
-    ?user_id=abc          — required
-    ?tag=dog              — optional tag filter
-    ?format=json          — full records with URLs (default)
-    ?format=listview      — pipe-separated strings for App Inventor ListView
-    """
-    tag     = request.args.get('tag', '').strip().lower()
-    fmt     = request.args.get('format', 'json').strip()
-
-    user_id     = request.args.get('user_id', '').strip() or dummy_user_id
-
-    try:
-        records = (model_store.store.search_by_tag(user_id, tag)
-                   if tag
-                   else model_store.store.get_user_records(user_id))
-
-        records = [model_store.store.with_urls(r, request.host) for r in records]
-
-        if fmt == 'listview':
-            return jsonify([
-                f"{r.get('object_type', 'model')}|{r.get('rigged_url', '')}"
-                for r in records
-            ])
-
-        return jsonify(records)
-
-    except Exception as e:
-        log.error(f"/gallery error: {e}")
-        return jsonify({'error': str(e)}), 500
-
-
 @app.route('/gallery_page')
 def gallery_page():
     """Serve gallery.html for App Inventor WebViewer."""
     return send_file(os.path.join(os.path.dirname(__file__), 'gallery.html'))
 
-
+@app.route('/gallery', methods=['GET'])
+def gallery():
+    tag     = request.args.get('tag', '').strip().lower()
+    fmt     = request.args.get('format', 'json').strip()
+    user_id = request.args.get('user_id', '').strip() or dummy_user_id
+ 
+    try:
+        records = (_store.search_by_tag(user_id, tag)
+                   if tag
+                   else _store.get_by_user(user_id))
+ 
+        # Inject http:// URLs for all local file paths
+        records = [_store.with_urls(r, request.host) for r in records]
+ 
+        if fmt == 'listview':
+            return jsonify([
+                f"{r.get('tag', 'model')}|{(r.get('rig') or {}).get('rigged_url', '')}"
+                for r in records
+            ])
+ 
+        return jsonify(records)
+ 
+    except Exception as e:
+        log.error(f"/gallery error: {e}")
+        return jsonify({'error': str(e)}), 500
+ 
+ 
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 6 — /gallery_data route
+# Replace the route body with this.
+# ═══════════════════════════════════════════════════════════════════════════════
+ 
 @app.route('/gallery_data')
 def gallery_data():
-    user_id     = request.args.get('user_id', '').strip() or dummy_user_id
-
+    user_id = request.args.get('user_id', '').strip() or dummy_user_id
+ 
     try:
-        records = model_store.store.get_user_records(user_id)  # raw records, no URL injection
+        records = _store.get_by_user(user_id)
         return jsonify([{
-            'rigged_path':     r.get('rigged_path'),      # just the filename
-            'segmented_image': r.get('segmented_image'),  # just the filename
-            'label':           r.get('object_type', 'model'),
-            'tags':            r.get('tags', []),
             'classify_id':     r.get('classify_id'),
-            'created_at':      r.get('created_at'),
+            'label':           r.get('tag', 'model'),
+            'rigged_path':     (r.get('rig')      or {}).get('rigged_glb_path'),
+            'segmented_image': (r.get('classify') or {}).get('segmented_image_path'),
+            'created_at':      (r.get('rig')      or {}).get('created_at'),
+            'tags':            [],  # extend here if you add a tags field
         } for r in records])
+ 
     except Exception as e:
         log.error(f"/gallery_data error: {e}")
         return jsonify({'error': str(e)}), 500
