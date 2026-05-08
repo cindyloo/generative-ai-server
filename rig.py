@@ -43,7 +43,6 @@ import numpy as np
 import os
 import argparse
 import json
-
 from pathlib import Path
 
 
@@ -215,6 +214,13 @@ def create_animations_from_hints(armature_obj, joint_hints: list):
     except ImportError:
         raise RuntimeError("create_animations_from_hints must run inside Blender")
 
+    # ✓ SET ACTIVE FIRST
+    bpy.context.view_layer.objects.active = armature_obj
+    armature_obj.select_set(True)
+    
+    # Now safe to access pose.bones
+    pose_bones = {b.name: b for b in armature_obj.pose.bones}
+    
     clips = {}
     for hint in joint_hints:
         if not isinstance(hint, dict):
@@ -223,17 +229,17 @@ def create_animations_from_hints(armature_obj, joint_hints: list):
             clips.setdefault(anim['clip'], []).append((hint['name'], anim))
 
     if not clips:
+        print("  No animations found in hints")
         return
 
     axis_map   = {'x': 0, 'y': 1, 'z': 2}
-    pose_bones = {b.name: b for b in armature_obj.pose.bones}
-
+    
     armature_obj.animation_data_create()
-    bpy.context.view_layer.objects.active = armature_obj
     bpy.ops.object.mode_set(mode='POSE')
 
     for bone in armature_obj.pose.bones:
         bone.rotation_mode = 'XYZ'
+
 
     # Build set of bone names that have explicit location animations
     # so we can decide which location fcurves to keep
@@ -328,8 +334,8 @@ def point_to_segment_distance(points, seg_start, seg_end):
 
 def build_segment_weights(mesh_obj, armature_obj, skeleton_joints_data):
     """
-    Assign each vertex to its nearest bone segment.
-    Uses deforms_mesh hint from Gemini to constrain rigid body parts.
+    Assign vertices with smooth, distance-based weighting.
+    Avoids the hard edges of single-bone assignment.
     """
     import numpy as np
     import bpy
@@ -352,90 +358,152 @@ def build_segment_weights(mesh_obj, armature_obj, skeleton_joints_data):
 
     bmin = verts.min(axis=0)
     bmax = verts.max(axis=0)
-    mesh_size = np.linalg.norm(bmax - bmin)  # ← add this
+    mesh_size = np.linalg.norm(bmax - bmin)
 
     seg_dists = np.column_stack([
         point_to_segment_distance(verts, head, tail)
         for head, tail in bone_segments
     ])
 
-# Find terminal bones — bones that are never a parent of another bone
+    # Find terminal bones
     all_parent_names = set()
     for b in armature_obj.data.bones:
         if b.parent:
             all_parent_names.add(b.parent.name)
 
-        terminal_bone_indices = [
-            i for i, name in enumerate(bone_names_list)
-            if name not in all_parent_names
-        ]
+    terminal_bone_indices = [
+        i for i, name in enumerate(bone_names_list)
+        if name not in all_parent_names
+    ]
 
-    # Hard-lock vertices near terminal bones to those bones exclusively
+    # Hard-lock vertices near terminal bones (feet, hands, head)
+    # These must NOT share influence with neighboring terminals
     for ti in terminal_bone_indices:
         head, tail      = bone_segments[ti]
         bone_center     = (head + tail) / 2
-        terminal_radius = mesh_size * 0.18
+        terminal_radius = mesh_size * 0.15  # ← Tighter radius
         dists_to_bone   = np.linalg.norm(verts - bone_center, axis=1)
         terminal_mask   = dists_to_bone < terminal_radius
         if terminal_mask.any():
-            seg_dists[terminal_mask, :]  = np.inf
-            seg_dists[terminal_mask, ti] = 0.0
-            
+            seg_dists[terminal_mask, :]  = np.inf  # Clear all other influences
+            seg_dists[terminal_mask, ti] = 0.0     # Hard-assign only to this terminal
             print(f"  Locked {terminal_mask.sum()} vertices to terminal bone: {bone_names_list[ti]}")
-    if skeleton_joints_data:
-        rigid_bones   = set()
-        deform_bones  = set()
-        for joint in skeleton_joints_data:
-            hint = joint.get('hint') or {}
-            name = joint.get('name', '')
-            if not hint.get('deforms_mesh', True):
-                rigid_bones.add(name)
-            else:
-                deform_bones.add(name)
 
-        rigid_indices  = [i for i, n in enumerate(bone_names_list) if n in rigid_bones]
-        deform_indices = [i for i, n in enumerate(bone_names_list) if n in deform_bones]
+    # ✅ Build smooth Gaussian-based weights
+    smooth_weights = np.zeros((len(verts), len(bone_names_list)))
+    
+    # Instead of:
+    sigma = mesh_size * 0.1
 
-        if rigid_indices and deform_indices:
-            mesh_size = np.linalg.norm(verts.max(axis=0) - verts.min(axis=0))
-            for ri in rigid_indices:
-                head, tail       = bone_segments[ri]
-                bone_center_y    = (head[1] + tail[1]) / 2
-                y_range          = abs(tail[1] - head[1]) * 0.3 + mesh_size * 0.05  # ← REDUCED from 0.5 + 0.1
-                near_rigid_mask  = np.abs(verts[:, 1] - bone_center_y) < y_range
-                seg_dists[np.ix_(near_rigid_mask, deform_indices)] = np.inf
+    # Per-bone sigma based on bone length:
+    for bi in range(len(bone_names_list)):
+        head, tail = bone_segments[bi]
+        bone_len   = np.linalg.norm(tail - head)
+        sigma      = max(bone_len * 0.5, mesh_size * 0.02)  # at least 2% of mesh
+        distances  = seg_dists[:, bi]
+        smooth_weights[:, bi] = np.exp(-(distances ** 2) / (2 * sigma ** 2))
 
-    bmin     = np.percentile(verts, 2,  axis=0)
-    bmax     = np.percentile(verts, 98, axis=0)
-    center_y = (bmin[2] + bmax[2]) / 2
 
-    upper_bone_indices = [
-        i for i, name in enumerate(bone_names_list)
-        if any(k in name.lower() for k in ['head', 'neck', 'spine', 'torso'])
-    ]
-    lower_bone_indices = [
-        i for i, name in enumerate(bone_names_list)
-        if any(k in name.lower() for k in ['leg', 'foot', 'root', 'pelvis', 'hip'])
-    ]
-    upper_mask = verts[:, 2] > center_y
-    lower_mask = verts[:, 2] <= center_y
+    # Normalize weights per vertex
+    weight_sums = smooth_weights.sum(axis=1, keepdims=True)
+    weight_sums[weight_sums == 0] = 1.0
+    smooth_weights /= weight_sums
 
-    if upper_bone_indices and lower_bone_indices:
-        seg_dists[np.ix_(upper_mask, lower_bone_indices)] *= 10.0
-        seg_dists[np.ix_(lower_mask, upper_bone_indices)] *= 10.0
-
-    nearest = np.argmin(seg_dists, axis=1)
+    # Assign to vertex groups
     for bi, bname in enumerate(bone_names_list):
-        mask = np.where(nearest == bi)[0]
-        if len(mask):
-            mesh_obj.vertex_groups[bname].add(
-                mask.tolist(), 1.0, 'REPLACE'
-            )
+        for vi, weight in enumerate(smooth_weights[:, bi]):
+            if weight > 0.01:  # Skip negligible weights
+                mesh_obj.vertex_groups[bname].add([vi], weight, 'REPLACE')
 
     mod        = mesh_obj.modifiers.new(name="Armature", type='ARMATURE')
     mod.object = armature_obj
-    print(f"  Segment weights assigned: {mesh_obj.name}")
+    print(f"  Smooth segment weights assigned: {mesh_obj.name}")
     
+    
+    
+def validate_bone_mesh_fit(mesh_obj, armature_obj):
+    """
+    Check if bones are actually ON/IN the mesh using Blender only.
+    """
+    import numpy as np
+    
+    print(f"\n{'='*60}")
+    print("BONE-MESH VALIDATION")
+    print(f"{'='*60}")
+    
+    # Get mesh vertices in world space
+    verts_local = np.array([v.co for v in mesh_obj.data.vertices])
+    mat = np.array(mesh_obj.matrix_world)
+    ones = np.ones((len(verts_local), 1))
+    verts_world = (mat @ np.hstack([verts_local, ones]).T).T[:, :3]
+    
+    mesh_min = verts_world.min(axis=0)
+    mesh_max = verts_world.max(axis=0)
+    mesh_center = (mesh_min + mesh_max) / 2
+    mesh_size = np.linalg.norm(mesh_max - mesh_min)
+    
+    report = {}
+    bones_inside = 0
+    bones_outside = 0
+    bones_near = 0
+    
+    print(f"\nMesh info:")
+    print(f"  Center: ({mesh_center[0]:.3f}, {mesh_center[1]:.3f}, {mesh_center[2]:.3f})")
+    print(f"  Size: {mesh_size:.3f}")
+    print(f"  Bounds: X[{mesh_min[0]:.3f}, {mesh_max[0]:.3f}] "
+          f"Y[{mesh_min[1]:.3f}, {mesh_max[1]:.3f}] "
+          f"Z[{mesh_min[2]:.3f}, {mesh_max[2]:.3f}]")
+    
+    print(f"\nBone positions:")
+    for bone in armature_obj.data.bones:
+        head_world = armature_obj.matrix_world @ bone.head_local
+        head_arr = np.array(head_world[:3])
+        
+        # Check if head is inside bounding box
+        inside_bbox = all([
+            mesh_min[i] <= head_arr[i] <= mesh_max[i]
+            for i in range(3)
+        ])
+        
+        # Distance to mesh center
+        dist_to_center = np.linalg.norm(head_arr - mesh_center)
+        
+        # Distance to nearest vertex
+        distances_to_verts = np.linalg.norm(verts_world - head_arr, axis=1)
+        dist_to_nearest_vert = distances_to_verts.min()
+        
+        # Classify
+        if inside_bbox:
+            status = "✓ INSIDE"
+            bones_inside += 1
+        elif dist_to_nearest_vert < mesh_size * 0.1:  # Within 10% of mesh size
+            status = "~ NEAR"
+            bones_near += 1
+        else:
+            status = "✗ FAR"
+            bones_outside += 1
+        
+        report[bone.name] = {
+            'position': tuple(head_arr),
+            'inside_bbox': inside_bbox,
+            'dist_to_nearest_vert': float(dist_to_nearest_vert),
+            'status': status
+        }
+        
+        print(f"  {bone.name:20s}: {status:10s} pos=({head_arr[0]:7.3f}, {head_arr[1]:7.3f}, {head_arr[2]:7.3f}) "
+              f"vert_dist={dist_to_nearest_vert:.4f}")
+    
+    print(f"\nSummary:")
+    print(f"  Inside bbox: {bones_inside}")
+    print(f"  Near surface: {bones_near}")
+    print(f"  Far outside: {bones_outside}")
+    print(f"{'='*60}\n")
+    
+    if bones_outside > 0:
+        print(f"⚠️  WARNING: {bones_outside} bones are far outside mesh!")
+        print(f"   Denormalization may have failed.\n")
+    
+    return report
     
 def skin_mesh(mesh_objects, armature_obj, skeleton_joints_data):
     """
@@ -486,64 +554,115 @@ def skin_mesh(mesh_objects, armature_obj, skeleton_joints_data):
 
 
 def build_armature(arm_data, joints, hierarchy, bone_names):
-    """
-    Create bones in edit mode. Returns bone_map.
-    """
-    import bpy
+    import bpy, numpy as np
 
-    for bone in arm_data.edit_bones:
-        arm_data.edit_bones.remove(bone)
+    for b in arm_data.edit_bones:
+        arm_data.edit_bones.remove(b)
 
     # Deduplicate hierarchy
-    seen_children    = set()
+    seen_children = set()
     unique_hierarchy = []
-    for parent_idx, child_idx in hierarchy:
-        if child_idx not in seen_children:
-            seen_children.add(child_idx)
-            unique_hierarchy.append((parent_idx, child_idx))
-        else:
-            print(f"  Skipping duplicate child bone {child_idx}")
+    for p, c in hierarchy:
+        if c not in seen_children:
+            seen_children.add(c)
+            unique_hierarchy.append((p, c))
     hierarchy = unique_hierarchy
 
-    # Find root
-    child_indices = {c for p, c in hierarchy}
-    root_idx      = next((i for i in range(len(joints))
-                          if i not in child_indices), 0)
-    root_name     = bone_names[root_idx] if bone_names and root_idx < len(bone_names) else f'joint_{root_idx}'
-    print(f"  Root joint: {root_name}")
+    children_map = {}
+    for p, c in hierarchy:
+        children_map.setdefault(p, []).append(c)
 
-    # Create root bone
-    root_bone       = arm_data.edit_bones.new(root_name)
-    root_bone.head  = joints[root_idx]
-    first_child_idx = next((c for p, c in hierarchy if p == root_idx), None)
-    root_bone.tail  = joints[first_child_idx] if first_child_idx is not None else (
-        joints[root_idx][0], joints[root_idx][1], joints[root_idx][2] + 0.1
-    )
-    bone_map = {(root_idx, root_idx): root_bone}
-    print(f"  Bone: {root_name} (root)")
+    # One bone per joint
+    for i, joint in enumerate(joints):
+        name = bone_names[i] if bone_names and i < len(bone_names) else f'joint_{i}'
+        bone = arm_data.edit_bones.new(name)
+        bone.head = joints[i]
 
-    def bone_name(parent_idx, child_idx):
-        if bone_names and child_idx < len(bone_names):
-            return bone_names[child_idx]
-        return f"bone_{child_idx}"
+        child_ids = children_map.get(i, [])
+        if child_ids:
+            bone.tail = joints[child_ids[0]]
+        else:
+            # Leaf bone
+            parent_idx = next((p for p, c in hierarchy if c == i), None)
+            if parent_idx is not None:
+                d = np.array(joints[i]) - np.array(joints[parent_idx])
+                n = np.linalg.norm(d)
+                d = d / n if n > 0 else np.array([0, 0.1, 0])
+                bone.tail = tuple(np.array(joints[i]) + d * 0.05)
+            else:
+                bone.tail = (joints[i][0], joints[i][1] + 0.1, joints[i][2])
 
-    for parent_idx, child_idx in hierarchy:
-        name       = bone_name(parent_idx, child_idx)
-        bone       = arm_data.edit_bones.new(name)
-        bone.head  = joints[parent_idx]
-        bone.tail  = joints[child_idx]
-        bone_map[(parent_idx, child_idx)] = bone
+        _align_bone_roll(bone)
         print(f"  Bone: {name}")
 
-    for (p1, c1), b1 in bone_map.items():
-        for (p2, c2), b2 in bone_map.items():
-            if c1 == p2 and b1 != b2:
-                b2.parent      = b1
-                b2.use_connect = True
+    # Parent bones with use_connect = True
+    for parent_idx, child_idx in hierarchy:
+        pname = bone_names[parent_idx] if bone_names else f'joint_{parent_idx}'
+        cname = bone_names[child_idx]  if bone_names else f'joint_{child_idx}'
+        pb = arm_data.edit_bones.get(pname)
+        cb = arm_data.edit_bones.get(cname)
+        if pb and cb:
+            cb.parent = pb
+            cb.use_connect = True   # ✅ CHANGED: Allow child head to snap to parent tail
 
-    return bone_map, hierarchy
+    n_bones = len(arm_data.edit_bones)
+    print(f"Armature: {n_bones} bones")
+    return {}, hierarchy
 
+def _align_bone_roll(bone):
+    """
+    Align bone roll so local X ≈ world X for all bone orientations.
+    This ensures Euler X rotations produce the expected world-space movement:
+      - Leg bones (pointing down): X rotation = forward/backward swing ✓
+      - Spine bones (pointing up): X rotation = side lean ✓
+      - Arm bones (pointing sideways): X rotation = forward/backward swing ✓
+    Without this, local X can point in any direction (in this model it pointed
+    straight DOWN, causing legs to spin instead of swing).
+    """
+    import mathutils
+    from mathutils import Vector
+    bone_dir = (bone.tail - bone.head).normalized()
 
+    # Primary alignment: make local Z point toward world Y (forward/depth axis).
+    # For a downward leg bone this gives local X = world X (left-right) = swing axis.
+    align_vec = mathutils.Vector((0, 1, 0))
+
+    # If bone is nearly parallel to world Y (e.g. a horizontal arm bone),
+    # fall back to world Z (up) to avoid degenerate alignment.
+    if abs(bone_dir.dot(align_vec)) > 0.9:
+        align_vec = mathutils.Vector((0, 0, 1))
+
+    bone.align_roll(align_vec)
+
+#not used yet
+def create_facial_shape_keys(mesh_objects, classify_data):
+    """
+    Create blink and mouth_open shape keys on the head mesh region.
+    Only runs if object has a recognizable face (dog, human, creature, etc.)
+    """
+    import bpy
+    import bmesh
+
+    category    = (classify_data or {}).get('category', '')
+    object_type = (classify_data or {}).get('object_type', '').lower()
+
+    has_face = any(w in object_type for w in
+                   ['dog', 'cat', 'human', 'creature', 'monster', 'robot', 'alien'])
+    if not has_face:
+        return
+
+    for mesh_obj in mesh_objects:
+        # Basis shape key required first
+        if not mesh_obj.data.shape_keys:
+            mesh_obj.shape_key_add(name='Basis', from_mix=False)
+
+        # Add named shape keys — actual deformation authored separately
+        # For now just register them so they appear in the GLB morph targets
+        mesh_obj.shape_key_add(name='blink_left',  from_mix=False)
+        mesh_obj.shape_key_add(name='blink_right', from_mix=False)
+        mesh_obj.shape_key_add(name='mouth_open',  from_mix=False)
+
+        print(f"  Shape keys added to {mesh_obj.name}")
 # ── Blender rigging ───────────────────────────────────────────────────────────
 
 def rig_in_blender(mesh_path: str, joints: list, hierarchy: list,
@@ -594,12 +713,33 @@ def rig_in_blender(mesh_path: str, joints: list, hierarchy: list,
         armature_obj.scale          = (1, 1, 1)
         bpy.ops.object.mode_set(mode='EDIT')
 
+        print(f"[DEBUG] About to call validate_bone_mesh_fit")
+        print(f"[DEBUG] mesh_objects count: {len(mesh_objects)}")
+        print(f"[DEBUG] armature_obj: {armature_obj.name}")
         bone_map, hierarchy = build_armature(
             armature_obj.data, joints, hierarchy, bone_names
         )
 
         bpy.ops.object.mode_set(mode='OBJECT')
         print(f"Armature: {len(bone_map)} bones")
+        print(f"[VALIDATE_START]")
+        import sys
+        sys.stdout.flush()
+        sys.stderr.flush()
+        
+        try:
+            print(f"[VALIDATE_START]")
+            import sys
+            sys.stdout.flush()
+            validate_bone_mesh_fit(mesh_objects[0], armature_obj)
+            print(f"[VALIDATE_COMPLETE]")
+            sys.stdout.flush()
+        except Exception as e:
+            print(f"[VALIDATE_ERROR] {e}")
+            import traceback
+            traceback.print_exc()
+
+        # ── Apply transforms ──────────────────────────────────────
 
         # ── Apply transforms ──────────────────────────────────────
         bpy.ops.object.select_all(action='DESELECT')
@@ -615,6 +755,13 @@ def rig_in_blender(mesh_path: str, joints: list, hierarchy: list,
         # ── Animations ────────────────────────────────────────────
         joint_hints = [j.get('hint') for j in skeleton_joints_data] if skeleton_joints_data else []
         create_animations_from_hints(armature_obj, joint_hints)
+
+
+        for action in bpy.data.actions:
+            print(f"  Action: {action.name}")
+            print(f"    FCurves: {len(action.fcurves)}")
+            for fc in action.fcurves:
+                print(f"      {fc.data_path} [{fc.array_index}]: {len(fc.keyframe_points)} keyframes")
 
         # ── Export ────────────────────────────────────────────────
         bpy.ops.export_scene.gltf(
