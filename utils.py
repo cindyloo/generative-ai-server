@@ -1,29 +1,48 @@
+"""
+utils.py
+
+Shared helpers for seg_server.py.
+
+Vision prompts
+--------------
+  _build_classify_prompt(tag_ctx)
+      Lightweight — identify object_type, category, needs_augmentation only.
+      Called by /classify. No joint placement.
+
+  _build_joints_prompt(object_type, category, n_joints)
+      Focused joint placement — receives known object_type/category as context.
+      Called by /joints. No identification, no augmentation assessment.
+
+  _build_vehicle_prompt()
+      Combined identify + joint placement for vehicles (unchanged — vehicles
+      are a special case where the joint schema is rigid enough that splitting
+      adds no value).
+
+The old _build_animal_prompt() is removed. classify_with_vision() now calls
+_build_classify_prompt(), and classify_joints_with_vision() calls
+_build_joints_prompt() from inside seg_server.py.
+"""
+
 import os
 import sys
 import io
 import base64
-import json
 import logging
-import time
-from flask import Flask, request, jsonify, send_file
-from werkzeug.exceptions import HTTPException, RequestEntityTooLarge
-from rembg import remove, new_session
-from PIL import Image
-import requests
-import urllib3
-import subprocess
-import threading
-from pathlib import Path
-import hashlib
 import numpy as np
+import requests
+from PIL import Image
 
-VEHICLE_KEYWORDS = {'car', 'truck', 'vehicle', 'bus', 'bike', 'motorcycle', 'van', 'auto', 'wheels'}
+log = logging.getLogger(__name__)
+
+VEHICLE_KEYWORDS = {'car', 'truck', 'vehicle', 'bus', 'bike', 'motorcycle',
+                    'van', 'auto', 'wheels'}
 
 HUMANOID_KEYWORDS = {'human', 'person', 'character', 'humanoid', 'man',
                      'woman', 'boy', 'girl', 'robot', 'alien', 'zombie',
                      'totoro', 'creature', 'figure', 'monster'}
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
+
+# ── Image helpers ─────────────────────────────────────────────────────────────
 
 def resize_if_needed(img: Image.Image, max_size: int = 1024) -> Image.Image:
     if max(img.size) > max_size:
@@ -33,10 +52,12 @@ def resize_if_needed(img: Image.Image, max_size: int = 1024) -> Image.Image:
         log.info(f"Resized to {new_size}")
     return img
 
+
 def img_to_b64(image: Image.Image, fmt: str = 'PNG') -> str:
     buf = io.BytesIO()
     image.save(buf, format=fmt)
     return base64.b64encode(buf.getvalue()).decode()
+
 
 def detect_mime_type(img_bytes: bytes) -> str:
     if img_bytes[:8] == b'\x89PNG\r\n\x1a\n':
@@ -50,8 +71,15 @@ def detect_mime_type(img_bytes: bytes) -> str:
     else:
         return 'image/png'
 
-# ── Keyframe injection (procedural, replaces hardcoded animations) ─────────────
 
+# ── Keyframe injection ────────────────────────────────────────────────────────
+#
+# Procedural walk animations injected into the skeleton after joint placement.
+# This replaces asking the vision model to generate keyframes (which it does
+# inconsistently). inject_keyframes() is called inside run_rig_pipeline()
+# after the skeleton is assembled, before run_blender_rig().
+
+# axis, phase (+1 normal / -1 inverted), base amplitude in radians
 WALK_KEYFRAMES = {
     "root":      None,
     "pelvis":    ("z",  1,  0.05),
@@ -63,7 +91,7 @@ WALK_KEYFRAMES = {
     "elbow":     ("x",  1,  0.20),
     "hand":      ("x",  1,  0.10),
     "hip":       ("x",  1,  0.20),
-    "leg":       ("x",  1,  0.50),   # Increased knee bend
+    "leg":       ("x",  1,  0.50),
     "foot":      ("x",  1,  0.10),
     "wing_base": ("z",  1,  0.30),
     "wing_mid":  ("z",  1,  0.20),
@@ -72,12 +100,17 @@ WALK_KEYFRAMES = {
     "body":      None,
 }
 
+# Right-side joints get phase flipped so left/right limbs oppose each other
 RIGHT_SIDE_FLIP = {"shoulder", "elbow", "hand", "hip", "leg", "foot",
                    "wing_base", "wing_mid", "wing_tip"}
 
+
 def build_walk_keyframes(body_part: str, joint_name: str,
                          bone_length: float = None) -> list:
-    """Returns an animations list for a joint given its body_part label."""
+    """
+    Return an animations list for a joint given its body_part label.
+    bone_length: world-space distance to nearest child, used to scale amplitude.
+    """
     body_part_lower = (body_part or '').lower()
 
     if body_part_lower == "wheel":
@@ -95,7 +128,6 @@ def build_walk_keyframes(body_part: str, joint_name: str,
 
     axis, phase, base_amp = params
     is_right = "right" in joint_name.lower()
-
     if is_right and body_part_lower in RIGHT_SIDE_FLIP:
         phase *= -1
 
@@ -111,7 +143,6 @@ def build_walk_keyframes(body_part: str, joint_name: str,
         [45, round(-phase * amp, 4)],
         [60, 0.0],
     ]
-
     return [{
         "clip":      "walk",
         "property":  "rotation_euler",
@@ -122,13 +153,15 @@ def build_walk_keyframes(body_part: str, joint_name: str,
 
 
 def inject_keyframes(skel: dict) -> dict:
-    """Inject procedural walk keyframes based on body_part labels."""
+    """
+    Walk every joint in the skeleton and inject procedural walk keyframes
+    based on its body_part label. Called after skel is assembled, before
+    run_blender_rig().
+    """
     positions = {j['id']: np.array(j['position']) for j in skel['joints']}
-
-    children = {}
+    children  = {}
     for bone in skel['bones']:
-        p, c = bone['parent'], bone['child']
-        children.setdefault(p, []).append(c)
+        children.setdefault(bone['parent'], []).append(bone['child'])
 
     for joint in skel['joints']:
         hint      = joint.get('hint') or {}
@@ -145,7 +178,6 @@ def inject_keyframes(skel: dict) -> dict:
                 ))
 
         animations = build_walk_keyframes(body_part, name, bone_length)
-
         if joint.get('hint') is None:
             joint['hint'] = {}
         joint['hint']['animations'] = animations
@@ -153,29 +185,512 @@ def inject_keyframes(skel: dict) -> dict:
     return skel
 
 
-# ── fal.ai image editing ───────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Vision prompts
+# ══════════════════════════════════════════════════════════════════════════════
 
-def edit_image_fal(img: Image.Image, prompt: str):
-    """Edit image using fal.ai Qwen Image 2.0."""
-    import fal_client
+def _build_classify_prompt(tag_ctx: str = '') -> str:
+    """
+    Lightweight identify-only prompt for /classify.
+    Determines object_type, category, rig_type, and whether augmentation is needed.
+    Does NOT ask for joint placement — that is _build_joints_prompt().
 
-    data_uri = f"data:image/png;base64,{img_to_b64(img)}"
-    log.info(f"fal.ai: {prompt[:80]}...")
+    tag_ctx: optional string like '\nThe user identified this as: "dragon".'
+    """
+    return f"""Analyze this image to identify the object for 3D rigging.{tag_ctx}
 
-    result   = fal_client.subscribe(
-        "fal-ai/qwen-image-2/edit",
-        arguments={"prompt": prompt, "image_urls": [data_uri], "num_images": 2}
-    )
-    responseA = requests.get(result["images"][0]["url"], verify=False)
-    responseB = requests.get(result["images"][1]["url"], verify=False)
-    return (Image.open(io.BytesIO(responseA.content)).convert('RGB'),
-            Image.open(io.BytesIO(responseB.content)).convert('RGB'))
+Return ONLY valid JSON, no markdown, no extra text:
+
+{{
+  "object_type": "brief description of the object",
+  "category": "animal|humanoid|vehicle|other",
+  "rig_type": "humanoid|biped|quadruped|flying|vehicle|other",
+  "needs_augmentation": false,
+  "augment_prompt": ""
+}}
+
+Rules:
+- object_type: concise noun phrase, e.g. "golden retriever", "toy truck", "anime girl"
+
+- category: what the object IS
+    animal    — any non-human creature (dog, dragon, bird, dinosaur)
+    humanoid  — human or human-like figure (person, robot, zombie, alien)
+    vehicle   — wheeled or motorised object (car, truck, bike)
+    other     — furniture, food, abstract shapes, etc.
+
+- rig_type: how the object MOVES and should be rigged — based on pose and structure,
+    not on what the object is. A dog standing upright on two legs is "biped" not "quadruped".
+    humanoid   — upright on two legs WITH arms (person, humanoid robot, zombie)
+    biped      — upright on two legs WITHOUT arms (T-rex, penguin, bipedal statue)
+    quadruped  — four legs, roughly horizontal spine (dog, horse, cat, lion)
+    flying     — wings as primary limbs, may also have legs (bird, bat, dragon)
+    vehicle    — wheels and axles (car, truck, bike, spacecraft)
+    other      — no clear locomotion structure (snake, fish, furniture, abstract)
+
+- needs_augmentation: true if the current pose will make rigging very difficult:
+    • Limbs are bent, folded, or hidden (sitting, curled, wings closed)
+    • Body parts overlap and cannot be separated
+    • Extreme foreshortening hides limb structure
+    Set false if pose is neutral/spread out or if rig_type is vehicle/other
+
+- augment_prompt: only if needs_augmentation is true — describe what change
+    would fix the pose. Leave empty string if needs_augmentation is false.
+"""
 
 
-# ── Vision prompts ─────────────────────────────────────────────────────────────
+def _build_joints_prompt(object_type: str, category: str,
+                          n_joints: int | None = None,
+                          mesh_bounds: dict | None = None,
+                          rig_type: str = '') -> str:
+    """
+    Focused joint-placement prompt for /infer_joints.
+    Receives object_type, category, and rig_type from /classify.
+    rig_type drives which skeleton template is shown as an example.
+
+    Key design decisions:
+    - Z is always forced to 0.5 in code (center depth).
+    - X and Y are the only meaningful coordinates from a frontal image.
+    - We ask the model to cover the FULL object even if parts are cropped.
+
+    mesh_bounds: dict with width/height in world units from the mesh GLB.
+    n_joints: optional hint (treated as a suggestion).
+    rig_type: humanoid|biped|quadruped|flying|vehicle|other
+    """
+    MIN_JOINTS, MAX_JOINTS = 3, 16
+    if n_joints:
+        joints_instruction = (
+            f"\nAim for approximately {n_joints} joints total, "
+            f"covering the FULL object anatomy from head to feet."
+        )
+    else:
+        joints_instruction = (
+            f"\nUse between {MIN_JOINTS} and {MAX_JOINTS} joints, "
+            f"covering the FULL object anatomy from head to feet."
+        )
+
+    # Select example skeleton based on rig_type (how it moves),
+    # falling back to category if rig_type is absent (old records)
+    rt = (rig_type or category or '').lower()
+    if rt == 'humanoid':
+        example_json = _HUMANOID_EXAMPLE_JSON
+    elif rt == 'biped':
+        example_json = _BIPED_EXAMPLE_JSON
+    elif rt == 'quadruped':
+        example_json = _QUADRUPED_EXAMPLE_JSON
+    elif rt == 'flying':
+        example_json = _FLYING_EXAMPLE_JSON
+    elif rt == 'vehicle':
+        example_json = _VEHICLE_EXAMPLE_JSON
+    else:
+        # Fallback: use category
+        if category == 'humanoid':
+            example_json = _HUMANOID_EXAMPLE_JSON
+        elif category == 'vehicle':
+            example_json = _VEHICLE_EXAMPLE_JSON
+        else:
+            example_json = _ANIMAL_EXAMPLE_JSON
+
+    if mesh_bounds:
+        w = mesh_bounds['width']
+        h = mesh_bounds['height']
+        mesh_context = f"""
+MESH DIMENSIONS (from the actual 3D model):
+  width  (x, left→right): {w:.3f} units
+  height (y, bottom→top): {h:.3f} units
+  height/width ratio: {h/w:.2f}
+
+  y=1.0 is the very top of the mesh (top of head)
+  y=0.0 is the very bottom (bottom of feet on the ground)
+"""
+    else:
+        mesh_context = ""
+
+    return f"""You are placing a 3D skeleton on: "{object_type}"
+rig_type: {rt or 'unknown'}  ← this tells you which skeleton structure to use
+{joints_instruction}
+{mesh_context}
+COORDINATE RULES — follow exactly:
+  x: 0.0=leftmost edge of mesh, 1.0=rightmost edge. Spread joints across full width.
+  y: 0.0=bottom of mesh (feet/ground), 1.0=top of mesh (head). Use full range.
+  z: ALWAYS set z=0.5 for every joint. The code will handle depth placement.
+
+CRITICAL — COVER THE FULL OBJECT:
+  Even if the image shows only part of the object, place joints for the ENTIRE
+  anatomy. If the head is at the top, place head/neck joints at y≈1.0.
+  If feet are at the bottom, place them at y≈0.0.
+
+CRITICAL — ONLY REAL LIMBS:
+  Only place joints where actual limbs exist. Count visible limbs carefully.
+  Do NOT invent limbs that are not present on this object.
+
+Do NOT include any "animations" key — animations are added automatically.
+
+{example_json}
+
+BODY_PART LABELS — use exactly these strings, they control the animations:
+  Spine chain:  torso, pelvis, spine, chest, neck, head
+  Arm chain:    shoulder, elbow, hand
+  Leg chain:    hip, leg (for knee), foot
+  Wing chain:   wing_base, wing_mid, wing_tip
+  Vehicle:      body, axle, wheel
+
+  The label "leg" means the KNEE joint — the middle joint of a leg chain.
+  hip → leg (knee) → foot  is the correct leg hierarchy.
+  NEVER use "shoulder/elbow/hand" labels for leg joints.
+  If there are no arms, omit shoulder/elbow/hand entirely.
+  ALWAYS use pelvis as the parent of hip joints (not chest).
+
+KNEE PLACEMENT:
+  knee_y = (hip_y + foot_y) / 2   ← exact midpoint, no exceptions
+  NEVER place the knee closer to the foot than to the hip.
+  All joints in the same leg chain share the same x coordinate.
+
+LIMB X PLACEMENT — most common error:
+  Hip, shoulder, and wing_base joints must be at the OUTER SURFACE of the limb,
+  not near the body center. Find the limb in the image and place the joint
+  at the point where it visually branches from the body.
+  ✗ WRONG:   joint_hip_left at x=0.40 (inside the torso — too centered)
+  ✓ CORRECT: joint_hip_left at x=0.25 (at the outer surface of the left leg)
+  Do NOT copy example x values — measure from the actual image.
+"""
+
+
+# ── Full example JSON skeletons per category ──────────────────────────────────
+# These mirror the original _build_animal_prompt example closely.
+# The model needs concrete coordinate values — a position guide table is weaker
+# than seeing actual numbers inside real JSON.
+
+_ANIMAL_EXAMPLE_JSON = """\
+Return JSON in exactly this structure (adapt joint positions to match the image):
+
+{
+  "joint_hints": [
+    {"name": "joint_root",           "body_part": "torso",    "deforms_mesh": false, "position_normalized": {"x": 0.5,  "y": 0.0,  "z": 0.5}},
+    {"name": "joint_pelvis",         "body_part": "pelvis",   "deforms_mesh": false, "position_normalized": {"x": 0.5,  "y": 0.42, "z": 0.5}},
+    {"name": "joint_spine",          "body_part": "spine",    "deforms_mesh": false, "position_normalized": {"x": 0.5,  "y": 0.55, "z": 0.5}},
+    {"name": "joint_chest",          "body_part": "chest",    "deforms_mesh": false, "position_normalized": {"x": 0.5,  "y": 0.65, "z": 0.5}},
+    {"name": "joint_neck",           "body_part": "neck",     "deforms_mesh": false, "position_normalized": {"x": 0.5,  "y": 0.75, "z": 0.5}},
+    {"name": "joint_head",           "body_part": "head",     "deforms_mesh": false, "position_normalized": {"x": 0.5,  "y": 0.88, "z": 0.5}},
+    {"name": "joint_shoulder_left",  "body_part": "shoulder", "deforms_mesh": true,  "position_normalized": {"x": 0.15, "y": 0.62, "z": 0.5}},
+    {"name": "joint_shoulder_right", "body_part": "shoulder", "deforms_mesh": true,  "position_normalized": {"x": 0.85, "y": 0.62, "z": 0.5}},
+    {"name": "joint_elbow_left",     "body_part": "elbow",    "deforms_mesh": true,  "position_normalized": {"x": 0.08, "y": 0.50, "z": 0.5}},
+    {"name": "joint_elbow_right",    "body_part": "elbow",    "deforms_mesh": true,  "position_normalized": {"x": 0.92, "y": 0.50, "z": 0.5}},
+    {"name": "joint_hand_left",      "body_part": "hand",     "deforms_mesh": true,  "position_normalized": {"x": 0.0,  "y": 0.38, "z": 0.5}},
+    {"name": "joint_hand_right",     "body_part": "hand",     "deforms_mesh": true,  "position_normalized": {"x": 1.0,  "y": 0.38, "z": 0.5}},
+    {"name": "joint_hip_left",       "body_part": "hip",      "deforms_mesh": true,  "position_normalized": {"x": 0.40, "y": 0.42, "z": 0.5}},
+    {"name": "joint_hip_right",      "body_part": "hip",      "deforms_mesh": true,  "position_normalized": {"x": 0.60, "y": 0.42, "z": 0.5}},
+    {"name": "joint_knee_left",      "body_part": "leg",      "deforms_mesh": true,  "position_normalized": {"x": 0.40, "y": 0.22, "z": 0.5}},
+    {"name": "joint_knee_right",     "body_part": "leg",      "deforms_mesh": true,  "position_normalized": {"x": 0.60, "y": 0.22, "z": 0.5}},
+    {"name": "joint_foot_left",      "body_part": "foot",     "deforms_mesh": true,  "position_normalized": {"x": 0.38, "y": 0.02, "z": 0.5}},
+    {"name": "joint_foot_right",     "body_part": "foot",     "deforms_mesh": true,  "position_normalized": {"x": 0.62, "y": 0.02, "z": 0.5}}
+  ],
+  "skeleton": [
+    {"parent": "joint_root",           "child": "joint_pelvis"},
+    {"parent": "joint_pelvis",         "child": "joint_spine"},
+    {"parent": "joint_spine",          "child": "joint_chest"},
+    {"parent": "joint_chest",          "child": "joint_neck"},
+    {"parent": "joint_neck",           "child": "joint_head"},
+    {"parent": "joint_chest",          "child": "joint_shoulder_left"},
+    {"parent": "joint_chest",          "child": "joint_shoulder_right"},
+    {"parent": "joint_shoulder_left",  "child": "joint_elbow_left"},
+    {"parent": "joint_shoulder_right", "child": "joint_elbow_right"},
+    {"parent": "joint_elbow_left",     "child": "joint_hand_left"},
+    {"parent": "joint_elbow_right",    "child": "joint_hand_right"},
+    {"parent": "joint_pelvis",         "child": "joint_hip_left"},
+    {"parent": "joint_pelvis",         "child": "joint_hip_right"},
+    {"parent": "joint_hip_left",       "child": "joint_knee_left"},
+    {"parent": "joint_hip_right",      "child": "joint_knee_right"},
+    {"parent": "joint_knee_left",      "child": "joint_foot_left"},
+    {"parent": "joint_knee_right",     "child": "joint_foot_right"}
+  ],
+  "suggested_joints": 18
+}
+
+NOTE: The example above shows the full skeleton with both arms AND legs.
+Adapt it to match the actual object:
+  - If the object has NO arms: remove shoulder/elbow/hand joints entirely
+  - If the object has NO legs: remove hip/leg/foot joints entirely
+  - If the object has wings instead of arms: rename shoulder→wing_base, elbow→wing_mid, hand→wing_tip
+  - ALWAYS use pelvis as the parent of hip joints (not chest)
+  - ALWAYS use hip→leg(knee)→foot for the leg chain with body_part labels "hip", "leg", "foot"
+
+KNEE PLACEMENT — most important rule:
+  knee_y = (hip_y + foot_y) / 2   ← exact midpoint, no exceptions
+  If hip_left is at y=0.42 and foot_left is at y=0.02, knee_left MUST be at y=0.22.
+  NEVER place the knee closer to the foot than to the hip.
+
+POSITION GUIDE (starting points only — override with what you actually see):
+  Head:      y≈0.88,  x=0.5
+  Neck:      y≈0.75,  x=0.5
+  Chest:     y≈0.65,  x=0.5
+  Spine:     y≈0.55,  x=0.5
+  Pelvis:    y≈0.42,  x=0.5   ← parent of BOTH spine and hips
+  Shoulders: y≈0.62,  x≈0.15 (left), x≈0.85 (right)
+  Elbows:    y≈0.50,  x≈0.08 (left), x≈0.92 (right)
+  Hands:     y≈0.38,  x=0.0  (left), x=1.0  (right)
+  Hips:      y≈0.42,  x≈0.40 (left), x≈0.60 (right)   ← same y as pelvis
+  Knees:     y = midpoint(hip_y, foot_y), same x as hip
+  Feet:      y≈0.02,  x≈0.38 (left), x≈0.62 (right)"""
+
+
+_HUMANOID_EXAMPLE_JSON = """\
+Return JSON in exactly this structure (adapt joint positions to match the image):
+
+{
+  "joint_hints": [
+    {"name": "joint_root",           "body_part": "torso",    "deforms_mesh": false, "position_normalized": {"x": 0.5,  "y": 0.0,  "z": 0.5}},
+    {"name": "joint_pelvis",         "body_part": "pelvis",   "deforms_mesh": false, "position_normalized": {"x": 0.5,  "y": 0.45, "z": 0.5}},
+    {"name": "joint_spine",          "body_part": "spine",    "deforms_mesh": false, "position_normalized": {"x": 0.5,  "y": 0.55, "z": 0.5}},
+    {"name": "joint_chest",          "body_part": "chest",    "deforms_mesh": false, "position_normalized": {"x": 0.5,  "y": 0.65, "z": 0.5}},
+    {"name": "joint_neck",           "body_part": "neck",     "deforms_mesh": false, "position_normalized": {"x": 0.5,  "y": 0.80, "z": 0.5}},
+    {"name": "joint_head",           "body_part": "head",     "deforms_mesh": false, "position_normalized": {"x": 0.5,  "y": 0.92, "z": 0.5}},
+    {"name": "joint_shoulder_left",  "body_part": "shoulder", "deforms_mesh": true,  "position_normalized": {"x": 0.20, "y": 0.62, "z": 0.5}},
+    {"name": "joint_shoulder_right", "body_part": "shoulder", "deforms_mesh": true,  "position_normalized": {"x": 0.80, "y": 0.62, "z": 0.5}},
+    {"name": "joint_elbow_left",     "body_part": "elbow",    "deforms_mesh": true,  "position_normalized": {"x": 0.10, "y": 0.50, "z": 0.5}},
+    {"name": "joint_elbow_right",    "body_part": "elbow",    "deforms_mesh": true,  "position_normalized": {"x": 0.90, "y": 0.50, "z": 0.5}},
+    {"name": "joint_hand_left",      "body_part": "hand",     "deforms_mesh": true,  "position_normalized": {"x": 0.05, "y": 0.38, "z": 0.5}},
+    {"name": "joint_hand_right",     "body_part": "hand",     "deforms_mesh": true,  "position_normalized": {"x": 0.95, "y": 0.38, "z": 0.5}},
+    {"name": "joint_hip_left",       "body_part": "hip",      "deforms_mesh": true,  "position_normalized": {"x": 0.42, "y": 0.44, "z": 0.5}},
+    {"name": "joint_hip_right",      "body_part": "hip",      "deforms_mesh": true,  "position_normalized": {"x": 0.58, "y": 0.44, "z": 0.5}},
+    {"name": "joint_knee_left",      "body_part": "leg",      "deforms_mesh": true,  "position_normalized": {"x": 0.42, "y": 0.22, "z": 0.5}},
+    {"name": "joint_knee_right",     "body_part": "leg",      "deforms_mesh": true,  "position_normalized": {"x": 0.58, "y": 0.22, "z": 0.5}},
+    {"name": "joint_foot_left",      "body_part": "foot",     "deforms_mesh": true,  "position_normalized": {"x": 0.40, "y": 0.0,  "z": 0.5}},
+    {"name": "joint_foot_right",     "body_part": "foot",     "deforms_mesh": true,  "position_normalized": {"x": 0.60, "y": 0.0,  "z": 0.5}}
+  ],
+  "skeleton": [
+    {"parent": "joint_root",           "child": "joint_pelvis"},
+    {"parent": "joint_pelvis",         "child": "joint_spine"},
+    {"parent": "joint_spine",          "child": "joint_chest"},
+    {"parent": "joint_chest",          "child": "joint_neck"},
+    {"parent": "joint_neck",           "child": "joint_head"},
+    {"parent": "joint_chest",          "child": "joint_shoulder_left"},
+    {"parent": "joint_chest",          "child": "joint_shoulder_right"},
+    {"parent": "joint_shoulder_left",  "child": "joint_elbow_left"},
+    {"parent": "joint_shoulder_right", "child": "joint_elbow_right"},
+    {"parent": "joint_elbow_left",     "child": "joint_hand_left"},
+    {"parent": "joint_elbow_right",    "child": "joint_hand_right"},
+    {"parent": "joint_pelvis",         "child": "joint_hip_left"},
+    {"parent": "joint_pelvis",         "child": "joint_hip_right"},
+    {"parent": "joint_hip_left",       "child": "joint_knee_left"},
+    {"parent": "joint_hip_right",      "child": "joint_knee_right"},
+    {"parent": "joint_knee_left",      "child": "joint_foot_left"},
+    {"parent": "joint_knee_right",     "child": "joint_foot_right"}
+  ],
+  "suggested_joints": 18
+}
+
+KNEE PLACEMENT — most important rule:
+  The knee y must be the midpoint between hip y and foot y.
+  If hip_left is at y=0.44 and foot_left is at y=0.0, then knee_left MUST be at y=0.22.
+  Formula: knee_y = (hip_y + foot_y) / 2
+  NEVER place the knee closer to the foot than to the hip.
+
+POSITION GUIDE (use FULL range 0.0–1.0 — starting points only, override with actual image):
+  Head:      y≈0.92
+  Neck:      y≈0.80
+  Chest:     y≈0.65
+  Shoulders: x≈0.20 (left), x≈0.80 (right), y≈0.62
+  Elbows:    x≈0.10 (left), x≈0.90 (right), y≈0.50
+  Hands:     x≈0.05 (left), x≈0.95 (right), y≈0.38
+  Pelvis:    y≈0.44
+  Hips:      x≈0.42 (left), x≈0.58 (right), y = top of leg
+  Knees:     x same as hip, y = MIDPOINT between hip y and foot y
+  Feet:      x≈0.40 (left), x≈0.60 (right), y=0.0"""
+
+
+_BIPED_EXAMPLE_JSON = """\
+This object is a BIPED — upright on two legs, NO arms.
+Use this skeleton structure:
+
+{
+  "joint_hints": [
+    {"name": "joint_root",        "body_part": "torso",  "deforms_mesh": false, "position_normalized": {"x": 0.5,  "y": 0.0,  "z": 0.5}},
+    {"name": "joint_pelvis",      "body_part": "pelvis", "deforms_mesh": false, "position_normalized": {"x": 0.5,  "y": 0.42, "z": 0.5}},
+    {"name": "joint_spine",       "body_part": "spine",  "deforms_mesh": false, "position_normalized": {"x": 0.5,  "y": 0.55, "z": 0.5}},
+    {"name": "joint_chest",       "body_part": "chest",  "deforms_mesh": false, "position_normalized": {"x": 0.5,  "y": 0.65, "z": 0.5}},
+    {"name": "joint_neck",        "body_part": "neck",   "deforms_mesh": false, "position_normalized": {"x": 0.5,  "y": 0.75, "z": 0.5}},
+    {"name": "joint_head",        "body_part": "head",   "deforms_mesh": false, "position_normalized": {"x": 0.5,  "y": 0.88, "z": 0.5}},
+    {"name": "joint_hip_left",    "body_part": "hip",    "deforms_mesh": true,  "position_normalized": {"x": 0.40, "y": 0.42, "z": 0.5}},
+    {"name": "joint_hip_right",   "body_part": "hip",    "deforms_mesh": true,  "position_normalized": {"x": 0.60, "y": 0.42, "z": 0.5}},
+    {"name": "joint_knee_left",   "body_part": "leg",    "deforms_mesh": true,  "position_normalized": {"x": 0.40, "y": 0.22, "z": 0.5}},
+    {"name": "joint_knee_right",  "body_part": "leg",    "deforms_mesh": true,  "position_normalized": {"x": 0.60, "y": 0.22, "z": 0.5}},
+    {"name": "joint_foot_left",   "body_part": "foot",   "deforms_mesh": true,  "position_normalized": {"x": 0.38, "y": 0.02, "z": 0.5}},
+    {"name": "joint_foot_right",  "body_part": "foot",   "deforms_mesh": true,  "position_normalized": {"x": 0.62, "y": 0.02, "z": 0.5}}
+  ],
+  "skeleton": [
+    {"parent": "joint_root",       "child": "joint_pelvis"},
+    {"parent": "joint_pelvis",     "child": "joint_spine"},
+    {"parent": "joint_spine",      "child": "joint_chest"},
+    {"parent": "joint_chest",      "child": "joint_neck"},
+    {"parent": "joint_neck",       "child": "joint_head"},
+    {"parent": "joint_pelvis",     "child": "joint_hip_left"},
+    {"parent": "joint_pelvis",     "child": "joint_hip_right"},
+    {"parent": "joint_hip_left",   "child": "joint_knee_left"},
+    {"parent": "joint_hip_right",  "child": "joint_knee_right"},
+    {"parent": "joint_knee_left",  "child": "joint_foot_left"},
+    {"parent": "joint_knee_right", "child": "joint_foot_right"}
+  ],
+  "suggested_joints": 12
+}
+
+NO shoulder/elbow/hand joints — this is a biped with no arms.
+Pelvis is the parent of both hips (NOT chest).
+knee_y = (hip_y + foot_y) / 2  — place knee at the exact midpoint.
+
+HIP/KNEE/FOOT X PLACEMENT — most common error:
+  The hip x must be at the OUTER SURFACE of the leg, not near the body center.
+  Look at the image: find the left leg and measure how far left it sits.
+  ✗ WRONG:   joint_hip_left at x=0.40 (too centered — puts joint inside the torso)
+  ✓ CORRECT: joint_hip_left at x=0.25 (at the outer left surface of the left leg)
+  The knee and foot must share the same x as the hip on that side.
+  If the legs are narrow and close together, the x values will be closer to 0.5.
+  If the legs are wide apart, x values will be closer to 0.1 / 0.9.
+  Do NOT copy the example x values — measure from the actual image.
+
+POSITION GUIDE:
+  Head:   y≈0.88, x=0.5
+  Neck:   y≈0.75, x=0.5
+  Chest:  y≈0.65, x=0.5
+  Spine:  y≈0.55, x=0.5
+  Pelvis: y≈0.42, x=0.5
+  Hips:   y≈0.42, x≈0.40 (left) / 0.60 (right)  ← same y as pelvis
+  Knees:  y = midpoint(hip_y, foot_y), same x as hip
+  Feet:   y≈0.02, x≈0.38 (left) / 0.62 (right)"""
+
+
+_QUADRUPED_EXAMPLE_JSON = """\
+This object is a QUADRUPED — four legs, roughly horizontal spine.
+Use this skeleton structure:
+
+{
+  "joint_hints": [
+    {"name": "joint_root",             "body_part": "torso",    "deforms_mesh": false, "position_normalized": {"x": 0.5,  "y": 0.0,  "z": 0.5}},
+    {"name": "joint_pelvis",           "body_part": "pelvis",   "deforms_mesh": false, "position_normalized": {"x": 0.5,  "y": 0.55, "z": 0.75}},
+    {"name": "joint_spine",            "body_part": "spine",    "deforms_mesh": false, "position_normalized": {"x": 0.5,  "y": 0.58, "z": 0.5}},
+    {"name": "joint_chest",            "body_part": "chest",    "deforms_mesh": false, "position_normalized": {"x": 0.5,  "y": 0.58, "z": 0.25}},
+    {"name": "joint_neck",             "body_part": "neck",     "deforms_mesh": false, "position_normalized": {"x": 0.5,  "y": 0.65, "z": 0.15}},
+    {"name": "joint_head",             "body_part": "head",     "deforms_mesh": false, "position_normalized": {"x": 0.5,  "y": 0.72, "z": 0.05}},
+    {"name": "joint_front_hip_left",   "body_part": "shoulder", "deforms_mesh": true,  "position_normalized": {"x": 0.35, "y": 0.55, "z": 0.22}},
+    {"name": "joint_front_hip_right",  "body_part": "shoulder", "deforms_mesh": true,  "position_normalized": {"x": 0.65, "y": 0.55, "z": 0.22}},
+    {"name": "joint_front_knee_left",  "body_part": "elbow",    "deforms_mesh": true,  "position_normalized": {"x": 0.35, "y": 0.30, "z": 0.20}},
+    {"name": "joint_front_knee_right", "body_part": "elbow",    "deforms_mesh": true,  "position_normalized": {"x": 0.65, "y": 0.30, "z": 0.20}},
+    {"name": "joint_front_foot_left",  "body_part": "hand",     "deforms_mesh": true,  "position_normalized": {"x": 0.35, "y": 0.02, "z": 0.18}},
+    {"name": "joint_front_foot_right", "body_part": "hand",     "deforms_mesh": true,  "position_normalized": {"x": 0.65, "y": 0.02, "z": 0.18}},
+    {"name": "joint_rear_hip_left",    "body_part": "hip",      "deforms_mesh": true,  "position_normalized": {"x": 0.38, "y": 0.55, "z": 0.78}},
+    {"name": "joint_rear_hip_right",   "body_part": "hip",      "deforms_mesh": true,  "position_normalized": {"x": 0.62, "y": 0.55, "z": 0.78}},
+    {"name": "joint_rear_knee_left",   "body_part": "leg",      "deforms_mesh": true,  "position_normalized": {"x": 0.38, "y": 0.30, "z": 0.80}},
+    {"name": "joint_rear_knee_right",  "body_part": "leg",      "deforms_mesh": true,  "position_normalized": {"x": 0.62, "y": 0.30, "z": 0.80}},
+    {"name": "joint_rear_foot_left",   "body_part": "foot",     "deforms_mesh": true,  "position_normalized": {"x": 0.38, "y": 0.02, "z": 0.82}},
+    {"name": "joint_rear_foot_right",  "body_part": "foot",     "deforms_mesh": true,  "position_normalized": {"x": 0.62, "y": 0.02, "z": 0.82}}
+  ],
+  "skeleton": [
+    {"parent": "joint_root",            "child": "joint_pelvis"},
+    {"parent": "joint_pelvis",          "child": "joint_spine"},
+    {"parent": "joint_spine",           "child": "joint_chest"},
+    {"parent": "joint_chest",           "child": "joint_neck"},
+    {"parent": "joint_neck",            "child": "joint_head"},
+    {"parent": "joint_chest",           "child": "joint_front_hip_left"},
+    {"parent": "joint_chest",           "child": "joint_front_hip_right"},
+    {"parent": "joint_front_hip_left",  "child": "joint_front_knee_left"},
+    {"parent": "joint_front_hip_right", "child": "joint_front_knee_right"},
+    {"parent": "joint_front_knee_left", "child": "joint_front_foot_left"},
+    {"parent": "joint_front_knee_right","child": "joint_front_foot_right"},
+    {"parent": "joint_pelvis",          "child": "joint_rear_hip_left"},
+    {"parent": "joint_pelvis",          "child": "joint_rear_hip_right"},
+    {"parent": "joint_rear_hip_left",   "child": "joint_rear_knee_left"},
+    {"parent": "joint_rear_hip_right",  "child": "joint_rear_knee_right"},
+    {"parent": "joint_rear_knee_left",  "child": "joint_rear_foot_left"},
+    {"parent": "joint_rear_knee_right", "child": "joint_rear_foot_right"}
+  ],
+  "suggested_joints": 18
+}
+
+For quadrupeds, z is meaningful: front legs z≈0.2, rear legs z≈0.8.
+Spine runs roughly horizontal (y stays nearly constant along z axis).
+Front leg joints use shoulder/elbow/hand labels; rear leg joints use hip/leg/foot."""
+
+
+_FLYING_EXAMPLE_JSON = """\
+This object is a FLYING creature — wings as primary limbs.
+Use this skeleton structure (adapt if it also has legs):
+
+{
+  "joint_hints": [
+    {"name": "joint_root",           "body_part": "torso",     "deforms_mesh": false, "position_normalized": {"x": 0.5,  "y": 0.45, "z": 0.5}},
+    {"name": "joint_spine",          "body_part": "spine",     "deforms_mesh": false, "position_normalized": {"x": 0.5,  "y": 0.55, "z": 0.5}},
+    {"name": "joint_chest",          "body_part": "chest",     "deforms_mesh": false, "position_normalized": {"x": 0.5,  "y": 0.60, "z": 0.5}},
+    {"name": "joint_neck",           "body_part": "neck",      "deforms_mesh": false, "position_normalized": {"x": 0.5,  "y": 0.72, "z": 0.5}},
+    {"name": "joint_head",           "body_part": "head",      "deforms_mesh": false, "position_normalized": {"x": 0.5,  "y": 0.88, "z": 0.5}},
+    {"name": "joint_wing_base_left",  "body_part": "wing_base", "deforms_mesh": true,  "position_normalized": {"x": 0.20, "y": 0.60, "z": 0.5}},
+    {"name": "joint_wing_base_right", "body_part": "wing_base", "deforms_mesh": true,  "position_normalized": {"x": 0.80, "y": 0.60, "z": 0.5}},
+    {"name": "joint_wing_mid_left",   "body_part": "wing_mid",  "deforms_mesh": true,  "position_normalized": {"x": 0.08, "y": 0.55, "z": 0.5}},
+    {"name": "joint_wing_mid_right",  "body_part": "wing_mid",  "deforms_mesh": true,  "position_normalized": {"x": 0.92, "y": 0.55, "z": 0.5}},
+    {"name": "joint_wing_tip_left",   "body_part": "wing_tip",  "deforms_mesh": true,  "position_normalized": {"x": 0.02, "y": 0.50, "z": 0.5}},
+    {"name": "joint_wing_tip_right",  "body_part": "wing_tip",  "deforms_mesh": true,  "position_normalized": {"x": 0.98, "y": 0.50, "z": 0.5}},
+    {"name": "joint_hip_left",        "body_part": "hip",       "deforms_mesh": true,  "position_normalized": {"x": 0.42, "y": 0.42, "z": 0.5}},
+    {"name": "joint_hip_right",       "body_part": "hip",       "deforms_mesh": true,  "position_normalized": {"x": 0.58, "y": 0.42, "z": 0.5}},
+    {"name": "joint_foot_left",       "body_part": "foot",      "deforms_mesh": true,  "position_normalized": {"x": 0.42, "y": 0.02, "z": 0.5}},
+    {"name": "joint_foot_right",      "body_part": "foot",      "deforms_mesh": true,  "position_normalized": {"x": 0.58, "y": 0.02, "z": 0.5}}
+  ],
+  "skeleton": [
+    {"parent": "joint_root",           "child": "joint_spine"},
+    {"parent": "joint_spine",          "child": "joint_chest"},
+    {"parent": "joint_chest",          "child": "joint_neck"},
+    {"parent": "joint_neck",           "child": "joint_head"},
+    {"parent": "joint_chest",          "child": "joint_wing_base_left"},
+    {"parent": "joint_chest",          "child": "joint_wing_base_right"},
+    {"parent": "joint_wing_base_left", "child": "joint_wing_mid_left"},
+    {"parent": "joint_wing_base_right","child": "joint_wing_mid_right"},
+    {"parent": "joint_wing_mid_left",  "child": "joint_wing_tip_left"},
+    {"parent": "joint_wing_mid_right", "child": "joint_wing_tip_right"},
+    {"parent": "joint_root",           "child": "joint_hip_left"},
+    {"parent": "joint_root",           "child": "joint_hip_right"},
+    {"parent": "joint_hip_left",       "child": "joint_foot_left"},
+    {"parent": "joint_hip_right",      "child": "joint_foot_right"}
+  ],
+  "suggested_joints": 15
+}
+
+If the creature has no visible legs (e.g. a bird in flight), remove hip/foot joints.
+Wing tips should reach the very edges of the mesh (x≈0.02 and x≈0.98)."""
+
+
+_VEHICLE_EXAMPLE_JSON = """\
+Return JSON in exactly this structure (adapt joint positions to match the image):
+
+{
+  "joint_hints": [
+    {"name": "body",       "body_part": "body",  "deforms_mesh": false, "position_normalized": {"x": 0.5,  "y": 0.5,  "z": 0.5}},
+    {"name": "front_axle", "body_part": "axle",  "deforms_mesh": false, "position_normalized": {"x": 0.5,  "y": 0.25, "z": 0.15}},
+    {"name": "rear_axle",  "body_part": "axle",  "deforms_mesh": false, "position_normalized": {"x": 0.5,  "y": 0.75, "z": 0.15}},
+    {"name": "wheel_fl",   "body_part": "wheel", "deforms_mesh": true,  "position_normalized": {"x": 0.15, "y": 0.25, "z": 0.15}},
+    {"name": "wheel_fr",   "body_part": "wheel", "deforms_mesh": true,  "position_normalized": {"x": 0.85, "y": 0.25, "z": 0.15}},
+    {"name": "wheel_rl",   "body_part": "wheel", "deforms_mesh": true,  "position_normalized": {"x": 0.15, "y": 0.75, "z": 0.15}},
+    {"name": "wheel_rr",   "body_part": "wheel", "deforms_mesh": true,  "position_normalized": {"x": 0.85, "y": 0.75, "z": 0.15}}
+  ],
+  "skeleton": [
+    {"parent": "body",       "child": "front_axle"},
+    {"parent": "body",       "child": "rear_axle"},
+    {"parent": "front_axle", "child": "wheel_fl"},
+    {"parent": "front_axle", "child": "wheel_fr"},
+    {"parent": "rear_axle",  "child": "wheel_rl"},
+    {"parent": "rear_axle",  "child": "wheel_rr"}
+  ],
+  "suggested_joints": 7
+}
+
+Left wheels x<0.4, right wheels x>0.6.
+front_axle y must match front wheel y, rear_axle y must match rear wheel y.
+body and axles: deforms_mesh=false. wheels: deforms_mesh=true."""
+
 
 def _build_vehicle_prompt() -> str:
-    """Prompt for vehicle classification and rigging."""
+    """
+    Combined identify + joint placement prompt for vehicles.
+    Vehicles are a special case - the joint schema is rigid enough that
+    splitting identify/joints adds no value. Used by classify_with_vision()
+    when VEHICLE_KEYWORDS are detected in the user tag.
+    """
     return """Analyze this vehicle image for 3D rigging.
 
 Return ONLY valid JSON with no markdown, no extra text, no backticks.
@@ -183,6 +698,8 @@ Return ONLY valid JSON with no markdown, no extra text, no backticks.
 {
   "object_type": "toy truck",
   "category": "vehicle",
+  "needs_augmentation": false,
+  "augment_prompt": "",
   "wheel_colors_rgb": [
     [0.05, 0.05, 0.05],
     [0.85, 0.85, 0.85]
@@ -276,237 +793,3 @@ Rules:
 - left wheels must have x < 0.4, right wheels must have x > 0.6
 - z is DEPTH (front=0, rear=1), NOT left/right
 """
-
-
-def _build_classify_prompt(tag_context: str = "") -> str:
-    """
-    STEP 1: Lightweight classification-only prompt.
-    Model evaluates: object_type, category, pose suitability, augmentation needs.
-    Returns: object_type, category, needs_augmentation, augment_prompt, suggested_joints.
-    Does NOT place joints yet — that depends on augmentation decision.
-    """
-    return f"""Analyze this image and classify the object for 3D rigging. Return ONLY valid JSON.{tag_context}
-
-{{
-  "object_type": "bronze dog statue",
-  "category": "animal|vehicle|humanoid|other",
-  "needs_augmentation": false,
-  "augment_prompt": "",
-  "suggested_joints": 12
-}}
-
-YOUR TASK:
-  • object_type: brief, specific description (e.g., "bronze dog statue", "toy car", "robot")
-  • category: one of [animal, vehicle, humanoid, other]
-  
-  • EVALUATE POSE FOR RIGGING:
-    needs_augmentation should be TRUE if:
-      ✗ Limbs are bent/contracted (legs bent, arms folded)
-      ✗ Pose is curled up, hunched, or closed
-      ✗ Wings are folded or not extended
-      ✗ Object is lying down or in unnatural pose
-      ✗ Articulated parts are touching/overlapping
-    
-    needs_augmentation should be FALSE if:
-      ✓ Limbs are extended/relaxed
-      ✓ Object in T-pose, A-pose, or standing naturally
-      ✓ All articulated parts are clearly separated and visible
-      ✓ Pose allows clear joint placement and rigging
-  
-  • augment_prompt: ONLY if needs_augmentation=true
-    - Describe what to change to make pose suitable for rigging
-    - Example: "Straighten the dog's legs into a standing pose with arms extended"
-    - Leave empty string if needs_augmentation=false
-  
-  • suggested_joints: estimated joint count for this object (3-16)
-    - Simple objects (2-3 wheels): 3-5
-    - Animals/humanoids: 8-16
-    - Complex vehicles: 6-12
-
-CRITICAL:
-  - If ANY limb is bent/folded/hidden, needs_augmentation MUST be true
-  - Do NOT estimate joints if pose is unsuitable (needs_augmentation=true)
-  - Be strict about pose quality — rigging requires clear separation
-"""
-
-
-def _build_joints_prompt(object_type: str, category: str,
-                         bounds_info: str = "", requested_joints: int = None) -> str:
-    """
-    STEP 2: Joint placement prompt.
-    Receives object_type and category as context.
-    Places joints based on actual image anatomy.
-    """
-    joints_instruction = (
-        f"\nYou MUST generate EXACTLY {requested_joints} joints. "
-        f"Set suggested_joints to {requested_joints}."
-    ) if requested_joints else "\nGenerate between 3 and 16 joints."
-    
-    bounds_info_text = f"\nMesh bounding box: {bounds_info} units." if bounds_info else ""
-
-    return f"""Analyze this image and place rigging joints. Return ONLY valid JSON.
-
-Object type: {object_type}
-Category: {category}{bounds_info_text}{joints_instruction}
-
-COORDINATES: x=0(left) 1(right), y=0(bottom) 1(top), z=0(front) 1(back)
-
-{{
-  "joint_hints": [
-    {{
-      "name": "joint_root",
-      "body_part": "torso",
-      "deforms_mesh": false,
-      "position_normalized": {{"x": 0.5, "y": 0.0, "z": 0.5}}
-    }},
-    {{
-      "name": "joint_pelvis",
-      "body_part": "pelvis",
-      "deforms_mesh": false,
-      "position_normalized": {{"x": 0.5, "y": 0.20, "z": 0.5}}
-    }},
-    {{
-      "name": "joint_spine",
-      "body_part": "spine",
-      "deforms_mesh": false,
-      "position_normalized": {{"x": 0.5, "y": 0.40, "z": 0.5}}
-    }},
-    {{
-      "name": "joint_chest",
-      "body_part": "chest",
-      "deforms_mesh": false,
-      "position_normalized": {{"x": 0.5, "y": 0.55, "z": 0.5}}
-    }},
-    {{
-      "name": "joint_neck",
-      "body_part": "neck",
-      "deforms_mesh": false,
-      "position_normalized": {{"x": 0.5, "y": 0.70, "z": 0.5}}
-    }},
-    {{
-      "name": "joint_head",
-      "body_part": "head",
-      "deforms_mesh": false,
-      "position_normalized": {{"x": 0.5, "y": 0.88, "z": 0.5}}
-    }},
-    {{
-      "name": "joint_shoulder_left",
-      "body_part": "shoulder",
-      "deforms_mesh": true,
-      "position_normalized": {{"x": 0.15, "y": 0.50, "z": 0.5}}
-    }},
-    {{
-      "name": "joint_shoulder_right",
-      "body_part": "shoulder",
-      "deforms_mesh": true,
-      "position_normalized": {{"x": 0.85, "y": 0.50, "z": 0.5}}
-    }},
-    {{
-      "name": "joint_elbow_left",
-      "body_part": "elbow",
-      "deforms_mesh": true,
-      "position_normalized": {{"x": 0.08, "y": 0.42, "z": 0.5}}
-    }},
-    {{
-      "name": "joint_elbow_right",
-      "body_part": "elbow",
-      "deforms_mesh": true,
-      "position_normalized": {{"x": 0.92, "y": 0.42, "z": 0.5}}
-    }},
-    {{
-      "name": "joint_hand_left",
-      "body_part": "hand",
-      "deforms_mesh": true,
-      "position_normalized": {{"x": 0.0, "y": 0.35, "z": 0.5}}
-    }},
-    {{
-      "name": "joint_hand_right",
-      "body_part": "hand",
-      "deforms_mesh": true,
-      "position_normalized": {{"x": 1.0, "y": 0.35, "z": 0.5}}
-    }},
-    {{
-      "name": "joint_hip_left",
-      "body_part": "hip",
-      "deforms_mesh": true,
-      "position_normalized": {{"x": 0.38, "y": 0.22, "z": 0.5}}
-    }},
-    {{
-      "name": "joint_hip_right",
-      "body_part": "hip",
-      "deforms_mesh": true,
-      "position_normalized": {{"x": 0.62, "y": 0.22, "z": 0.5}}
-    }},
-    {{
-      "name": "joint_knee_left",
-      "body_part": "leg",
-      "deforms_mesh": true,
-      "position_normalized": {{"x": 0.38, "y": 0.15, "z": 0.5}}
-    }},
-    {{
-      "name": "joint_knee_right",
-      "body_part": "leg",
-      "deforms_mesh": true,
-      "position_normalized": {{"x": 0.62, "y": 0.15, "z": 0.5}}
-    }},
-    {{
-      "name": "joint_foot_left",
-      "body_part": "foot",
-      "deforms_mesh": true,
-      "position_normalized": {{"x": 0.35, "y": 0.0, "z": 0.5}}
-    }},
-    {{
-      "name": "joint_foot_right",
-      "body_part": "foot",
-      "deforms_mesh": true,
-      "position_normalized": {{"x": 0.65, "y": 0.0, "z": 0.5}}
-    }}
-  ],
-  "skeleton": [
-    {{"parent": "joint_root",           "child": "joint_pelvis"}},
-    {{"parent": "joint_pelvis",         "child": "joint_spine"}},
-    {{"parent": "joint_spine",          "child": "joint_chest"}},
-    {{"parent": "joint_chest",          "child": "joint_neck"}},
-    {{"parent": "joint_neck",           "child": "joint_head"}},
-    {{"parent": "joint_chest",          "child": "joint_shoulder_left"}},
-    {{"parent": "joint_chest",          "child": "joint_shoulder_right"}},
-    {{"parent": "joint_shoulder_left",  "child": "joint_elbow_left"}},
-    {{"parent": "joint_shoulder_right", "child": "joint_elbow_right"}},
-    {{"parent": "joint_elbow_left",     "child": "joint_hand_left"}},
-    {{"parent": "joint_elbow_right",    "child": "joint_hand_right"}},
-    {{"parent": "joint_pelvis",         "child": "joint_hip_left"}},
-    {{"parent": "joint_pelvis",         "child": "joint_hip_right"}},
-    {{"parent": "joint_hip_left",       "child": "joint_knee_left"}},
-    {{"parent": "joint_hip_right",      "child": "joint_knee_right"}},
-    {{"parent": "joint_knee_left",      "child": "joint_foot_left"}},
-    {{"parent": "joint_knee_right",     "child": "joint_foot_right"}}
-  ]
-}}
-
-YOUR TASK:
-  • Look at the image and FIND where limbs physically attach to the body
-  • position_normalized must reflect ACTUAL ATTACHMENT POINTS
-  • Adjust positions to match this specific object's anatomy
-  • Left/right sides must be symmetric
-  • If object has no arms (snake, fish), remove shoulder/elbow/hand joints
-  • If object has wings, rename: shoulder→wing_base, elbow→wing_mid, hand→wing_tip
-  • Do NOT add facial joints (jaw, eyes, ears) — these are mesh features
-  • All joint names UNIQUE
-
-POSITION GUIDE:
-  • Chest: y≈0.55
-  • Shoulders: x≈0.15 (left), x≈0.85 (right), y≈0.45–0.55
-  • Elbows: x≈0.08 (left), x≈0.92 (right), y≈0.40–0.45
-  • Hands: x=0.0 (left), x=1.0 (right), y≈0.35
-  • Hips: x≈0.38 (left), x≈0.62 (right), y≈0.22
-  • Knees: x≈0.38 (left), x≈0.62 (right), y≈0.15
-  • Feet: x≈0.35 (left), x≈0.65 (right), y≈0.0
-
-CRITICAL:
-  - Spread joints across FULL WIDTH, don't cluster at center
-  - Left < 0.5, Right > 0.5
-  - Extremities at mesh edges (x≈0 or x≈1)
-  - Shoulders are children of CHEST
-  - Shoulder at LEFT/RIGHT EDGE, not body center
-"""
-
