@@ -48,6 +48,17 @@ Environment variables
   BLENDER_PATH   (default: /Applications/Blender.app/Contents/MacOS/blender)
   PIPELINE_STORE_BACKEND  json | tinydb | clouddb
   RESULTS_DIR    (default: results)
+
+Bugs fixed from doc6 version
+-----------------------------
+  1. import model_store → import pipeline_store as ps
+  2. _store.upsert_classify() called with unknown kwargs user_id/active_image_path
+     → upsert_classify only accepts (classify_id, tag, info); user_id stored
+       separately; active_image_path set by upsert_classify internally
+  3. _build_joints_prompt in utils (doc7 version) referenced undefined locals
+     tag_context / bounds_info / joints_instruction / bounds_info_text
+     → utils.py already has the correct clean version; seg_server just calls it
+  4. Route was /infer_joints — renamed back to /joints to match client calls
 """
 
 import os
@@ -76,8 +87,8 @@ from rembg import remove, new_session
 from PIL import Image
 
 import utils
-import model_store as ms
-from model_store import _local_url
+import pipeline_store as ps          # FIX 1: was "import model_store as ms"
+from pipeline_store import _local_url
 
 # ── App setup ──────────────────────────────────────────────────────────────────
 
@@ -104,9 +115,9 @@ VEHICLE_KEYWORDS  = {'car', 'vehicle', 'wheels', 'truck', 'auto', 'bus',
 
 # ── Singletons ─────────────────────────────────────────────────────────────────
 
-_store        = ms.get_store()
-_rig_tasks    = {}   # task_id → status dict
-_mesh_tasks   = {}   # task_id → status dict
+_store        = ps.get_store()        # FIX 1: was ms.get_store()
+_rig_tasks    = {}
+_mesh_tasks   = {}
 _blender_lock = threading.Lock()
 
 # ── rembg ──────────────────────────────────────────────────────────────────────
@@ -126,8 +137,7 @@ def too_large(e):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Vision helpers — classify_with_vision (object ID) and
-#                  classify_joints_with_vision (joint placement)
+# Vision helpers
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _extract_json(text: str) -> dict | None:
@@ -154,7 +164,7 @@ def _extract_json(text: str) -> dict | None:
         return None
 
 
-# ── Per-model callers (shared by both classify and joints calls) ───────────────
+# ── Per-model callers (shared by classify and joints) ─────────────────────────
 
 def _try_claude(img_base64: str, mime_type: str, prompt: str,
                 max_tokens: int = 4096) -> dict | None:
@@ -232,8 +242,8 @@ def _try_gemini(img_bytes: bytes, mime_type: str, prompt: str) -> dict | None:
             except Exception as e:
                 err = str(e)
                 if '429' in err or 'RESOURCE_EXHAUSTED' in err:
-                    m       = re.search(r'retryDelay.*?(\d+)s', err)
-                    wait    = max(int(m.group(1)) if m else 0, 15 * (attempt + 1))
+                    m    = re.search(r'retryDelay.*?(\d+)s', err)
+                    wait = max(int(m.group(1)) if m else 0, 15 * (attempt + 1))
                     if 'PerDay' in err or wait > 60:
                         break
                     time.sleep(wait)
@@ -280,11 +290,9 @@ def _try_openai(img_base64: str, mime_type: str, prompt: str,
 def classify_with_vision(img_bytes: bytes, mime_type: str,
                          user_tag: str | None = None) -> dict:
     """
-    Identify the object and assess whether augmentation is needed.
-    Does NOT place joints — that is classify_joints_with_vision().
-
-    Returns dict with at minimum:
-      object_type, category, needs_augmentation, augment_prompt
+    Identify object_type, category, needs_augmentation.
+    Does NOT place joints — call /joints separately.
+    Uses utils._build_classify_prompt() or utils._build_vehicle_prompt().
     """
     img = Image.open(io.BytesIO(img_bytes))
     img = utils.resize_if_needed(img, max_size=1024)
@@ -292,9 +300,9 @@ def classify_with_vision(img_bytes: bytes, mime_type: str,
     img.save(buf, format='PNG', optimize=True)
     img_bytes = buf.getvalue()
 
-    mime_type  = utils.detect_mime_type(img_bytes)
-    tag_words  = set((user_tag or '').lower().split('+'))
-    tag_ctx    = f'\nThe user identified this as: "{user_tag}".' if user_tag else ''
+    mime_type = utils.detect_mime_type(img_bytes)
+    tag_words = set((user_tag or '').lower().split('+'))
+    tag_ctx   = f'\nThe user identified this as: "{user_tag}".' if user_tag else ''
 
     prompt = (
         utils._build_vehicle_prompt()
@@ -324,7 +332,6 @@ _MIN_JOINTS = 3
 _MAX_JOINTS = 16
 
 
-
 def _validate_joints(data: dict) -> bool:
     return (isinstance(data, dict)
             and isinstance(data.get('joint_hints'), list)
@@ -334,10 +341,14 @@ def _validate_joints(data: dict) -> bool:
 def classify_joints_with_vision(img_bytes: bytes, mime_type: str,
                                  object_type: str, category: str,
                                  requested_joints: str | None = None,
+                                 mesh_bounds: dict | None = None,
                                  ) -> tuple[dict, str]:
     """
     Ask a vision model to place joints on the active image.
-    object_type and category come from /classify — the model doesn't re-identify.
+    object_type and category come from /classify — no re-identification.
+    mesh_bounds: optional dict with width/height/depth in world units from the
+                 mesh GLB, injected into the prompt so the model calibrates
+                 coordinates to the full 3D mesh rather than the 2D image frame.
 
     Returns (joints_dict, model_name_used).
     Raises RuntimeError if all models fail.
@@ -355,7 +366,8 @@ def classify_joints_with_vision(img_bytes: bytes, mime_type: str,
     img.save(buf, format='PNG', optimize=True)
     img_bytes  = buf.getvalue()
     mime_type  = utils.detect_mime_type(img_bytes)
-    prompt     = utils._build_joints_prompt(object_type, category, n_joints)
+    prompt     = utils._build_joints_prompt(object_type, category, n_joints,
+                                             mesh_bounds=mesh_bounds)
     img_base64 = base64.b64encode(img_bytes).decode('utf-8')
 
     for label, fn, args in [
@@ -366,8 +378,6 @@ def classify_joints_with_vision(img_bytes: bytes, mime_type: str,
         log.info(f"joints: trying {label}...")
         result = fn(*args)
         if result and _validate_joints(result):
-            log.info(f"joints: {label} succeeded "
-                     f"({len(result['joint_hints'])} hints)")
             return result, label.lower()
 
     raise RuntimeError("All vision APIs exhausted for joint placement")
@@ -402,8 +412,8 @@ def meshy_reconstruct(img: Image.Image, object_type: str) -> tuple[str, str, str
     if not meshy_key:
         raise RuntimeError("MESHY_API_KEY not set")
 
-    headers   = {"Authorization": f"Bearer {meshy_key}"}
-    ot_lower  = object_type.lower()
+    headers  = {"Authorization": f"Bearer {meshy_key}"}
+    ot_lower = object_type.lower()
     pose_mode = (
         "t-pose" if any(w in ot_lower for w in ['human', 'person', 'humanoid'])
         else "a-pose" if any(w in ot_lower for w in
@@ -445,7 +455,9 @@ def meshy_reconstruct(img: Image.Image, object_type: str) -> tuple[str, str, str
             urls = task["model_urls"]
             return task_id, urls.get("glb"), urls.get("usdz")
         elif status == "FAILED":
-            raise RuntimeError(f"Meshy failed: {task.get('task_error', {}).get('message', 'Unknown')}")
+            raise RuntimeError(
+                f"Meshy failed: {task.get('task_error', {}).get('message', 'Unknown')}"
+            )
 
     raise RuntimeError("Meshy timed out after 5 minutes")
 
@@ -517,13 +529,14 @@ def run_skeleton_inference(glb_path: str, rigged_path: str,
 
 def run_blender_rig(glb_path: str, json_path: str, rigged_path: str):
     with _blender_lock:
+        print(" run blender ")
         rig_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'rig.py')
         cmd = [_blender_bin(), '--background', '--python', rig_script, '--',
                '--from-json', os.path.abspath(json_path),
                '--input',     os.path.abspath(glb_path),
                '--output',    os.path.abspath(rigged_path)]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        log.info(result.stdout[-2000:])
+        log.info(result.stdout[-4000:])
         if result.returncode != 0:
             raise RuntimeError(f"Blender failed: {result.stderr[-200:]}")
         if not os.path.exists(rigged_path):
@@ -532,8 +545,14 @@ def run_blender_rig(glb_path: str, json_path: str, rigged_path: str):
 
 def joints_from_model(joints_data: dict, glb_path: str):
     """
-    Map normalised joint positions from the vision model onto the mesh
-    bounding box. Returns (joints, hierarchy, hint_objects).
+    Map normalised joint positions (0–1) from the vision model onto mesh
+    world-space coordinates via bounding box interpolation.
+    Returns (joints, hierarchy, hint_objects).
+
+    Z is forced to 0.5 (center depth) regardless of what the model outputs.
+    Depth cannot be reliably estimated from a front-facing 2D image — whatever
+    the model outputs for z is essentially noise. Forcing center depth ensures
+    joints sit inside the mesh rather than floating in front of or behind it.
     """
     import trimesh
 
@@ -545,25 +564,30 @@ def joints_from_model(joints_data: dict, glb_path: str):
     verts  = np.array(mesh.vertices)
     bmin   = verts.min(axis=0)
     brange = verts.max(axis=0) - bmin
+    brange[brange == 0] = 1.0
 
     name_to_idx = {h['name']: i for i, h in enumerate(hint_objects)}
 
     joints = []
     for hint in hint_objects:
-        p        = hint.get('position_normalized', {})
-        norm_pos = np.array([p.get('x', 0.5), p.get('y', 0.5), p.get('z', 0.5)])
+        p = hint.get('position_normalized', {})
+        norm_pos = np.array([
+            np.clip(p.get('x', 0.5), 0.0, 1.0),
+            np.clip(p.get('y', 0.5), 0.0, 1.0),
+            0.5,   # force center depth — model cannot reliably estimate Z
+        ])
         joints.append(tuple(bmin + norm_pos * brange))
 
     hierarchy = []
     for bone in joints_data.get('skeleton', []):
-        p = name_to_idx.get(bone.get('parent') if isinstance(bone.get('parent'), str)
-                            else (hint_objects[bone['parent']]['name']
-                                  if isinstance(bone.get('parent'), int)
-                                  and bone['parent'] < len(hint_objects) else None))
-        c = name_to_idx.get(bone.get('child') if isinstance(bone.get('child'), str)
-                            else (hint_objects[bone['child']]['name']
-                                  if isinstance(bone.get('child'), int)
-                                  and bone['child'] < len(hint_objects) else None))
+        parent_ref = bone.get('parent')
+        child_ref  = bone.get('child')
+        if isinstance(parent_ref, int) and parent_ref < len(hint_objects):
+            parent_ref = hint_objects[parent_ref]['name']
+        if isinstance(child_ref, int) and child_ref < len(hint_objects):
+            child_ref = hint_objects[child_ref]['name']
+        p = name_to_idx.get(parent_ref)
+        c = name_to_idx.get(child_ref)
         if p is not None and c is not None:
             hierarchy.append((p, c))
 
@@ -624,6 +648,104 @@ def run_vehicle_pipeline(classify_id: str, glb_path: str,
     log.info(f"Vehicle pipeline complete: {rigged_path}")
     return rigged_path
 
+def snap_joints_to_mesh(joints_data: dict, glb_path: str) -> dict:
+    """
+    Snap BASE joint X coordinates (hip, shoulder, wing_base) to mesh surface.
+    Keep Y and Z as Claude inferred them (Y is usually correct).
+    """
+    import trimesh
+    
+    mesh = trimesh.load(glb_path, force='mesh')
+    verts = np.array(mesh.vertices)
+    bmin = verts.min(axis=0)
+    brange = verts.max(axis=0) - bmin
+    brange[brange == 0] = 1.0
+    
+    hints = joints_data.get('joint_hints', [])
+    base_joint_names = [h['name'] for h in hints
+                       if any(x in h.get('name', '').lower()
+                             for x in ['hip', 'shoulder', 'wing_base'])]
+    
+    for hint in hints:
+        if hint['name'] not in base_joint_names:
+            continue
+        
+        pos_norm = hint.get('position_normalized', {})
+        # Convert to world space
+        world_pos = np.array([
+            bmin[0] + pos_norm.get('x', 0.5) * brange[0],
+            bmin[1] + pos_norm.get('y', 0.5) * brange[1],
+            bmin[2] + pos_norm.get('z', 0.5) * brange[2]
+        ])
+        
+        # Find closest vertex
+        distances = np.linalg.norm(verts - world_pos, axis=1)
+        closest_idx = np.argmin(distances)
+        closest_vert = verts[closest_idx]
+        
+        # ✅ Snap ONLY X coordinate (the problematic one)
+        # Keep Y and Z as Claude inferred
+        snapped = {
+            'x': float(np.clip((closest_vert[0] - bmin[0]) / brange[0], 0.0, 1.0)),
+            'y': pos_norm.get('y', 0.5),  # Keep Claude's Y
+            'z': 0.5,
+        }
+        
+        hint['position_normalized'] = snapped
+        log.info(f"Snapped {hint['name']} X: {pos_norm.get('x', 0.5):.2f} → {snapped['x']:.2f} "
+                f"(Y unchanged: {snapped['y']:.2f})")
+    
+    return joints_data
+
+
+def visualize_normalized_joints(joints_data: dict, mesh_path: str, output_path: str):
+    """
+    Create GLB showing Claude's NORMALIZED joint positions (before snapping).
+    Helps debug what Claude is actually inferring.
+    """
+    import trimesh
+    
+    # Load mesh
+    mesh = trimesh.load(mesh_path, force='mesh')
+    scene = trimesh.Scene()
+    scene.add_geometry(mesh, node_name='mesh')
+    
+    mesh_size = np.linalg.norm(mesh.bounds[1] - mesh.bounds[0])
+    
+    # Get normalized joints
+    verts = np.array(mesh.vertices)
+    bmin = verts.min(axis=0)
+    brange = verts.max(axis=0) - bmin
+    brange[brange == 0] = 1.0
+    
+    hints = joints_data.get('joint_hints', [])
+    sphere_r = mesh_size * 0.02
+    
+    # Color code: base joints RED, middle joints YELLOW, end joints GREEN
+    def get_color(name):
+        name_lower = name.lower()
+        if any(x in name_lower for x in ['hip', 'shoulder', 'wing_base']):
+            return [255, 0, 0, 220]  # RED - base
+        elif any(x in name_lower for x in ['knee', 'elbow', 'wing_mid']):
+            return [255, 255, 0, 220]  # YELLOW - middle
+        else:
+            return [0, 255, 0, 220]  # GREEN - end
+    
+    for hint in hints:
+        pos_norm = hint.get('position_normalized', {})
+        x = bmin[0] + pos_norm.get('x', 0.5) * brange[0]
+        y = bmin[1] + pos_norm.get('y', 0.5) * brange[1]
+        z = bmin[2] + pos_norm.get('z', 0.5) * brange[2]
+        
+        sphere = trimesh.creation.icosphere(radius=sphere_r)
+        sphere.apply_translation([x, y, z])
+        sphere.visual.face_colors = get_color(hint['name'])
+        
+        scene.add_geometry(sphere, node_name=hint['name'])
+    
+    scene.export(output_path)
+    log.info(f"Normalized joints viz: {output_path}")
+    return output_path
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Rig pipeline (Blender only — mesh comes from /mesh)
@@ -632,10 +754,8 @@ def run_vehicle_pipeline(classify_id: str, glb_path: str,
 def run_rig_pipeline(task_id: str, classify_id: str, user_id: str, host: str):
     """
     Runs Blender rigging using mesh and joints already stored for classify_id.
-
-    - Mesh must exist (call /mesh first).
-    - Joints are read from the store; falls back to geometric inference if absent.
-    - This is the repeatable step: re-run after /joints to get new rig on same mesh.
+    Mesh must exist. Joints are read from store; falls back to geometric if absent.
+    Repeatable — re-run after /joints to get a new rig on the same mesh.
     """
     try:
         _rig_tasks[task_id] = {'status': 'rigging', 'progress': 10}
@@ -654,7 +774,6 @@ def run_rig_pipeline(task_id: str, classify_id: str, user_id: str, host: str):
             )
 
         glb_url     = mesh_data.get('glb_url')
-        usdz_path   = mesh_data.get('usdz_path')
         category    = classify_data.get('category', '')
         object_type = classify_data.get('object_type', '')
         tag_words   = set(object_type.lower().split())
@@ -664,26 +783,22 @@ def run_rig_pipeline(task_id: str, classify_id: str, user_id: str, host: str):
             (category not in ('animal', 'humanoid', 'other') and
              bool(tag_words & VEHICLE_KEYWORDS))
         )
-        log.info(f"category='{category}' is_vehicle={is_vehicle}")
+        log.info(f"category='{category}' is_vehicle={is_vehicle} object_type='{object_type}'")
 
         decimated_path     = None
         skeleton_json_path = None
         viz_glb_path       = None
 
         if is_vehicle:
-            # ── Vehicle pipeline ─────────────────────────────────────────────
             _rig_tasks[task_id] = {'status': 'rigging', 'progress': 50}
             rigged_path = run_vehicle_pipeline(classify_id, glb_path,
                                                classify_data, host)
         else:
-            # ── Animal/humanoid pipeline ──────────────────────────────────────
-            
-            # Decimate
+            # ── Decimate ──────────────────────────────────────────────────────
             decimated_path = os.path.join(RESULTS_DIR, f"{classify_id}_decimated.glb")
             if not os.path.exists(decimated_path):
                 _rig_tasks[task_id] = {'status': 'decimating', 'progress': 20}
                 _decimate_mesh(glb_path, decimated_path, ratio=0.1)
-                log.info(f"Decimated: {decimated_path}")
             active_glb  = decimated_path
             rigged_path = os.path.join(RESULTS_DIR, f"{classify_id}_rigged.glb")
 
@@ -695,26 +810,18 @@ def run_rig_pipeline(task_id: str, classify_id: str, user_id: str, host: str):
                          f"(model={joints_data.get('model_used', '?')}, "
                          f"count={len(joints_data['joint_hints'])})")
 
-                n_joints_str   = str(joints_data.get('suggested_joints', '')) or None
-                skeleton_json_path = run_skeleton_inference(
-                    active_glb, rigged_path, n_joints_str
-                )
-
+                # Map vision-model normalized positions onto mesh world space.
+                # Do NOT call run_skeleton_inference here — that runs geometric
+                # inference which writes its own 4-joint skeleton JSON and
+                # overwrites the vision model's joints before we can use them.
                 joints, hierarchy, hint_objects = joints_from_model(
                     joints_data, active_glb
                 )
 
+                def _hint_name(h, i):
+                    return h.get('name', f'joint_{i}') if isinstance(h, dict) else f'joint_{i}'
+
                 if joints:
-                    # Hierarchy may come from stored skeleton or inferred skeleton
-                    if not hierarchy:
-                        with open(skeleton_json_path) as f:
-                            existing = json.load(f)
-                        hierarchy = [(b['parent'], b['child'])
-                                     for b in existing['bones']]
-
-                    def _hint_name(h, i):
-                        return h.get('name', f'joint_{i}') if isinstance(h, dict) else f'joint_{i}'
-
                     skel = {
                         'joints': [
                             {'id': i,
@@ -725,25 +832,28 @@ def run_rig_pipeline(task_id: str, classify_id: str, user_id: str, host: str):
                         ],
                         'bones': [
                             {'parent': p, 'child': c,
-                             'name': f"{_hint_name(hint_objects[p], p)}"
-                                     f"_to_{_hint_name(hint_objects[c], c)}"}
+                             'name': (f"{_hint_name(hint_objects[p], p)}"
+                                      f"_to_{_hint_name(hint_objects[c], c)}")}
                             for p, c in hierarchy
                             if p < len(hint_objects) and c < len(hint_objects)
                         ]
                     }
                 else:
-                    # Positions couldn't be mapped — overlay names on inferred skeleton
+                    # position_normalized was missing/malformed — fall back to
+                    # geometric inference as a last resort
+                    log.warning("joints_from_model returned no positions — "
+                                "falling back to geometric inference")
+                    skeleton_json_path = run_skeleton_inference(active_glb, rigged_path)
                     with open(skeleton_json_path) as f:
                         skel = json.load(f)
-                    for i, joint in enumerate(skel['joints']):
-                        if i < len(hint_objects):
-                            h = hint_objects[i]
-                            joint['name'] = (h.get('name', joint['name'])
-                                             if isinstance(h, dict) else h)
-                            joint['hint'] = h if isinstance(h, dict) else None
+
+                # Write the skeleton JSON ourselves — do not let rig.py do it
+                skeleton_json_path = rigged_path.replace('.glb', '_skeleton.json')
+                with open(skeleton_json_path, 'w') as f:
+                    json.dump(skel, f, indent=2)
+                log.info(f"Skeleton JSON written from vision joints: {skeleton_json_path}")
 
             else:
-                # ── Pure geometric fallback ───────────────────────────────────
                 log.info(f"No joints stored for {classify_id} — geometric inference")
                 skeleton_json_path = run_skeleton_inference(active_glb, rigged_path)
                 with open(skeleton_json_path) as f:
@@ -754,10 +864,10 @@ def run_rig_pipeline(task_id: str, classify_id: str, user_id: str, host: str):
             skel = utils.inject_keyframes(skel)
             with open(skeleton_json_path, 'w') as f:
                 json.dump(skel, f, indent=2)
-            log.info(f"Keyframes injected: {skeleton_json_path}")
 
             # ── Visualisation (non-fatal) ─────────────────────────────────────
             try:
+            
                 _rig_tasks[task_id] = {'status': 'visualizing', 'progress': 50}
                 from rig import visualize_skeleton
                 viz_glb_path = os.path.join(RESULTS_DIR, f"{classify_id}_viz.glb")
@@ -773,18 +883,15 @@ def run_rig_pipeline(task_id: str, classify_id: str, user_id: str, host: str):
             except Exception as e:
                 log.warning(f"Viz failed (non-fatal): {e}")
 
-            # ── Run Blender rigging ───────────────────────────────────────────
             _rig_tasks[task_id] = {'status': 'rigging_blender', 'progress': 60}
-            log.info(f"Starting Blender rigging: {skeleton_json_path}")
             run_blender_rig(active_glb, skeleton_json_path, rigged_path)
-            log.info(f"Blender rigging complete: {rigged_path}")
 
         # ── Update mesh record with decimated path ────────────────────────────
         if decimated_path:
             _store.upsert_mesh(classify_id, {**mesh_data,
                                              'decimated_glb_path': decimated_path})
 
-        # ── Persist ──────────────────────────────────────────────────────────
+        # ── Persist ───────────────────────────────────────────────────────────
         _rig_tasks[task_id] = {'status': 'finalizing', 'progress': 90}
         _store.upsert_rig(classify_id, {
             'rigged_glb_path':    rigged_path,
@@ -809,15 +916,8 @@ def run_rig_pipeline(task_id: str, classify_id: str, user_id: str, host: str):
         _store.set_rig_status(classify_id, 'error', str(e))
 
 
-@app.route('/rig/status/<task_id>', methods=['GET'])
-def rig_status(task_id: str):
-    task = _rig_tasks.get(task_id)
-    if not task:
-        return jsonify({'error': 'Task not found'}), 404
-    return jsonify(task)
-
 # ══════════════════════════════════════════════════════════════════════════════
-# Mesh pipeline (Meshy — runs in background thread)
+# Mesh pipeline (Meshy — background thread)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _run_mesh_task(task_id: str, classify_id: str, img: Image.Image,
@@ -895,12 +995,9 @@ def segment():
 @app.route('/classify', methods=['GET', 'POST'])
 def classify():
     """
-    STEP 1: Identify object and evaluate if augmentation is needed.
-    Model returns: object_type, category, needs_augmentation, augment_prompt, suggested_joints.
-    Does NOT infer joints — that's /joints.
-    
-    ?user_id=... sets the owner (defaults to dummy_user_id).
-    ?force=true bypasses cache.
+    Identify object_type, category, needs_augmentation.
+    Does NOT place joints — call /joints separately.
+    ?force=true bypasses cache but preserves confirmed augmented image.
     """
     if request.method == 'GET':
         return jsonify({'status': 'ok'}), 200
@@ -908,65 +1005,65 @@ def classify():
         tag     = request.args.get('tag', '').strip()
         force   = request.args.get('force', '').lower() in ('1', 'true', 'yes')
         user_id = request.args.get('user_id', '').strip() or dummy_user_id
-
+ 
         img_bytes = request.stream.read()
         if not img_bytes:
             return jsonify({'error': 'No data received'}), 400
-
+ 
         classify_id = hashlib.md5(img_bytes + tag.encode()).hexdigest()[:8]
-
+ 
         if not force:
             record = _store.get(classify_id)
             if record and record.get('classify'):
                 log.info(f"classify cache hit: {classify_id}")
                 return jsonify({
                     **record['classify'],
-                    'classify_id': classify_id,
-                    'user_id': record.get('user_id', user_id),
+                    'classify_id':      classify_id,
                     'active_image_path': record.get('active_image_path'),
                 })
-
+ 
         log.info(f"classify {'(force) ' if force else ''}running: {classify_id}")
         mime_type = 'image/png' if img_bytes[:4] == b'\x89PNG' else 'image/jpeg'
-        
-        # Ask model: identify object + evaluate pose
-        info = classify_with_vision(img_bytes, mime_type, tag or None)
-        
+        info      = classify_with_vision(img_bytes, mime_type, tag or None)
+ 
         log.info(f"Classification: {info.get('object_type', '?')} | "
-                 f"needs_augmentation={info.get('needs_augmentation', False)}")
-
-        # Save segmented image
+            f"rig_type={info.get('rig_type', '?')} | "
+            f"has_body_parts={info.get('has_body_parts', {})} | "
+            f"needs_augmentation={info.get('needs_augmentation', False)}")
+ 
         seg_path = os.path.join(RESULTS_DIR, f"{classify_id}_segmented.png")
         if not os.path.exists(seg_path):
             img = Image.open(io.BytesIO(img_bytes)).convert('RGBA')
             img.save(seg_path, format='PNG')
             log.info(f"Segmented image saved: {seg_path}")
-
+ 
         info['segmented_image_path'] = seg_path
-        
-        # Store classification only (no joints)
-        _store.upsert_classify(classify_id, tag, info, user_id=user_id,
-                               active_image_path=seg_path)
-
+ 
+        _store.upsert_classify(classify_id, tag, info)
+ 
         return jsonify({
             **info,
-            'classify_id': classify_id,
+            'classify_id':      classify_id,
             'user_id': user_id,
             'active_image_path': seg_path,
         })
-
+ 
     except HTTPException:
         raise
     except Exception as e:
         log.error(f"/classify error: {e}")
-        return jsonify({'error': str(e)}), 500# ── /augment_image ────────────────────────────────────────────────────────────
+        return jsonify({'error': str(e)}), 500
+ 
+ 
+
+# ── /augment_image ────────────────────────────────────────────────────────────
 
 @app.route('/augment_image', methods=['GET', 'POST'])
 def augment_image():
     """
     Generate two augmented variants of the active image via fal.ai.
-    Reads active_image_path from the store — no image bytes needed from client.
-    Client calls /augment_image/confirm to lock in their choice.
+    Reads active_image_path from the store.
+    Client calls /augment_image/confirm to lock in choice.
     """
     if request.method == 'GET':
         return jsonify({'status': 'ok'}), 200
@@ -1019,11 +1116,7 @@ def augment_image():
 
 @app.route('/augment_image/confirm', methods=['GET', 'POST'])
 def augment_image_confirm():
-    """
-    Lock in the user's chosen augmented variant (a or b).
-    Sets active_image_path in the store — all downstream steps (/joints,
-    /mesh, /rig) will use this image from here on.
-    """
+    """Lock in chosen augmented variant. Sets active_image_path in store."""
     if request.method == 'GET':
         return jsonify({'status': 'ok'}), 200
     try:
@@ -1037,7 +1130,7 @@ def augment_image_confirm():
 
         chosen_path = os.path.join(RESULTS_DIR, f"{classify_id}_augmented_{choice}.png")
         if not os.path.exists(chosen_path):
-            return jsonify({'error': f"Augmented image not found — run /augment_image first"}), 404
+            return jsonify({'error': "Augmented image not found — run /augment_image first"}), 404
 
         _store.set_active_image(classify_id, chosen_path)
         log.info(f"Active image → augmented_{choice} for {classify_id}")
@@ -1056,19 +1149,24 @@ def augment_image_confirm():
         return jsonify({'error': str(e)}), 500
 
 
-# ── /joints ───────────────────────────────────────────────────────────────────
+# ── /infer_joints ─────────────────────────────────────────────────────────────
 
 @app.route('/infer_joints', methods=['GET', 'POST'])
 def infer_joints():
     """
-    STEP 2+: Place skeleton joints on the active image using a vision model.
-    Reads object_type and category from /classify result.
-    Freely repeatable — each call overwrites the previous result.
-    Falls back to geometric inference if all vision models fail (requires /mesh first).
-    
-    ?classify_id=...  required, from /classify
-    ?joints=N         optional hint to vision model (3-16)
-    ?force=true       bypass cache, re-run vision model
+    Place skeleton joints on the active image using a vision model.
+    Freely repeatable — each call overwrites previous result.
+    Falls back to geometric inference if vision fails (requires /mesh first).
+
+    ?classify_id=  required
+    ?joints=N      optional hint (3–16), passed to vision model as suggestion
+    ?force=true    bypass cache, re-run vision model
+
+    If a mesh already exists for this classify_id, its bounding box dimensions
+    are extracted and injected into the vision prompt so the model can reason
+    about the 3D proportions of the full mesh rather than guessing from the
+    2D image frame alone. This is the key fix for joints placed relative to
+    the visible image crop rather than the full mesh extents.
     """
     if request.method == 'GET':
         return jsonify({'status': 'ok'}), 200
@@ -1088,8 +1186,7 @@ def infer_joints():
             log.info(f"joints cache hit: {classify_id}")
             return jsonify({
                 **record['joints'],
-                'classify_id': classify_id,
-                'user_id': record.get('user_id'),
+                'classify_id':       classify_id,
                 'active_image_path': record.get('active_image_path'),
             })
 
@@ -1106,40 +1203,100 @@ def infer_joints():
         object_type = classify_data.get('object_type', '')
         category    = classify_data.get('category', '')
 
-        log.info(f"Placing joints for: {object_type} ({category})")
+        # ── Extract mesh bounding box if available ────────────────────────────
+        mesh_bounds = None
+        mesh_data   = record.get('mesh') or {}
+        glb_path    = mesh_data.get('glb_path') or mesh_data.get('decimated_glb_path')
 
-        # ── Vision model joint placement ──────────────────────────────────────
+        if glb_path and os.path.exists(glb_path):
+            try:
+                import trimesh
+                mesh   = trimesh.load(glb_path, force='mesh')
+                verts  = np.array(mesh.vertices)
+                bmin   = verts.min(axis=0)
+                bmax   = verts.max(axis=0)
+                brange = bmax - bmin
+                # Meshy exports Y-up. x=left/right, y=bottom/top, z=front/back.
+                # The y axis should be the tallest — log all three so we can
+                # spot if the mesh has an unexpected up-axis.
+                mesh_bounds = {
+                    'width':  float(brange[0]),   # x: left→right
+                    'height': float(brange[1]),   # y: bottom→top (up)
+                    'depth':  float(brange[2]),   # z: front→back
+                    'bmin':   bmin.tolist(),
+                    'bmax':   bmax.tolist(),
+                }
+                tallest = max(enumerate(brange), key=lambda t: t[1])
+                axis_names = ['x', 'y', 'z']
+                if tallest[0] != 1:
+                    log.warning(f"Mesh up-axis may not be Y: tallest axis is "
+                                f"{axis_names[tallest[0]]} ({tallest[1]:.3f}), "
+                                f"y={brange[1]:.3f}")
+                log.info(f"Mesh bounds: x={brange[0]:.3f} y={brange[1]:.3f} "
+                         f"z={brange[2]:.3f} (tallest={axis_names[tallest[0]]})")
+
+            except Exception as e:
+                log.warning(f"Could not extract mesh bounds: {e}")
+
+        log.info(f"Placing joints for: '{object_type}' ({category}) "
+                 f"requested={requested_joints} "
+                 f"mesh_bounds={'yes' if mesh_bounds else 'no'}")
+
+        # ── Vision model ──────────────────────────────────────────────────────
         joints_info = None
         model_used  = 'unknown'
         try:
             joints_info, model_used = classify_joints_with_vision(
                 img_bytes, mime_type, object_type, category,
                 requested_joints=requested_joints,
+                mesh_bounds=mesh_bounds,
             )
+            if joints_info and glb_path and os.path.exists(glb_path):
+                try:
+                    viz_path = os.path.join(RESULTS_DIR, f"{classify_id}_joints_normalized_viz.glb")
+                    visualize_normalized_joints(joints_info, glb_path, viz_path)
+                except Exception as e:
+                    log.warning(f"Normalized joints viz failed (non-fatal): {e}")
         except Exception as e:
-            log.warning(f"/joints vision failed: {e} — trying geometric fallback")
+            log.warning(f"/infer_joints vision failed: {e} — trying geometric fallback")
 
-        # ── Geometric fallback (needs mesh) ───────────────────────────────────
+        # ── Geometric fallback ────────────────────────────────────────────────
         if not joints_info:
-            mesh_data = record.get('mesh') or {}
-            glb_path  = mesh_data.get('glb_path')
+            glb_path = glb_path or (mesh_data.get('glb_path') if mesh_data else None)
             if not glb_path or not os.path.exists(glb_path):
                 return jsonify({
                     'error': ('Vision model unavailable and no mesh for geometric '
-                              'fallback — run /mesh first, then retry /joints')
+                              'fallback — run /mesh first, then retry /infer_joints')
                 }), 422
 
             from rig import infer_skeleton_geometric
+            import trimesh
             n = int(requested_joints) if requested_joints else None
             raw_joints, hierarchy, _ = infer_skeleton_geometric(glb_path, n)
+
+            # raw_joints are world-space coordinates — normalize to 0–1
+            # relative to the mesh bounding box so joints_from_model can
+            # map them back correctly.
+            if mesh_bounds is None:
+                mesh   = trimesh.load(glb_path, force='mesh')
+                verts  = np.array(mesh.vertices)
+                bmin   = np.array(verts.min(axis=0))
+                brange = np.array(verts.max(axis=0)) - bmin
+            else:
+                bmin   = np.array(mesh_bounds['bmin'])
+                brange = np.array(mesh_bounds['bmax']) - bmin
+            brange[brange == 0] = 1.0
+
             model_used  = 'geometric'
             joints_info = {
                 'joint_hints': [
                     {'name': f'joint_{i}',
                      'body_part': f'joint_{i}',
-                     'position_normalized': {'x': float(j[0]),
-                                             'y': float(j[1]),
-                                             'z': float(j[2])},
+                     'position_normalized': {
+                         'x': float(np.clip((j[0] - bmin[0]) / brange[0], 0.0, 1.0)),
+                         'y': float(np.clip((j[1] - bmin[1]) / brange[1], 0.0, 1.0)),
+                         'z': float(np.clip((j[2] - bmin[2]) / brange[2], 0.0, 1.0)),
+                     },
                      'animations': []}
                     for i, j in enumerate(raw_joints)
                 ],
@@ -1154,30 +1311,37 @@ def infer_joints():
             'source_image_path': active_path,
             'model_used':        model_used,
         }
+        if glb_path and os.path.exists(glb_path):
+            try:
+                joints_data = snap_joints_to_mesh(joints_data, glb_path)
+            except Exception as e:
+                log.warning(f"Snapping failed (non-fatal): {e}")
+        
+        
         _store.upsert_joints(classify_id, joints_data)
         log.info(f"Joints stored: {classify_id} "
                  f"({len(joints_info['joint_hints'])} hints, model={model_used})")
 
         return jsonify({
             **joints_data,
-            'classify_id': classify_id,
-            'user_id': record.get('user_id'),
+            'classify_id':       classify_id,
             'active_image_path': active_path,
         })
 
     except HTTPException:
         raise
     except Exception as e:
-        log.error(f"/joints error: {e}")
+        log.error(f"/infer_joints error: {e}")
         return jsonify({'error': str(e)}), 500
+
+
 # ── /mesh ─────────────────────────────────────────────────────────────────────
 
 @app.route('/mesh', methods=['GET', 'POST'])
 def mesh():
     """
-    Generate the 3D mesh via Meshy. Cached after first successful run.
-    ?force=true to regenerate (costs a Meshy credit).
-    Reads active_image_path from the store.
+    Generate 3D mesh via Meshy. Cached after first run.
+    ?force=true regenerates (costs a Meshy credit).
     """
     if request.method == 'GET':
         return jsonify({'status': 'ok'}), 200
@@ -1264,10 +1428,9 @@ def mesh_status(task_id: str):
 @app.route('/rig', methods=['GET', 'POST'])
 def rig():
     """
-    Rig the mesh using joints from the store.
-    Repeatable — re-run after /joints to get new rig on the same mesh.
-    Falls back to geometric inference if no joints are stored.
-    ?force=true bypasses the rig cache.
+    Rig mesh using joints from store. Repeatable.
+    Falls back to geometric inference if no joints stored.
+    ?force=true bypasses rig cache.
     """
     if request.method == 'GET':
         return jsonify({'status': 'ok'}), 200
@@ -1283,7 +1446,6 @@ def rig():
         if not record:
             return jsonify({'error': f"classify_id '{classify_id}' not found"}), 404
 
-        # ── Validate mesh exists ───────────────────────────────────────────────
         mesh_data = record.get('mesh') or {}
         glb_path  = mesh_data.get('glb_path')
         if not glb_path or not os.path.exists(glb_path):
@@ -1292,7 +1454,6 @@ def rig():
                 'classify_id': classify_id,
             }), 422
 
-        # ── Cache hit ─────────────────────────────────────────────────────────
         rig_data = record.get('rig') or {}
         if not force and rig_data.get('status') == 'ok':
             rigged_path = rig_data.get('rigged_glb_path')
@@ -1320,16 +1481,59 @@ def rig():
             daemon=True,
         ).start()
 
-        return jsonify({
-            'status': 'processing',
-            'task_id': task_id,
-            'classify_id': classify_id,
-        })
+        return jsonify({'status': 'processing', 'task_id': task_id,
+                        'classify_id': classify_id})
 
     except Exception as e:
         log.error(f"/rig error: {e}")
         return jsonify({'error': str(e)}), 500
 
+
+@app.route('/rig/status/<task_id>', methods=['GET'])
+def rig_status(task_id: str):
+    task = _rig_tasks.get(task_id)
+    if not task:
+        return jsonify({'error': 'Task not found'}), 404
+    return jsonify(task)
+
+
+# ── /decimate ─────────────────────────────────────────────────────────────────
+
+@app.route('/decimate', methods=['GET', 'POST'])
+def decimate():
+    """Decimate a GLB mesh. Accepts raw bytes or ?glb_url=..."""
+    if request.method == 'GET':
+        return jsonify({'status': 'ok'}), 200
+    try:
+        ratio   = max(0.01, min(1.0, float(request.args.get('ratio', '0.1'))))
+        glb_url = request.args.get('glb_url', '').strip()
+
+        if glb_url:
+            resp      = requests.get(glb_url, verify=False, timeout=60)
+            resp.raise_for_status()
+            glb_bytes = resp.content
+        else:
+            glb_bytes = request.stream.read()
+
+        if not glb_bytes:
+            return jsonify({'error': 'No GLB data'}), 400
+
+        uid      = str(uuid.uuid4())[:8]
+        in_path  = os.path.join(RESULTS_DIR, f"{uid}_input.glb")
+        out_path = os.path.join(RESULTS_DIR, f"{uid}_decimated.glb")
+        with open(in_path, 'wb') as f:
+            f.write(glb_bytes)
+        _decimate_mesh(in_path, out_path, ratio=ratio)
+        os.unlink(in_path)
+
+        return jsonify({'status': 'ok',
+                        'url':    _local_url(out_path, request.host),
+                        'ratio':  ratio})
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error(f"/decimate error: {e}")
+        return jsonify({'error': str(e)}), 500
 
 
 # ── /convert_to_usdz ──────────────────────────────────────────────────────────
@@ -1338,7 +1542,6 @@ def convert_glb_to_usdz(glb_path: str, usdz_path: str) -> str:
     import meshio
     log.info(f"Converting {glb_path} → {usdz_path}")
     meshio.write(usdz_path, meshio.read(glb_path))
-    log.info(f"Converted: {usdz_path}")
     return usdz_path
 
 
@@ -1380,9 +1583,6 @@ def gallery_page():
 
 @app.route('/gallery', methods=['GET'])
 def gallery():
-    """
-    ?user_id=  ?tag=  ?format=json|listview
-    """
     tag     = request.args.get('tag', '').strip().lower()
     fmt     = request.args.get('format', 'json').strip()
     user_id = request.args.get('user_id', '').strip() or dummy_user_id
@@ -1390,7 +1590,6 @@ def gallery():
         records = (_store.search_by_tag(user_id, tag)
                    if tag else _store.get_by_user(user_id))
         records = [_store.with_urls(r, request.host) for r in records]
-
         if fmt == 'listview':
             return jsonify([
                 f"{r.get('tag', 'model')}|{(r.get('rig') or {}).get('rigged_url', '')}"
@@ -1428,4 +1627,3 @@ def gallery_data():
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=6000, debug=False)
-    

@@ -380,8 +380,10 @@ def build_segment_weights(mesh_obj, armature_obj, skeleton_joints_data):
     # These must NOT share influence with neighboring terminals
     for ti in terminal_bone_indices:
         head, tail      = bone_segments[ti]
-        bone_center     = (head + tail) / 2
-        terminal_radius = mesh_size * 0.15  # ← Tighter radius
+        bone_center = (head + tail) / 2
+        bone_length = np.linalg.norm(tail - head)
+        terminal_radius = bone_length * 0.6  # 60% of bone length, capped at mesh_size * 0.10
+        terminal_radius = min(terminal_radius, mesh_size * 0.10)
         dists_to_bone   = np.linalg.norm(verts - bone_center, axis=1)
         terminal_mask   = dists_to_bone < terminal_radius
         if terminal_mask.any():
