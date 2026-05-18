@@ -268,14 +268,14 @@ class JsonStore:
             return sorted(records,
                           key=lambda r: (r.get('rig') or {}).get('created_at', ''),
                           reverse=True)
-
+    #not using user_id atm
     def search_by_tag(self, user_id: str, tag: str) -> list[dict]:
         tag_lower = tag.lower().strip()
         with self._lock:
             return [
                 dict(r) for r in self._data.values()
                 if tag_lower in r.get('tags', [])
-                and (r.get('rig') or {}).get('user_id') == user_id
+                and (r.get('rig') or {}) #.get('user_id') == user_id
             ]
 
     def get_mesh_by_hash(self, mesh_hash: str) -> dict | None:

@@ -989,7 +989,8 @@ def run_rig_pipeline(task_id: str, classify_id: str, user_id: str, host: str):
                                       f"_to_{_hint_name(hint_objects[c], c)}")}
                             for p, c in hierarchy
                             if p < len(hint_objects) and c < len(hint_objects)
-                        ]
+                        ],
+                        'rigid_parts': rigid_parts,
                     }
                 else:
                     # position_normalized was missing/malformed — fall back to
@@ -1174,33 +1175,33 @@ def classify():
                     'classify_id':      classify_id,
                     'active_image_path': record.get('active_image_path'),
                 })
- 
+
         log.info(f"classify {'(force) ' if force else ''}running: {classify_id}")
         mime_type = 'image/png' if img_bytes[:4] == b'\x89PNG' else 'image/jpeg'
         info      = classify_with_vision(img_bytes, mime_type, tag or None)
- 
+
         log.info(f"Classification: {info.get('object_type', '?')} | "
-            f"rig_type={info.get('rig_type', '?')} | "
-            f"has_body_parts={info.get('has_body_parts', {})} | "
-            f"needs_augmentation={info.get('needs_augmentation', False)}")
- 
+                 f"needs_augmentation={info.get('needs_augmentation', False)}")
+
         seg_path = os.path.join(RESULTS_DIR, f"{classify_id}_segmented.png")
         if not os.path.exists(seg_path):
             img = Image.open(io.BytesIO(img_bytes)).convert('RGBA')
             img.save(seg_path, format='PNG')
             log.info(f"Segmented image saved: {seg_path}")
- 
+
         info['segmented_image_path'] = seg_path
- 
+
+        # FIX 2: upsert_classify only takes (classify_id, tag, info).
+        # It internally sets active_image_path = seg_path on first call,
+        # and preserves it if already pointing at a confirmed augmented image.
         _store.upsert_classify(classify_id, tag, info)
- 
+
         return jsonify({
             **info,
             'classify_id':      classify_id,
-            'user_id': user_id,
             'active_image_path': seg_path,
         })
- 
+
     except HTTPException:
         raise
     except Exception as e:
