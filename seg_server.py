@@ -106,12 +106,7 @@ dummy_user_id = "fb712dd7-73cc-43a5-8158-74f7cb8a7fb4"
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-HUMANOID_KEYWORDS = {'human', 'person', 'character', 'humanoid', 'man',
-                     'woman', 'boy', 'girl', 'robot', 'alien', 'zombie',
-                     'totoro', 'creature', 'figure', 'monster'}
 
-VEHICLE_KEYWORDS  = {'car', 'vehicle', 'wheels', 'truck', 'auto', 'bus',
-                     'bike', 'motorcycle', 'van'}
 
 # ── Singletons ─────────────────────────────────────────────────────────────────
 
@@ -306,7 +301,7 @@ def classify_with_vision(img_bytes: bytes, mime_type: str,
 
     prompt = (
         utils._build_vehicle_prompt()
-        if tag_words & VEHICLE_KEYWORDS
+        if tag_words & utils.VEHICLE_KEYWORDS
         else utils._build_classify_prompt(tag_ctx)
     )
 

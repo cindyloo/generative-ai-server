@@ -40,6 +40,8 @@ VEHICLE_KEYWORDS = {'car', 'truck', 'vehicle', 'bus', 'bike', 'motorcycle',
 HUMANOID_KEYWORDS = {'human', 'person', 'character', 'humanoid', 'man',
                      'woman', 'boy', 'girl', 'robot', 'alien', 'zombie',
                      'totoro', 'creature', 'figure', 'monster'}
+                     
+ANIMAL_KEYWORDS = {'dog', 'cat', 'bird', 'fish', 'shark', 'whale', 'wolf', 'animal','bug', 'insect', 'butterfly'}
 
 
 # ── Image helpers ─────────────────────────────────────────────────────────────
