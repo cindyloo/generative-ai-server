@@ -154,11 +154,225 @@ def build_walk_keyframes(body_part: str, joint_name: str,
     }]
 
 
+def build_idle_keyframes(body_part: str, joint_name: str) -> list:
+    """
+    Gentle idle animation — slow bob and head nod.
+    Only animates root (bob) and head (nod). Everything else is silent.
+    Uses location for root bob so the whole rigid body moves as a unit.
+    Uses 90-frame cycle (slow and calm).
+    """
+    body_part_lower = (body_part or '').lower()
+
+    if body_part_lower in ('torso', 'pelvis'):
+        # Root/pelvis: gentle vertical bob via location.
+        # We respond to both labels because 'joint_root' sometimes doesn't
+        # exist as a Blender bone (it has no parent so no bone is created).
+        # Pelvis always exists and is the natural anchor for whole-body translation.
+        return [{
+            "clip":      "idle",
+            "property":  "location",
+            "axis":      "y",          # y = up in Blender Z-up after coord remap
+            "keyframes": [
+                [1,  0.000],
+                [23, 0.012],
+                [45, 0.000],
+                [68, -0.012],
+                [90, 0.000],
+            ],
+            "loop": True,
+        }]
+
+    if body_part_lower == 'head':
+        # Head: gentle nod (rotation around x)
+        return [{
+            "clip":      "idle",
+            "property":  "rotation_euler",
+            "axis":      "x",
+            "keyframes": [
+                [1,   0.000],
+                [23,  0.04],
+                [45,  0.000],
+                [68, -0.04],
+                [90,  0.000],
+            ],
+            "loop": True,
+        }]
+
+    return []
+
+
+def build_wave_keyframes(body_part: str, joint_name: str) -> list:
+    """
+    Wave/flap animations.
+
+    For arm joints: left arm raises and waves (single-sided wave).
+    For wing joints: BOTH wings flap together with phase offsets
+                     (base leads, mid trails, tip trails most).
+    Also generates a 'fold' clip for wings — wings fold down against body.
+
+    60-frame cycle for wave/flap, 40-frame hold for fold.
+    """
+    body_part_lower = (body_part or '').lower()
+    is_left  = 'left'  in joint_name.lower()
+    is_right = 'right' in joint_name.lower()
+
+    # ── Arm wave (left only) ──────────────────────────────────────────────────
+    if body_part_lower == 'shoulder' and is_left:
+        return [{
+            "clip":      "wave",
+            "property":  "rotation_euler",
+            "axis":      "x",
+            "keyframes": [
+                [1,   0.00],
+                [15,  0.80],
+                [30,  0.65],
+                [40,  0.80],
+                [50,  0.65],
+                [60,  0.00],
+            ],
+            "loop": True,
+        }]
+
+    if body_part_lower == 'elbow' and is_left:
+        return [{
+            "clip":      "wave",
+            "property":  "rotation_euler",
+            "axis":      "x",
+            "keyframes": [
+                [1,   0.00],
+                [15,  0.40],
+                [30,  0.60],
+                [40,  0.40],
+                [50,  0.60],
+                [60,  0.00],
+            ],
+            "loop": True,
+        }]
+
+    if body_part_lower == 'hand' and is_left:
+        return [{
+            "clip":      "wave",
+            "property":  "rotation_euler",
+            "axis":      "z",
+            "keyframes": [
+                [1,   0.00],
+                [30,  0.30],
+                [40, -0.30],
+                [50,  0.30],
+                [60,  0.00],
+            ],
+            "loop": True,
+        }]
+
+    # ── Wing flap (both wings, phase-offset tip wave) ─────────────────────────
+    # Bind pose = wings spread horizontally.
+    # Flap = rotate up then down from horizontal.
+    # Left wing: z+ = up. Right wing: z- = up (mirrored).
+    # Phase offsets: base at frame 1, mid lags 4 frames, tip lags 8 frames.
+    # This gives the characteristic flexible-wing wave motion.
+
+    if body_part_lower == 'wing_base':
+        sign = 1.0 if is_left else -1.0
+        return [
+            {
+                "clip":      "wave",       # flap animation
+                "property":  "rotation_euler",
+                "axis":      "z",
+                "keyframes": [
+                    [1,   0.00],
+                    [12,  sign * 0.50],    # up stroke
+                    [25,  sign * -0.35],   # down stroke
+                    [38,  sign * 0.50],    # up again
+                    [50,  sign * -0.35],
+                    [60,  0.00],
+                ],
+                "loop": True,
+            },
+            {
+                "clip":      "fold",       # fold wings against body
+                "property":  "rotation_euler",
+                "axis":      "z",
+                "keyframes": [
+                    [1,   0.00],
+                    [20,  sign * -0.90],   # fold down
+                    [40,  sign * -0.90],   # hold folded
+                ],
+                "loop": False,
+            },
+        ]
+
+    if body_part_lower == 'wing_mid':
+        sign = 1.0 if is_left else -1.0
+        return [
+            {
+                "clip":      "wave",
+                "property":  "rotation_euler",
+                "axis":      "z",
+                "keyframes": [
+                    [1,   0.00],
+                    [16,  sign * 0.35],    # lags base by 4 frames
+                    [29,  sign * -0.22],
+                    [42,  sign * 0.35],
+                    [54,  sign * -0.22],
+                    [60,  0.00],
+                ],
+                "loop": True,
+            },
+            {
+                "clip":      "fold",
+                "property":  "rotation_euler",
+                "axis":      "z",
+                "keyframes": [
+                    [1,   0.00],
+                    [22,  sign * -0.60],
+                    [40,  sign * -0.60],
+                ],
+                "loop": False,
+            },
+        ]
+
+    if body_part_lower == 'wing_tip':
+        sign = 1.0 if is_left else -1.0
+        return [
+            {
+                "clip":      "wave",
+                "property":  "rotation_euler",
+                "axis":      "z",
+                "keyframes": [
+                    [1,   0.00],
+                    [20,  sign * 0.20],    # lags base by 8 frames
+                    [33,  sign * -0.12],
+                    [46,  sign * 0.20],
+                    [58,  sign * -0.12],
+                    [60,  0.00],
+                ],
+                "loop": True,
+            },
+            {
+                "clip":      "fold",
+                "property":  "rotation_euler",
+                "axis":      "z",
+                "keyframes": [
+                    [1,   0.00],
+                    [25,  sign * -0.35],
+                    [40,  sign * -0.35],
+                ],
+                "loop": False,
+            },
+        ]
+
+    return []
+
+
 def inject_keyframes(skel: dict) -> dict:
     """
-    Walk every joint in the skeleton and inject procedural walk keyframes
-    based on its body_part label. Called after skel is assembled, before
-    run_blender_rig().
+    Inject procedural animations into every joint's hint.animations list.
+    Produces clips:
+      - 'walk'  — limb swing / wing flap cycle (deforming bones only)
+      - 'idle'  — gentle bob + head nod (root/pelvis and head only)
+      - 'wave'  — left arm wave OR both wings flap with phase offsets
+      - 'fold'  — wings fold against body (flying objects only)
+    Called after skel is assembled, before run_blender_rig().
     """
     positions = {j['id']: np.array(j['position']) for j in skel['joints']}
     children  = {}
@@ -179,7 +393,18 @@ def inject_keyframes(skel: dict) -> dict:
                     np.array(joint['position']) - child_pos
                 ))
 
-        animations = build_walk_keyframes(body_part, name, bone_length)
+        animations = []
+
+        # Walk — only deforming bones (limbs)
+        if deforms:
+            animations += build_walk_keyframes(body_part, name, bone_length)
+
+        # Idle — root bob and head nod only
+        animations += build_idle_keyframes(body_part, name)
+
+        # Wave — left arm/wing only
+        animations += build_wave_keyframes(body_part, name)
+
         if joint.get('hint') is None:
             joint['hint'] = {}
         joint['hint']['animations'] = animations
@@ -207,6 +432,8 @@ Return ONLY valid JSON, no markdown, no extra text:
   "object_type": "brief description of the object",
   "category": "animal|humanoid|vehicle|other",
   "rig_type": "humanoid|biped|quadruped|flying|vehicle|other",
+  "style": "brief description of the visual style and medium",
+  "rigid_parts": [],
   "needs_augmentation": false,
   "augment_prompt": ""
 }}
@@ -229,14 +456,49 @@ Rules:
     vehicle    — wheels and axles (car, truck, bike, spacecraft)
     other      — no clear locomotion structure (snake, fish, furniture, abstract)
 
+- style: describe the visual style and medium in a few specific words.
+    This is critical — it will be used to preserve the exact look during augmentation.
+    Be precise about technique, detail level, and artistic approach.
+    Examples:
+      "child's pencil sketch, rough lines, minimal detail, amateur"
+      "watercolor painting, soft edges, muted colors, loose brushwork"
+      "3D render, photorealistic, metallic bronze surface"
+      "cartoon, bold outlines, flat bright colors, simple shapes"
+      "crayon drawing, thick lines, basic shapes, bright colors"
+      "photograph, realistic, natural lighting, high detail"
+      "pixel art, 8-bit style, limited color palette"
+      "oil painting, textured brushstrokes, rich colors"
+      "digital illustration, clean lines, cel-shaded"
+    Never use generic terms like "image" or "picture" — be specific about the medium.
+
+- rigid_parts: list of body_part labels that should not deform during animation.
+    A part is rigid if it is made of hard material OR has no skin/flesh to deform.
+    Use only these labels: head, foot, hand, wing_tip
+    Examples:
+      "bronze dog statue"   → ["head", "foot"]   (solid metal, no deformation)
+      "stone golem"         → ["head", "hand", "foot"]
+      "humanoid robot"      → ["head", "hand"]   (rigid metal head and hands)
+      "cartoon character"   → []                 (soft skin, fully deformable)
+      "dragon"              → []                 (organic scales, deformable)
+      "zombie"              → []                 (flesh deforms)
+    Leave empty [] if the object is organic/soft and should deform naturally.
+
 - needs_augmentation: true if the current pose will make rigging very difficult:
     • Limbs are bent, folded, or hidden (sitting, curled, wings closed)
     • Body parts overlap and cannot be separated
     • Extreme foreshortening hides limb structure
     Set false if pose is neutral/spread out or if rig_type is vehicle/other
+    For flying objects: set false if wings are already spread — spread wings IS the correct rigging pose
 
-- augment_prompt: only if needs_augmentation is true — describe what change
-    would fix the pose. Leave empty string if needs_augmentation is false.
+- augment_prompt: only if needs_augmentation is true — describe the pose change needed
+    while PRESERVING the original style, materials, and appearance.
+    Always start with style preservation, then describe the pose change.
+    Examples by rig_type:
+      humanoid: "Keep the exact same character appearance. Repose into a T-pose with arms extended horizontally."
+      biped:    "Keep the exact same appearance. Repose standing upright with legs slightly apart, facing forward."
+      flying:   "Keep the exact same bird/creature appearance. Repose with wings fully extended horizontally, legs visible below, facing forward."
+      quadruped:"Keep the exact same animal appearance. Repose standing with all four legs apart and visible."
+    Leave empty string if needs_augmentation is false.
 """
 
 

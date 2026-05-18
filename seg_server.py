@@ -337,6 +337,7 @@ def classify_joints_with_vision(img_bytes: bytes, mime_type: str,
                                  object_type: str, category: str,
                                  requested_joints: str | None = None,
                                  mesh_bounds: dict | None = None,
+                                 rig_type: str = ""
                                  ) -> tuple[dict, str]:
     """
     Ask a vision model to place joints on the active image.
@@ -544,10 +545,14 @@ def joints_from_model(joints_data: dict, glb_path: str):
     world-space coordinates via bounding box interpolation.
     Returns (joints, hierarchy, hint_objects).
 
-    Z is forced to 0.5 (center depth) regardless of what the model outputs.
-    Depth cannot be reliably estimated from a front-facing 2D image — whatever
-    the model outputs for z is essentially noise. Forcing center depth ensures
-    joints sit inside the mesh rather than floating in front of or behind it.
+    Claude always outputs:
+      x = left/right (0=left, 1=right)
+      y = bottom/top (0=bottom, 1=top)
+      z = ignored (we force center depth)
+
+    But the mesh may be Y-up or Z-up depending on how Meshy exported it.
+    We detect the actual vertical axis as the one with the largest range,
+    then map Claude's semantic y → that axis and force the depth axis to 0.5.
     """
     import trimesh
 
@@ -558,20 +563,44 @@ def joints_from_model(joints_data: dict, glb_path: str):
     mesh   = trimesh.load(glb_path, force='mesh')
     verts  = np.array(mesh.vertices)
     bmin   = verts.min(axis=0)
-    brange = verts.max(axis=0) - bmin
+    bmax   = verts.max(axis=0)
+    brange = bmax - bmin
     brange[brange == 0] = 1.0
+
+    # Detect mesh orientation: Y-up (standard) vs Z-up (some Meshy exports)
+    # We check explicitly rather than sorting by range, because X (side) and
+    # Z (depth) can have similar ranges which causes the sort to assign them wrong.
+    if brange[2] > brange[1] * 1.2:
+        # Z range is significantly larger than Y → Z-up mesh
+        vert_axis  = 2   # Z → vertical (Claude's y)
+        side_axis  = 0   # X → left/right (Claude's x)
+        depth_axis = 1   # Y → depth (forced to center)
+    else:
+        # Standard Y-up mesh
+        vert_axis  = 1   # Y → vertical (Claude's y)
+        side_axis  = 0   # X → left/right (Claude's x)
+        depth_axis = 2   # Z → depth (forced to center)
+
+    axis_names = ['x', 'y', 'z']
+    log.info(f"Mesh axis mapping: vertical={axis_names[vert_axis]} "
+             f"side={axis_names[side_axis]} depth={axis_names[depth_axis]} "
+             f"ranges={brange.round(3)}")
 
     name_to_idx = {h['name']: i for i, h in enumerate(hint_objects)}
 
     joints = []
     for hint in hint_objects:
-        p = hint.get('position_normalized', {})
-        norm_pos = np.array([
-            np.clip(p.get('x', 0.5), 0.0, 1.0),
-            np.clip(p.get('y', 0.5), 0.0, 1.0),
-            0.5,   # force center depth — model cannot reliably estimate Z
-        ])
-        joints.append(tuple(bmin + norm_pos * brange))
+        p       = hint.get('position_normalized', {})
+        norm_x  = np.clip(p.get('x', 0.5), 0.0, 1.0)
+        norm_y  = np.clip(p.get('y', 0.5), 0.0, 1.0)
+
+        # Build world position using detected axis mapping
+        norm = np.array([0.5, 0.5, 0.5])
+        norm[side_axis]  = norm_x   # Claude x → left/right axis
+        norm[vert_axis]  = norm_y   # Claude y → vertical axis
+        norm[depth_axis] = 0.5      # center depth always
+
+        joints.append(tuple(bmin + norm * brange))
 
     hierarchy = []
     for bone in joints_data.get('skeleton', []):
@@ -643,104 +672,230 @@ def run_vehicle_pipeline(classify_id: str, glb_path: str,
     log.info(f"Vehicle pipeline complete: {rigged_path}")
     return rigged_path
 
-def snap_joints_to_mesh(joints_data: dict, glb_path: str) -> dict:
+
+def mesh_guided_joint_correction(joints_data: dict, glb_path: str,
+                                  rig_type: str) -> dict:
     """
-    Snap BASE joint X coordinates (hip, shoulder, wing_base) to mesh surface.
-    Keep Y and Z as Claude inferred them (Y is usually correct).
+    Use actual mesh geometry to correct and fill in Claude's joint placement.
+    Handles cases where Claude misses joints or places them incorrectly
+    due to unusual aspect ratios or novel object types.
     """
     import trimesh
-    
-    mesh = trimesh.load(glb_path, force='mesh')
-    verts = np.array(mesh.vertices)
-    bmin = verts.min(axis=0)
-    brange = verts.max(axis=0) - bmin
-    brange[brange == 0] = 1.0
-    
+
     hints = joints_data.get('joint_hints', [])
-    base_joint_names = [h['name'] for h in hints
-                       if any(x in h.get('name', '').lower()
-                             for x in ['hip', 'shoulder', 'wing_base'])]
-    
-    for hint in hints:
-        if hint['name'] not in base_joint_names:
-            continue
-        
-        pos_norm = hint.get('position_normalized', {})
-        # Convert to world space
-        world_pos = np.array([
-            bmin[0] + pos_norm.get('x', 0.5) * brange[0],
-            bmin[1] + pos_norm.get('y', 0.5) * brange[1],
-            bmin[2] + pos_norm.get('z', 0.5) * brange[2]
-        ])
-        
-        # Find closest vertex
-        distances = np.linalg.norm(verts - world_pos, axis=1)
-        closest_idx = np.argmin(distances)
-        closest_vert = verts[closest_idx]
-        
-        # ✅ Snap ONLY X coordinate (the problematic one)
-        # Keep Y and Z as Claude inferred
-        snapped = {
-            'x': float(np.clip((closest_vert[0] - bmin[0]) / brange[0], 0.0, 1.0)),
-            'y': pos_norm.get('y', 0.5),  # Keep Claude's Y
+    if not hints:
+        return joints_data
+
+    mesh   = trimesh.load(glb_path, force='mesh')
+    verts  = np.array(mesh.vertices)
+    bmin   = verts.min(axis=0)
+    bmax   = verts.max(axis=0)
+    brange = bmax - bmin
+    brange[brange == 0] = 1.0
+
+    hint_map = {h['name']: h for h in hints}
+    rt = (rig_type or '').lower()
+
+    def world_to_norm(v):
+        return {
+            'x': float(np.clip((v[0] - bmin[0]) / brange[0], 0.0, 1.0)),
+            'y': float(np.clip((v[1] - bmin[1]) / brange[1], 0.0, 1.0)),
             'z': 0.5,
         }
-        
-        hint['position_normalized'] = snapped
-        log.info(f"Snapped {hint['name']} X: {pos_norm.get('x', 0.5):.2f} → {snapped['x']:.2f} "
-                f"(Y unchanged: {snapped['y']:.2f})")
-    
+
+    if rt == 'flying':
+        # Wing tips are the leftmost/rightmost mesh vertices — geometrically exact
+        left_tip_vert  = verts[np.argmin(verts[:, 0])]
+        right_tip_vert = verts[np.argmax(verts[:, 0])]
+
+
+        # Center all spine joints at x=0.5 regardless of image perspective
+        for name in ['joint_root', 'joint_pelvis', 'joint_spine',
+                     'joint_chest', 'joint_neck', 'joint_head']:
+            if name in hint_map:
+                old_x = hint_map[name]['position_normalized']['x']
+                if abs(old_x - 0.5) > 0.03:  # only correct if meaningfully off-center
+                    hint_map[name]['position_normalized']['x'] = 0.5
+                    log.info(f"  GeoCorrect {name} X: {old_x:.3f}→0.500 (spine centering)")
+                
+
+        for tip_name, tip_vert in [
+            ('joint_wing_tip_left',  left_tip_vert),
+            ('joint_wing_tip_right', right_tip_vert),
+        ]:
+
+            norm = world_to_norm(tip_vert)
+            if tip_name in hint_map:
+                old_x = hint_map[tip_name]['position_normalized']['x']
+                hint_map[tip_name]['position_normalized']['x'] = norm['x']
+                log.info(f"  GeoCorrect {tip_name} X: {old_x:.3f}→{norm['x']:.3f} "
+                         f"(mesh extremity)")
+            else:
+                ref = next((h for h in hints if 'wing_tip' in h.get('name', '')), None)
+                new_hint = {
+                    'name':                tip_name,
+                    'body_part':           'wing_tip',
+                    'deforms_mesh':        ref['deforms_mesh'] if ref else True,
+                    'position_normalized': norm,
+                }
+                hints.append(new_hint)
+                hint_map[tip_name] = new_hint
+                log.info(f"  GeoCorrect: created missing {tip_name} from geometry")
+
+        # Wing mid — midpoint between base and tip
+        for side in ['left', 'right']:
+            base_name = f'joint_wing_base_{side}'
+            mid_name  = f'joint_wing_mid_{side}'
+            tip_name  = f'joint_wing_tip_{side}'
+            if all(n in hint_map for n in [base_name, mid_name, tip_name]):
+                base_x = hint_map[base_name]['position_normalized']['x']
+                tip_x  = hint_map[tip_name]['position_normalized']['x']
+                base_y = hint_map[base_name]['position_normalized']['y']
+                tip_y  = hint_map[tip_name]['position_normalized']['y']
+                hint_map[mid_name]['position_normalized']['x'] = (base_x + tip_x) / 2
+                hint_map[mid_name]['position_normalized']['y'] = (base_y + tip_y) / 2
+                log.info(f"  GeoCorrect {mid_name} → wing midpoint")
+
+    elif rt in ('biped', 'humanoid', 'other'):
+        # Find narrowest Y slice in mid-body = arm/stalk junction
+        n_slices = 50
+        slice_widths = []
+        for i in range(n_slices):
+            y_lo = bmin[1] + (i / n_slices) * brange[1]
+            y_hi = bmin[1] + ((i + 1) / n_slices) * brange[1]
+            sv   = verts[(verts[:, 1] >= y_lo) & (verts[:, 1] < y_hi)]
+            if len(sv) > 10:
+                width = sv[:, 0].max() - sv[:, 0].min()
+                slice_widths.append((i / n_slices + 0.5 / n_slices, width))
+
+        if slice_widths:
+            lower_mid = [(y, w) for y, w in slice_widths if 0.25 < y < 0.65]
+            if lower_mid:
+                stalk_y_norm = min(lower_mid, key=lambda t: t[1])[0]
+                for name in ['joint_shoulder_left', 'joint_shoulder_right']:
+                    if name in hint_map:
+                        old_y = hint_map[name]['position_normalized']['y']
+                        if abs(old_y - stalk_y_norm) > 0.08:
+                            hint_map[name]['position_normalized']['y'] = float(stalk_y_norm)
+                            log.info(f"  GeoCorrect {name} Y: {old_y:.3f}→{stalk_y_norm:.3f} "
+                                     f"(stalk junction)")
+
+        # Hands = outermost X vertices in arm Y range
+        arm_y_lo  = bmin[1] + 0.25 * brange[1]
+        arm_y_hi  = bmin[1] + 0.70 * brange[1]
+        arm_verts = verts[(verts[:, 1] >= arm_y_lo) & (verts[:, 1] < arm_y_hi)]
+        if len(arm_verts) > 0:
+            for name, selector in [
+                ('joint_hand_left',  np.argmin),
+                ('joint_hand_right', np.argmax),
+            ]:
+                if name in hint_map:
+                    vert  = arm_verts[selector(arm_verts[:, 0])]
+                    norm  = world_to_norm(vert)
+                    old_x = hint_map[name]['position_normalized']['x']
+                    if abs(old_x - norm['x']) > 0.05:
+                        hint_map[name]['position_normalized']['x'] = norm['x']
+                        log.info(f"  GeoCorrect {name} X: {old_x:.3f}→{norm['x']:.3f} "
+                                 f"(mesh extremity)")
+
+        # Feet = bottommost vertices split left/right
+        foot_verts = verts[verts[:, 1] < bmin[1] + 0.15 * brange[1]]
+        if len(foot_verts) > 10:
+            mid_x = (bmin[0] + bmax[0]) / 2
+            for name, mask_fn in [
+                ('joint_foot_left',  lambda v: v[:, 0] < mid_x),
+                ('joint_foot_right', lambda v: v[:, 0] >= mid_x),
+            ]:
+                if name in hint_map:
+                    cluster = foot_verts[mask_fn(foot_verts)]
+                    if len(cluster) > 0:
+                        norm  = world_to_norm(cluster.mean(axis=0))
+                        old_y = hint_map[name]['position_normalized']['y']
+                        hint_map[name]['position_normalized']['y'] = norm['y']
+                        log.info(f"  GeoCorrect {name} Y: {old_y:.3f}→{norm['y']:.3f} "
+                                 f"(foot centroid)")
+
+    elif rt == 'quadruped':
+        foot_verts = verts[verts[:, 1] < bmin[1] + 0.15 * brange[1]]
+        if len(foot_verts) > 20:
+            mid_x = (bmin[0] + bmax[0]) / 2
+            mid_z = (bmin[2] + bmax[2]) / 2
+            clusters = {
+                'joint_foot_front_left':  foot_verts[(foot_verts[:,0]<mid_x) & (foot_verts[:,2]<mid_z)],
+                'joint_foot_front_right': foot_verts[(foot_verts[:,0]>=mid_x)& (foot_verts[:,2]<mid_z)],
+                'joint_foot_rear_left':   foot_verts[(foot_verts[:,0]<mid_x) & (foot_verts[:,2]>=mid_z)],
+                'joint_foot_rear_right':  foot_verts[(foot_verts[:,0]>=mid_x)& (foot_verts[:,2]>=mid_z)],
+            }
+            for name, cluster in clusters.items():
+                if name in hint_map and len(cluster) > 0:
+                    norm = world_to_norm(cluster.mean(axis=0))
+                    hint_map[name]['position_normalized'] = norm
+                    log.info(f"  GeoCorrect {name} → foot centroid")
+
     return joints_data
 
 
-def visualize_normalized_joints(joints_data: dict, mesh_path: str, output_path: str):
+def enforce_bilateral_symmetry(joints_data: dict) -> dict:
     """
-    Create GLB showing Claude's NORMALIZED joint positions (before snapping).
-    Helps debug what Claude is actually inferring.
+    For paired joints (left/right), if one side is missing, mirror the other.
+    If both exist, enforce same Y height so they're level.
     """
-    import trimesh
-    
-    # Load mesh
-    mesh = trimesh.load(mesh_path, force='mesh')
-    scene = trimesh.Scene()
-    scene.add_geometry(mesh, node_name='mesh')
-    
-    mesh_size = np.linalg.norm(mesh.bounds[1] - mesh.bounds[0])
-    
-    # Get normalized joints
-    verts = np.array(mesh.vertices)
-    bmin = verts.min(axis=0)
-    brange = verts.max(axis=0) - bmin
-    brange[brange == 0] = 1.0
-    
-    hints = joints_data.get('joint_hints', [])
-    sphere_r = mesh_size * 0.02
-    
-    # Color code: base joints RED, middle joints YELLOW, end joints GREEN
-    def get_color(name):
-        name_lower = name.lower()
-        if any(x in name_lower for x in ['hip', 'shoulder', 'wing_base']):
-            return [255, 0, 0, 220]  # RED - base
-        elif any(x in name_lower for x in ['knee', 'elbow', 'wing_mid']):
-            return [255, 255, 0, 220]  # YELLOW - middle
-        else:
-            return [0, 255, 0, 220]  # GREEN - end
-    
-    for hint in hints:
-        pos_norm = hint.get('position_normalized', {})
-        x = bmin[0] + pos_norm.get('x', 0.5) * brange[0]
-        y = bmin[1] + pos_norm.get('y', 0.5) * brange[1]
-        z = bmin[2] + pos_norm.get('z', 0.5) * brange[2]
-        
-        sphere = trimesh.creation.icosphere(radius=sphere_r)
-        sphere.apply_translation([x, y, z])
-        sphere.visual.face_colors = get_color(hint['name'])
-        
-        scene.add_geometry(sphere, node_name=hint['name'])
-    
-    scene.export(output_path)
-    log.info(f"Normalized joints viz: {output_path}")
-    return output_path
+    hints    = joints_data.get('joint_hints', [])
+    hint_map = {h['name']: h for h in hints}
+
+    pairs = [
+        ('joint_wing_base_left',  'joint_wing_base_right'),
+        ('joint_wing_mid_left',   'joint_wing_mid_right'),
+        ('joint_wing_tip_left',   'joint_wing_tip_right'),
+        ('joint_shoulder_left',   'joint_shoulder_right'),
+        ('joint_elbow_left',      'joint_elbow_right'),
+        ('joint_hand_left',       'joint_hand_right'),
+        ('joint_hip_left',        'joint_hip_right'),
+        ('joint_knee_left',       'joint_knee_right'),
+        ('joint_foot_left',       'joint_foot_right'),
+        ('joint_foot_front_left', 'joint_foot_front_right'),
+        ('joint_foot_rear_left',  'joint_foot_rear_right'),
+    ]
+
+    for left_name, right_name in pairs:
+        left  = hint_map.get(left_name)
+        right = hint_map.get(right_name)
+
+        if left and not right:
+            lpos = left['position_normalized']
+            new_hint = {**left, 'name': right_name,
+                'position_normalized': {
+                    'x': float(np.clip(1.0 - lpos['x'], 0.0, 1.0)),
+                    'y': lpos['y'],
+                    'z': lpos.get('z', 0.5),
+                }}
+            hints.append(new_hint)
+            hint_map[right_name] = new_hint
+            log.info(f"  Symmetry: mirrored {left_name} → {right_name}")
+
+        elif right and not left:
+            rpos = right['position_normalized']
+            new_hint = {**right, 'name': left_name,
+                'position_normalized': {
+                    'x': float(np.clip(1.0 - rpos['x'], 0.0, 1.0)),
+                    'y': rpos['y'],
+                    'z': rpos.get('z', 0.5),
+                }}
+            hints.append(new_hint)
+            hint_map[left_name] = new_hint
+            log.info(f"  Symmetry: mirrored {right_name} → {left_name}")
+
+        elif left and right:
+            lpos  = left['position_normalized']
+            rpos  = right['position_normalized']
+            avg_y = (lpos['y'] + rpos['y']) / 2
+            if abs(lpos['y'] - rpos['y']) > 0.05:
+                lpos['y'] = avg_y
+                rpos['y'] = avg_y
+                log.info(f"  Symmetry: leveled {left_name}/{right_name} Y → {avg_y:.3f}")
+
+    return joints_data
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Rig pipeline (Blender only — mesh comes from /mesh)
@@ -760,6 +915,7 @@ def run_rig_pipeline(task_id: str, classify_id: str, user_id: str, host: str):
         classify_data = record.get('classify') or {}
         mesh_data     = record.get('mesh')     or {}
         joints_data   = record.get('joints')   or {}
+        rig_type      = classify_data.get('rig_type', '').lower()
 
         # ── Validate mesh ─────────────────────────────────────────────────────
         glb_path = mesh_data.get('glb_path')
@@ -771,14 +927,16 @@ def run_rig_pipeline(task_id: str, classify_id: str, user_id: str, host: str):
         glb_url     = mesh_data.get('glb_url')
         category    = classify_data.get('category', '')
         object_type = classify_data.get('object_type', '')
+        rigid_parts = classify_data.get('rigid_parts', [])
         tag_words   = set(object_type.lower().split())
 
         is_vehicle = (
             category == 'vehicle' or
             (category not in ('animal', 'humanoid', 'other') and
-             bool(tag_words & VEHICLE_KEYWORDS))
+             bool(tag_words & utils.VEHICLE_KEYWORDS))
         )
-        log.info(f"category='{category}' is_vehicle={is_vehicle} object_type='{object_type}'")
+        log.info(f"category='{category}' is_vehicle={is_vehicle} object_type='{object_type}' "
+                 f"rigid_parts={rigid_parts}")
 
         decimated_path     = None
         skeleton_json_path = None
@@ -1066,28 +1224,64 @@ def augment_image():
         classify_id = request.args.get('classify_id', '').strip()
         if not classify_id:
             return jsonify({'error': 'Missing classify_id'}), 400
-
+ 
         record = _store.get(classify_id)
         if not record or not record.get('classify'):
             return jsonify({'error': f"classify_id '{classify_id}' not found — run /classify first"}), 404
-
+ 
         active_path = record.get('active_image_path')
         if not active_path or not os.path.exists(active_path):
             return jsonify({'error': f"Active image not found: '{active_path}'"}), 404
-
-        object_type = record['classify'].get('object_type', '')
-        user_prompt = request.args.get('tag', '').lower().strip().replace('+', ' ')
-        prompt      = user_prompt or f"a {object_type}"
-
-        tag_words = set((user_prompt or object_type).lower().split())
-        if tag_words & HUMANOID_KEYWORDS:
-            prompt += (" Show the character in a T-pose or A-pose with arms "
-                       "extended outward for easy 3D rigging. Clear background.")
-
+ 
+        classify_data   = record.get('classify') or {}
+        object_type     = classify_data.get('object_type', '')
+        rig_type        = classify_data.get('rig_type', '').lower()
+        stored_augment  = classify_data.get('augment_prompt', '').strip()
+        style           = classify_data.get('style', '').strip()
+        user_prompt     = request.args.get('tag', '').lower().strip().replace('+', ' ')
+ 
+        # Style preservation anchor — always prepend this so fal.ai doesn't
+        # drift from the original appearance. Use the stored style description
+        # if available — it captures the exact medium and technique.
+        if style:
+            style_anchor = (f"Keep the exact same {object_type}. "
+                            f"Style: {style}. "
+                            f"Do NOT add detail, change the art style, or alter "
+                            f"the drawing technique. Only change the pose. ")
+        else:
+            style_anchor = (f"Keep the exact same {object_type} — identical "
+                            f"colors, materials, textures, and visual style. "
+                            f"Only change the pose. ")
+ 
+        # Use stored augment_prompt from classify if available,
+        # otherwise build a rig-type-appropriate pose prompt
+        if stored_augment:
+            pose_prompt = stored_augment
+        elif user_prompt:
+            pose_prompt = user_prompt
+        elif rig_type == 'humanoid':
+            pose_prompt = ("Repose into a T-pose or A-pose with arms extended "
+                           "horizontally for easy 3D rigging.")
+        elif rig_type == 'biped':
+            pose_prompt = ("Repose standing upright on two legs in a neutral "
+                           "A-pose with legs slightly apart, facing forward.")
+        elif rig_type == 'flying':
+            pose_prompt = ("Repose with wings fully extended horizontally, "
+                           "facing forward, legs visible below if present.")
+        elif rig_type == 'quadruped':
+            pose_prompt = ("Repose standing with all four legs apart and "
+                           "clearly visible, facing forward.")
+        else:
+            pose_prompt = f"Repose the {object_type} in a neutral spread pose for 3D rigging."
+ 
+        prompt = style_anchor + pose_prompt + " Clear white background."
+ 
+        log.info(f"Augment prompt: {prompt[:120]}...")
+ 
         img        = Image.open(active_path).convert('RGB')
         img        = utils.resize_if_needed(img, max_size=1024)
         img_a, img_b = edit_image_fal(img, prompt)
-
+ 
         path_a = os.path.join(RESULTS_DIR, f"{classify_id}_augmented_a.png")
         path_b = os.path.join(RESULTS_DIR, f"{classify_id}_augmented_b.png")
         img_a.save(path_a)
@@ -1197,6 +1391,7 @@ def infer_joints():
         mime_type   = 'image/png' if img_bytes[:4] == b'\x89PNG' else 'image/jpeg'
         object_type = classify_data.get('object_type', '')
         category    = classify_data.get('category', '')
+        rig_type    = classify_data.get('rig_type', '')
 
         # ── Extract mesh bounding box if available ────────────────────────────
         mesh_bounds = None
@@ -1245,13 +1440,8 @@ def infer_joints():
                 img_bytes, mime_type, object_type, category,
                 requested_joints=requested_joints,
                 mesh_bounds=mesh_bounds,
+                rig_type=rig_type,
             )
-            if joints_info and glb_path and os.path.exists(glb_path):
-                try:
-                    viz_path = os.path.join(RESULTS_DIR, f"{classify_id}_joints_normalized_viz.glb")
-                    visualize_normalized_joints(joints_info, glb_path, viz_path)
-                except Exception as e:
-                    log.warning(f"Normalized joints viz failed (non-fatal): {e}")
         except Exception as e:
             log.warning(f"/infer_joints vision failed: {e} — trying geometric fallback")
 
@@ -1311,8 +1501,26 @@ def infer_joints():
                 joints_data = snap_joints_to_mesh(joints_data, glb_path)
             except Exception as e:
                 log.warning(f"Snapping failed (non-fatal): {e}")
-        
-        
+
+            try:
+                rig_type = classify_data.get('rig_type', '')
+                joints_data = mesh_guided_joint_correction(
+                    joints_data, glb_path, rig_type)
+            except Exception as e:
+                log.warning(f"Mesh-guided correction failed (non-fatal): {e}")
+
+            try:
+                joints_data = enforce_bilateral_symmetry(joints_data)
+            except Exception as e:
+                log.warning(f"Symmetry enforcement failed (non-fatal): {e}")
+
+            try:
+                viz_path = os.path.join(RESULTS_DIR,
+                                        f"{classify_id}_joints_normalized_viz.glb")
+                visualize_normalized_joints(joints_data, glb_path, viz_path)
+            except Exception as e:
+                log.warning(f"Normalized joints viz failed (non-fatal): {e}")
+
         _store.upsert_joints(classify_id, joints_data)
         log.info(f"Joints stored: {classify_id} "
                  f"({len(joints_info['joint_hints'])} hints, model={model_used})")
