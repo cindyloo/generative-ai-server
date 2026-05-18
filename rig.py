@@ -365,7 +365,22 @@ def build_segment_weights(mesh_obj, armature_obj, skeleton_joints_data):
         for head, tail in bone_segments
     ])
 
-    # Find terminal bones
+    # ── Build set of non-deforming bone indices from skeleton_joints_data ────
+    # deforms_mesh=false means the bone moves rigidly — no smooth blending.
+    # This is read directly from the hint Claude outputs per joint.
+    non_deforming_indices = set()
+    if skeleton_joints_data:
+        for joint in skeleton_joints_data:
+            hint = joint.get('hint') or {}
+            if not hint.get('deforms_mesh', True):
+                name = joint.get('name', '')
+                idx  = next((i for i, n in enumerate(bone_names_list)
+                             if n == name), None)
+                if idx is not None:
+                    non_deforming_indices.add(idx)
+                    print(f"  Non-deforming bone: '{name}' (deforms_mesh=false)")
+
+    # ── Find terminal bones ───────────────────────────────────────────────────
     all_parent_names = set()
     for b in armature_obj.data.bones:
         if b.parent:
@@ -376,13 +391,57 @@ def build_segment_weights(mesh_obj, armature_obj, skeleton_joints_data):
         if name not in all_parent_names
     ]
 
-    # Hard-lock vertices near terminal bones (feet, hands, head)
-    # These must NOT share influence with neighboring terminals
+    # After computing seg_dists, before terminal locks:
+
+    # ── Pre-partition vertices into spine vs limb regions ──────────────────────
+    # Spine bones occupy the vertical center column of the mesh.
+    # Limb bones occupy the outer regions.
+    # We separate them by X distance from center — limb vertices are far from X=0,
+    # spine vertices are near X=0.
+
+    spine_bone_indices = set()
+    limb_bone_indices  = set()
+
+    for bi, bname in enumerate(bone_names_list):
+        bname_lower = bname.lower()
+        if any(p in bname_lower for p in
+               ['root', 'pelvis', 'spine', 'neck', 'head']):
+            spine_bone_indices.add(bi)
+        elif any(p in bname_lower for p in
+                 ['elbow', 'hand', 'hip', 'knee', 'foot',
+                'wing_mid', 'wing_tip']):
+            limb_bone_indices.add(bi)
+
+    # For each vertex, determine if it's in a limb region by finding
+    # its nearest limb bone and nearest spine bone, then comparing distances
+    if spine_bone_indices and limb_bone_indices:
+        spine_dists = seg_dists[:, list(spine_bone_indices)].min(axis=1)
+        limb_dists  = seg_dists[:, list(limb_bone_indices)].min(axis=1)
+
+        # Vertices closer to a limb bone → zero out spine bone influences
+        # Vertices closer to a spine bone → zero out limb bone influences
+        is_limb_vert  = limb_dists < spine_dists
+        is_spine_vert = ~is_limb_vert
+
+        # Zero out cross-region influences
+        for bi in spine_bone_indices:
+            seg_dists[is_limb_vert, bi] = np.inf
+        for bi in limb_bone_indices:
+            seg_dists[is_spine_vert, bi] = np.inf
+
+        print(f"  Partitioned: {is_limb_vert.sum()} limb verts, "
+              f"{is_spine_vert.sum()} spine verts")
+
+    # ── Hard-lock vertices near terminal bones (feet, hands) ─────────────────
+    # Skip non-deforming bones here — they're handled by the rigid lock below.
     for ti in terminal_bone_indices:
+        if ti in non_deforming_indices:
+            continue  # handled by rigid lock below
+
         head, tail      = bone_segments[ti]
-        bone_center = (head + tail) / 2
-        bone_length = np.linalg.norm(tail - head)
-        terminal_radius = bone_length * 0.6  # 60% of bone length, capped at mesh_size * 0.10
+        bone_center     = (head + tail) / 2
+        bone_length     = np.linalg.norm(tail - head)
+        terminal_radius = bone_length * 0.6
         terminal_radius = min(terminal_radius, mesh_size * 0.10)
         dists_to_bone   = np.linalg.norm(verts - bone_center, axis=1)
         terminal_mask   = dists_to_bone < terminal_radius
@@ -392,19 +451,91 @@ def build_segment_weights(mesh_obj, armature_obj, skeleton_joints_data):
             print(f"  Locked {terminal_mask.sum()} vertices to terminal bone: {bone_names_list[ti]}")
 
     # ✅ Build smooth Gaussian-based weights
-    smooth_weights = np.zeros((len(verts), len(bone_names_list)))
-    
-    # Instead of:
-    sigma = mesh_size * 0.1
 
-    # Per-bone sigma based on bone length:
+    # ── Rigid lock for non-deforming bones ────────────────────────────────────
+    # All vertices whose nearest bone is a non-deforming bone get locked to it
+    # with 100% weight — no blending. This makes the head, pelvis, etc. move
+    # as solid rigid units rather than deforming.
+    if non_deforming_indices:
+        # Compute nearest bone for all vertices using current seg_dists
+        nearest_bone = np.argmin(seg_dists, axis=1)
+        for bi in non_deforming_indices:
+            rigid_mask = nearest_bone == bi
+            if rigid_mask.any():
+                seg_dists[rigid_mask, :]  = np.inf
+                seg_dists[rigid_mask, bi] = 0.0
+                print(f"  Rigid lock: {rigid_mask.sum()} vertices → "
+                      f"'{bone_names_list[bi]}' (deforms_mesh=false)")
+
+    # ── Smooth Gaussian weights for remaining vertices ────────────────────────
+    smooth_weights = np.zeros((len(verts), len(bone_names_list)))
+
     for bi in range(len(bone_names_list)):
         head, tail = bone_segments[bi]
         bone_len   = np.linalg.norm(tail - head)
-        sigma      = max(bone_len * 0.5, mesh_size * 0.02)  # at least 2% of mesh
+        sigma      = max(bone_len * 0.5, mesh_size * 0.02)
         distances  = seg_dists[:, bi]
         smooth_weights[:, bi] = np.exp(-(distances ** 2) / (2 * sigma ** 2))
 
+
+# ── Island coherence lock ─────────────────────────────────────────────────
+    # Find disconnected mesh islands and lock small ones to their dominant bone.
+    # Meshy meshes have 600-800 separate islands (non-manifold surface patches).
+    # Without this, stray feather/detail fragments get independent weights and
+    # fly apart during animation. Small islands must move as a coherent unit.
+    import bmesh as _bmesh
+    bm = _bmesh.new()
+    bm.from_mesh(mesh_obj.data)
+    bm.verts.ensure_lookup_table()
+
+    island_map  = {}   # vertex_index → island_id
+    island_id   = 0
+    visited     = set()
+    for v in bm.verts:
+        if v.index not in visited:
+            stack = [v]
+            while stack:
+                curr = stack.pop()
+                if curr.index in visited:
+                    continue
+                visited.add(curr.index)
+                island_map[curr.index] = island_id
+                for e in curr.link_edges:
+                    other = e.other_vert(curr)
+                    if other.index not in visited:
+                        stack.append(other)
+            island_id += 1
+    bm.free()
+
+    # Count island sizes
+    island_sizes = {}
+    for iid in island_map.values():
+        island_sizes[iid] = island_sizes.get(iid, 0) + 1
+
+    # Threshold: islands smaller than 0.5% of total verts are "small"
+    small_threshold = max(10, len(verts) * 0.05)
+    small_locked    = 0
+
+    for iid in range(island_id):
+        if island_sizes.get(iid, 0) >= small_threshold:
+            continue  # large island — leave Gaussian weights as-is
+
+        # Small island — find dominant bone by average weight across its verts
+        island_verts = [vi for vi, i2 in island_map.items() if i2 == iid]
+        if not island_verts:
+            continue
+        avg_weights = smooth_weights[island_verts].mean(axis=0)
+        dominant    = int(np.argmax(avg_weights))
+
+        # Lock every vertex in this island 100% to the dominant bone
+        smooth_weights[island_verts, :]         = 0.0
+        smooth_weights[island_verts, dominant]  = 1.0
+        small_locked += len(island_verts)
+
+    if small_locked:
+        print(f"  Island lock: {small_locked} verts in small islands "
+              f"→ locked to dominant bone (threshold={int(small_threshold)} verts)")
+    # ── End island coherence lock ─────────────────────────────────────────────
 
     # Normalize weights per vertex
     weight_sums = smooth_weights.sum(axis=1, keepdims=True)
@@ -605,7 +736,13 @@ def build_armature(arm_data, joints, hierarchy, bone_names):
         cb = arm_data.edit_bones.get(cname)
         if pb and cb:
             cb.parent = pb
-            cb.use_connect = True   # ✅ CHANGED: Allow child head to snap to parent tail
+            # use_connect=True snaps child head to parent tail.
+            # Only use it for straight chains (spine, leg, arm).
+            # Branching joints (hip, shoulder) must be False or they
+            # get snapped to the wrong position.
+            branch_parts = {'hip', 'shoulder', 'wing_base'}
+            is_branch = any(p in cname.lower() for p in branch_parts)
+            cb.use_connect = not is_branch
 
     n_bones = len(arm_data.edit_bones)
     print(f"Armature: {n_bones} bones")
@@ -750,6 +887,56 @@ def rig_in_blender(mesh_path: str, joints: list, hierarchy: list,
             bpy.context.view_layer.objects.active = mesh_obj
         bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
         print("Applied transforms to all mesh objects")
+
+
+        # ── Diagnostic: check mesh health before skinning ─────────────────────────
+        import bmesh
+        for obj in mesh_objects:
+            bpy.context.view_layer.objects.active = obj
+            bm = bmesh.new()
+            bm.from_mesh(obj.data)
+            bm.verts.ensure_lookup_table()
+            bm.edges.ensure_lookup_table()
+            non_manifold_edges = [e for e in bm.edges if not e.is_manifold]
+            loose_verts        = [v for v in bm.verts if not v.link_edges]
+
+            islands = 0
+            visited = set()
+            for v in bm.verts:
+                if v.index not in visited:
+                    islands += 1
+                    stack = [v]
+                    while stack:
+                        curr = stack.pop()
+                        if curr.index in visited:
+                            continue
+                        visited.add(curr.index)
+                        for e in curr.link_edges:
+                            other = e.other_vert(curr)
+                            if other.index not in visited:
+                                stack.append(other)
+
+            print(f"Mesh health: {len(bm.verts)} verts, {len(bm.faces)} faces")
+            print(f"  Non-manifold edges: {len(non_manifold_edges)}")
+            print(f"  Loose vertices:     {len(loose_verts)}")
+            print(f"  Separate islands:   {islands}")
+            bm.free()
+        # ── End diagnostic ────────────────────────────────────────────────────────
+        
+        for obj in mesh_objects:
+            bpy.context.view_layer.objects.active = obj
+            bpy.ops.object.mode_set(mode='EDIT')
+            bpy.ops.mesh.select_all(action='SELECT')
+            bpy.ops.mesh.remove_doubles(threshold=0.002)
+            bpy.ops.object.mode_set(mode='OBJECT')
+            
+            # Check improvement
+            bm2 = bmesh.new()
+            bm2.from_mesh(obj.data)
+            nm2 = [e for e in bm2.edges if not e.is_manifold]
+            print(f"  After weld: {len(nm2)} non-manifold edges "
+                  f"(was {len(non_manifold_edges)})")
+            bm2.free()
 
         # ── Skin mesh to armature ─────────────────────────────────
         skin_mesh(mesh_objects, armature_obj, skeleton_joints_data)
