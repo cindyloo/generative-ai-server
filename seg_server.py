@@ -525,14 +525,13 @@ def run_skeleton_inference(glb_path: str, rigged_path: str,
 
 def run_blender_rig(glb_path: str, json_path: str, rigged_path: str):
     with _blender_lock:
-        print(" run blender ")
         rig_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'rig.py')
         cmd = [_blender_bin(), '--background', '--python', rig_script, '--',
                '--from-json', os.path.abspath(json_path),
                '--input',     os.path.abspath(glb_path),
                '--output',    os.path.abspath(rigged_path)]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        log.info(result.stdout[-4000:])
+        log.info(result.stdout[-2000:])
         if result.returncode != 0:
             raise RuntimeError(f"Blender failed: {result.stderr[-200:]}")
         if not os.path.exists(rigged_path):
@@ -652,7 +651,7 @@ def run_vehicle_pipeline(classify_id: str, glb_path: str,
         ('animatesam.py',       animated_path,  'blender'),
         ('merge_animations.py', rigged_path,    'python'),
     ]:
-        script = os.path.join(seg_dir, script_name)
+        script = os.path.join(seg_dir, 'vehicle', script_name)
         if runner == 'blender':
             extra = [tire_verts] if script_name == 'classify_wheels.py' else []
             cmd   = [_blender_bin(), '--background', '--factory-startup',
@@ -1164,6 +1163,7 @@ def classify():
         if not img_bytes:
             return jsonify({'error': 'No data received'}), 400
  
+        #same hash per img and tag...
         classify_id = hashlib.md5(img_bytes + tag.encode()).hexdigest()[:8]
  
         if not force:
