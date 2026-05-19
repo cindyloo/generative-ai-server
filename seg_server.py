@@ -1743,12 +1743,37 @@ def decimate():
 # ── /convert_to_usdz ──────────────────────────────────────────────────────────
 
 def convert_glb_to_usdz(glb_path: str, usdz_path: str) -> str:
-    import meshio
-    log.info(f"Converting {glb_path} → {usdz_path}")
-    meshio.write(usdz_path, meshio.read(glb_path))
+    """Convert GLB to USDZ using Blender's USD exporter."""
+    import textwrap, tempfile, subprocess
+    
+    script = textwrap.dedent(f"""
+        import bpy
+        bpy.ops.wm.read_factory_settings(use_empty=True)
+        bpy.ops.import_scene.gltf(filepath=r'{glb_path}')
+        bpy.ops.wm.usd_export(
+            filepath=r'{usdz_path}',
+            export_animation=True,
+            export_textures=True,
+            export_materials=True,
+        )
+        print('USDZ export done')
+    """).strip()
+    
+    sf = tempfile.mktemp(suffix='.py')
+    with open(sf, 'w') as f:
+        f.write(script)
+    result = subprocess.run(
+        [_blender_bin(), '--background', '--python', sf],
+        capture_output=True, text=True, timeout=120
+    )
+    os.unlink(sf)
+    
+    if not os.path.exists(usdz_path):
+        raise RuntimeError(f"USDZ export failed: {result.stderr[-300:]}")
+    
+    log.info(f"Converted {glb_path} → {usdz_path}")
     return usdz_path
-
-
+    
 @app.route('/convert_to_usdz', methods=['GET', 'POST'])
 def convert_to_usdz():
     if request.method == 'GET':
