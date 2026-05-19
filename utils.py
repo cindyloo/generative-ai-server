@@ -84,7 +84,7 @@ def detect_mime_type(img_bytes: bytes) -> str:
 # axis, phase (+1 normal / -1 inverted), base amplitude in radians
 WALK_KEYFRAMES = {
     "root":      None,
-    "pelvis":    ("z",  1,  0.05),
+    "pelvis":    ("z",  1,  0.08),
     "spine":     ("y", -1,  0.06),
     "chest":     ("y", -1,  0.05),
     "neck":      ("z",  1,  0.02),
@@ -92,12 +92,12 @@ WALK_KEYFRAMES = {
     "shoulder":  ("x",  1,  0.35),
     "elbow":     ("x",  1,  0.20),
     "hand":      ("x",  1,  0.10),
-    "hip":       ("x",  1,  0.20),
-    "leg":       ("x",  1,  0.50),
-    "foot":      ("x",  1,  0.10),
-    "wing_base": ("z",  1,  0.30),
-    "wing_mid":  ("z",  1,  0.20),
-    "wing_tip":  ("z",  1,  0.10),
+    "hip":       ("x",  1,  0.45),
+    "leg":       ("x",  1,  0.60),
+    "foot":      ("x",  1,  0.20),
+    "wing_base": ("z",  1,  0.45),  # ±26° — meaningful flap from spread pose
+    "wing_mid":  ("z",  1,  0.30),  # trails base — tip-wave effect
+    "wing_tip":  ("z",  1,  0.18),  # trails most
     "axle":      None,
     "body":      None,
 }
@@ -383,6 +383,7 @@ def inject_keyframes(skel: dict) -> dict:
         hint      = joint.get('hint') or {}
         body_part = hint.get('body_part', '')
         name      = joint.get('name', '')
+        deforms   = hint.get('deforms_mesh', True)
 
         bone_length = None
         child_ids   = children.get(joint['id'], [])
