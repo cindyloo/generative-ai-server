@@ -620,6 +620,7 @@ def joints_from_model(joints_data: dict, glb_path: str):
 def run_vehicle_pipeline(classify_id: str, glb_path: str,
                          classify_data: dict, host: str) -> str:
     seg_dir        = os.path.dirname(os.path.abspath(__file__))
+    vehicle_dir = os.path.join(seg_dir, 'vehicle')
     separated_path = os.path.join(RESULTS_DIR, f"{classify_id}_separated.glb")
     animated_path  = os.path.join(RESULTS_DIR, f"{classify_id}_animated.glb")
     rigged_path    = os.path.join(RESULTS_DIR, f"{classify_id}_rigged.glb")
@@ -645,18 +646,18 @@ def run_vehicle_pipeline(classify_id: str, glb_path: str,
         log.info(f"Texture extracted: {texture_path}")
         break
 
-    for script_name, out_path, runner in [
-        ('find_tire_verts.py',  tire_verts,     'python'),
-        ('classify_wheels.py',  separated_path, 'blender'),
-        ('animatesam.py',       animated_path,  'blender'),
-        ('merge_animations.py', rigged_path,    'python'),
+    for script_name, input_path, out_path, runner in [
+        ('find_tire_verts.py',  glb_path,        tire_verts,     'python'),
+        ('classify_wheels.py',  glb_path,        separated_path, 'blender'),
+        ('animatesam.py',       separated_path,  animated_path,  'blender'),
+        ('merge_animations.py', animated_path,   rigged_path,    'python'),
     ]:
-        script = os.path.join(seg_dir, 'vehicle', script_name)
+        script = os.path.join(vehicle_dir, script_name)
         if runner == 'blender':
             extra = [tire_verts] if script_name == 'classify_wheels.py' else []
             cmd   = [_blender_bin(), '--background', '--factory-startup',
                      '--python', script, '--',
-                     glb_path, out_path, classify_json] + extra
+                     input_path, out_path, classify_json] + extra
         else:
             args = ([glb_path, classify_json, tire_verts, texture_path]
                     if script_name == 'find_tire_verts.py'
@@ -664,7 +665,14 @@ def run_vehicle_pipeline(classify_id: str, glb_path: str,
             cmd  = [sys.executable, script] + args
 
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        log.info(result.stdout[-500:])
+        
+        log.info(f"separated_path exists: {os.path.exists(separated_path)} → {separated_path}")
+        log.info(f"classify_wheels returncode: {result.returncode}")
+        log.info(f"classify_wheels stderr: {result.stderr[-300:]}")
+        log.info(result.stdout[-4000:])
+        if result.returncode != 0:
+            log.error(f"classify_wheels stderr: {result.stderr[-500:]}")
+
         if not os.path.exists(out_path):
             raise RuntimeError(f"{script_name} failed: {result.stderr[-200:]}")
 

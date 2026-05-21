@@ -65,13 +65,15 @@ for i, wheel in enumerate(wheel_objects):
         cx, cy, cz  = float(nearest[0]), float(nearest[1]), float(nearest[2])
         print(f"  {wheel.name}: Gemini pivot=({cx:.3f},{cy:.3f},{cz:.3f})")
     else:
-        dists     = np.linalg.norm(verts_np - median_pt, axis=1)
-        threshold = np.percentile(dists, 50)
-        inner     = verts_np[dists < threshold]
-        cx = float(inner[:, 0].mean())
-        cy = float(inner[:, 1].mean())
-        cz = float(inner[:, 2].mean())
-        print(f"  {wheel.name}: computed pivot=({cx:.3f},{cy:.3f},{cz:.3f})")
+        # Bounding box center — true geometric center regardless of
+        # vertex distribution. For a wheel (symmetric cylinder) this
+        # is the axle center, which is what we want to rotate around.
+        bbox_min = verts_np.min(axis=0)
+        bbox_max = verts_np.max(axis=0)
+        cx = float((bbox_min[0] + bbox_max[0]) / 2)
+        cy = float((bbox_min[1] + bbox_max[1]) / 2)
+        cz = float((bbox_min[2] + bbox_max[2]) / 2)
+        print(f"  {wheel.name}: bbox pivot=({cx:.3f},{cy:.3f},{cz:.3f})")
 
     # ── Set origin to pivot ───────────────────────────────────────
     bpy.context.view_layer.objects.active = wheel
