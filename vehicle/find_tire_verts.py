@@ -208,16 +208,15 @@ else:
     right_facing = positions[:, 0] >= 0
 
  
-# Replace the entire X slab section with this simpler approach:
+# Spherical selection — use 70% of tire radius to exclude stray
+# black chassis geometry near the wheels without clipping tire tread.
 all_tire_mask = np.zeros(len(positions), dtype=bool)
 
 for ci, centroid in enumerate(centroids):
-    # Simple spherical selection from centroid
-    dists2      = np.linalg.norm(positions - centroid, axis=1)
-    this_wheel  = tire_color_mask & (dists2 < tire_radius)
-    print(f"  Wheel {ci}: centroid=({centroid[0]:.3f},{centroid[1]:.3f},{centroid[2]:.3f}) → {this_wheel.sum()} verts")
-    all_tire_mask |= this_wheel
-
+    dists2     = np.linalg.norm(positions - centroid, axis=1)
+    this_wheel = tire_color_mask & (dists2 < tire_radius * 0.7)
+    print(f"  Wheel {ci}: centroid=({centroid[0]:.3f},{centroid[1]:.3f},"
+          f"{centroid[2]:.3f}) → {this_wheel.sum()} verts")
     all_tire_mask |= this_wheel
 
 tire_vertices = np.where(all_tire_mask)[0].tolist()

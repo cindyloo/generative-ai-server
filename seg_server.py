@@ -620,7 +620,7 @@ def joints_from_model(joints_data: dict, glb_path: str):
 def run_vehicle_pipeline(classify_id: str, glb_path: str,
                          classify_data: dict, host: str) -> str:
     seg_dir        = os.path.dirname(os.path.abspath(__file__))
-    vehicle_dir = os.path.join(seg_dir, 'vehicle')
+    vehicle_dir    = os.path.join(seg_dir, 'vehicle')
     separated_path = os.path.join(RESULTS_DIR, f"{classify_id}_separated.glb")
     animated_path  = os.path.join(RESULTS_DIR, f"{classify_id}_animated.glb")
     rigged_path    = os.path.join(RESULTS_DIR, f"{classify_id}_rigged.glb")
@@ -628,8 +628,19 @@ def run_vehicle_pipeline(classify_id: str, glb_path: str,
     tire_verts     = os.path.join(RESULTS_DIR, f"{classify_id}_tire_verts.json")
     texture_path   = os.path.join(RESULTS_DIR, f"{classify_id}_texture.png")
 
+    
+    record      = _store.get(classify_id)
+    joints_data = (record.get('joints') or {}) if record else {}
+    joint_hints = joints_data.get('joint_hints', [])
+    # Only inject wheel joints — body/axle joints not needed in animatesam
+    classify_data['joint_hints'] = [
+        j for j in joint_hints
+        if j.get('body_part') == 'wheel'
+    ]
     with open(classify_json, 'w') as f:
         json.dump(classify_data, f, indent=2)
+    log.info(f"Injected {len(classify_data['joint_hints'])} wheel joints into classify_json")
+     
 
     with open(glb_path, 'rb') as f:
         f.read(12)
@@ -647,9 +658,9 @@ def run_vehicle_pipeline(classify_id: str, glb_path: str,
         break
 
     for script_name, input_path, out_path, runner in [
-        ('find_tire_verts.py',  glb_path,        tire_verts,     'python'),
-        ('classify_wheels.py',  glb_path,        separated_path, 'blender'),
-        ('animatesam.py',       separated_path,  animated_path,  'blender'),
+        ('find_tire_verts.py', glb_path,        tire_verts,     'python'),
+        ('classify_wheels.py', glb_path,         separated_path, 'blender'),
+        ('animatesam.py',      separated_path,   animated_path,  'blender'),
         ('merge_animations.py', animated_path,   rigged_path,    'python'),
     ]:
         script = os.path.join(vehicle_dir, script_name)
@@ -665,21 +676,39 @@ def run_vehicle_pipeline(classify_id: str, glb_path: str,
             cmd  = [sys.executable, script] + args
 
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        
+        log.info(result.stdout[-2000:])
+
+        # After find_tire_verts.py runs, read the saved centroids file
+        # and inject into classify_json for animatesam.py to use as pivots.
+        # This uses find_tire_verts.py's own lf/lr/rf/rr split — consistent
+        # with classify_wheels.py's naming — rather than recomputing here.
+        if script_name == 'find_tire_verts.py' and os.path.exists(tire_verts):
+            try:
+                centroids_path = tire_verts.replace('.json', '_centroids.json')
+                if os.path.exists(centroids_path):
+                    with open(centroids_path) as _f:
+                        _centroids = json.load(_f)
+                    with open(classify_json, 'r') as _f:
+                        _cdata = json.load(_f)
+                    _cdata['wheel_centroids'] = _centroids
+                    with open(classify_json, 'w') as _f:
+                        json.dump(_cdata, _f, indent=2)
+                    log.info(f"Wheel centroids injected from find_tire_verts: {_centroids}")
+                else:
+                    log.warning("Centroids file not found — pivot will use bbox fallback")
+            except Exception as e:
+                log.warning(f"Centroid injection failed (non-fatal): {e}")
+
         log.info(f"separated_path exists: {os.path.exists(separated_path)} → {separated_path}")
         log.info(f"classify_wheels returncode: {result.returncode}")
-        log.info(f"classify_wheels stderr: {result.stderr[-300:]}")
-        log.info(result.stdout[-4000:])
-        if result.returncode != 0:
-            log.error(f"classify_wheels stderr: {result.stderr[-500:]}")
+        log.info(f"classify_wheels stderr: {result.stderr[-300:] if result.stderr else ''}")
 
         if not os.path.exists(out_path):
             raise RuntimeError(f"{script_name} failed: {result.stderr[-200:]}")
 
     log.info(f"Vehicle pipeline complete: {rigged_path}")
     return rigged_path
-
-
+    
 def mesh_guided_joint_correction(joints_data: dict, glb_path: str,
                                   rig_type: str) -> dict:
     """
@@ -963,6 +992,7 @@ def run_rig_pipeline(task_id: str, classify_id: str, user_id: str, host: str):
             rigged_path = os.path.join(RESULTS_DIR, f"{classify_id}_rigged.glb")
 
             _rig_tasks[task_id] = {'status': 'inferring_skeleton', 'progress': 30}
+
 
             # ── Build skeleton from stored joints or geometric fallback ────────
             if joints_data.get('joint_hints'):
@@ -1546,6 +1576,125 @@ def infer_joints():
         log.error(f"/infer_joints error: {e}")
         return jsonify({'error': str(e)}), 500
 
+
+def snap_joints_to_mesh(joints_data: dict, glb_path: str) -> dict:
+    """
+    Post-processing correction that brings Claude's 2D-estimated positions
+    into alignment with the actual 3D mesh geometry.
+    For shoulders: snap X and Y to the arm attachment surface,
+                   filtering to the stalk/floret junction Y range.
+    For hips/wing_base: snap X only — Y is correct from Claude.
+    """
+    import trimesh
+
+    mesh   = trimesh.load(glb_path, force='mesh')
+    verts  = np.array(mesh.vertices)
+    bmin   = verts.min(axis=0)
+    bmax   = verts.max(axis=0)
+    brange = bmax - bmin
+    brange[brange == 0] = 1.0
+
+    hints = joints_data.get('joint_hints', [])
+    base_joint_names = [h['name'] for h in hints
+                        if any(x in h.get('name', '').lower()
+                               for x in ['hip', 'shoulder', 'wing_base'])]
+
+    for hint in hints:
+        if hint['name'] not in base_joint_names:
+            continue
+
+        pos_norm = hint.get('position_normalized', {})
+        world_pos = np.array([
+            bmin[0] + pos_norm.get('x', 0.5) * brange[0],
+            bmin[1] + pos_norm.get('y', 0.5) * brange[1],
+            bmin[2] + pos_norm.get('z', 0.5) * brange[2],
+        ])
+
+        is_shoulder = 'shoulder' in hint['name'].lower()
+
+        if is_shoulder:
+            # Snap X and Y to arm attachment surface within Y band
+            y_lo = bmin[1] + 0.30 * brange[1]
+            y_hi = bmin[1] + 0.65 * brange[1]
+            mask = (verts[:, 1] >= y_lo) & (verts[:, 1] <= y_hi)
+            candidates = verts[mask]
+
+            if len(candidates) > 0:
+                dists   = np.linalg.norm(candidates - world_pos, axis=1)
+                closest = candidates[np.argmin(dists)]
+                old_x   = pos_norm.get('x', 0.5)
+                old_y   = pos_norm.get('y', 0.5)
+                new_x   = float(np.clip((closest[0] - bmin[0]) / brange[0], 0.0, 1.0))
+                new_y   = float(np.clip((closest[1] - bmin[1]) / brange[1], 0.0, 1.0))
+                hint['position_normalized'] = {'x': new_x, 'y': new_y, 'z': 0.5}
+                log.info(f"Snapped {hint['name']} X: {old_x:.2f}→{new_x:.2f} "
+                         f"Y: {old_y:.2f}→{new_y:.2f} (3D surface snap)")
+            else:
+                log.warning(f"No candidates in Y band for {hint['name']}, skipping snap")
+
+        else:
+            # Snap X only — Y is correct from Claude
+            distances    = np.linalg.norm(verts - world_pos, axis=1)
+            closest_vert = verts[np.argmin(distances)]
+            old_x        = pos_norm.get('x', 0.5)
+            new_x        = float(np.clip((closest_vert[0] - bmin[0]) / brange[0], 0.0, 1.0))
+            hint['position_normalized'] = {
+                'x': new_x,
+                'y': pos_norm.get('y', 0.5),
+                'z': 0.5,
+            }
+            log.info(f"Snapped {hint['name']} X: {old_x:.2f}→{new_x:.2f} "
+                     f"(Y unchanged: {pos_norm.get('y', 0.5):.2f})")
+
+    return joints_data
+
+
+def visualize_normalized_joints(joints_data: dict, mesh_path: str,
+                                 output_path: str):
+    """
+    Create GLB showing Claude's normalized joint positions overlaid on mesh.
+    Color coded: red = base joints (hip/shoulder/wing_base),
+                 yellow = middle joints (knee/elbow/wing_mid),
+                 green = end joints (hand/foot/head/wing_tip).
+    """
+    import trimesh
+
+    mesh  = trimesh.load(mesh_path, force='mesh')
+    scene = trimesh.Scene()
+    scene.add_geometry(mesh, node_name='mesh')
+
+    mesh_size = np.linalg.norm(mesh.bounds[1] - mesh.bounds[0])
+    verts     = np.array(mesh.vertices)
+    bmin      = verts.min(axis=0)
+    brange    = verts.max(axis=0) - bmin
+    brange[brange == 0] = 1.0
+
+    hints    = joints_data.get('joint_hints', [])
+    sphere_r = mesh_size * 0.02
+
+    def get_color(name):
+        n = name.lower()
+        if any(x in n for x in ['hip', 'shoulder', 'wing_base']):
+            return [255, 50,  50,  220]   # red — base
+        elif any(x in n for x in ['knee', 'elbow', 'wing_mid']):
+            return [255, 255, 50,  220]   # yellow — middle
+        else:
+            return [50,  220, 50,  220]   # green — end
+
+    for hint in hints:
+        p     = hint.get('position_normalized', {})
+        x     = bmin[0] + p.get('x', 0.5) * brange[0]
+        y     = bmin[1] + p.get('y', 0.5) * brange[1]
+        z     = bmin[2] + p.get('z', 0.5) * brange[2]
+
+        sphere = trimesh.creation.icosphere(radius=sphere_r)
+        sphere.apply_translation([x, y, z])
+        sphere.visual.face_colors = get_color(hint['name'])
+        scene.add_geometry(sphere, node_name=hint['name'])
+
+    scene.export(output_path)
+    log.info(f"Normalized joints viz: {output_path}")
+    return output_path
 
 # ── /mesh ─────────────────────────────────────────────────────────────────────
 

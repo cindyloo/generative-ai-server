@@ -137,6 +137,41 @@ mesh_objects = [o for o in bpy.data.objects if o.type == 'MESH']
 print(f"\nAfter separation: {len(mesh_objects)} objects")
 for o in mesh_objects:
     print(f"  {o.name}: {len(o.data.vertices)} verts")
+    
+# After separation, clean stray disconnected vertices from each wheel object.
+# Stray black chassis fragments get assigned to wheel groups by proximity
+# but are disconnected from the main tire geometry — remove them.
+all_meshes = [o for o in bpy.data.objects if o.type == 'MESH']
+body = max(all_meshes, key=lambda o: len(o.data.vertices))
+
+for obj in all_meshes:
+    if obj == body:
+        continue
+    bpy.context.view_layer.objects.active = obj
+    bpy.ops.object.select_all(action='DESELECT')
+    obj.select_set(True)
+    bpy.ops.object.mode_set(mode='EDIT')
+    bpy.ops.mesh.select_all(action='DESELECT')
+    bpy.ops.mesh.select_loose()
+    bpy.ops.mesh.delete(type='VERT')
+    bpy.ops.object.mode_set(mode='OBJECT')
+    print(f"  Cleaned {obj.name}: {len(obj.data.vertices)} verts remaining")
+# Save Blender-space centroids to classify_json so animatesam.py can use
+# them directly as pivot points — no coordinate conversion needed since
+# these were computed from matrix_world @ v.co (already Blender world space)
+blender_centroids = {
+    name: c.tolist() if c is not None else None
+    for name, c in true_centroids.items()
+}
+with open(classify_json, 'r') as f:
+    cdata = json.load(f)
+cdata['blender_wheel_centroids'] = blender_centroids
+with open(classify_json, 'w') as f:
+    json.dump(cdata, f, indent=2)
+print(f"\nBlender-space centroids saved to classify_json:")
+for name, c in blender_centroids.items():
+    if c:
+        print(f"  {name}: ({c[0]:.3f},{c[1]:.3f},{c[2]:.3f})")
 
 bpy.ops.export_scene.gltf(filepath=output_path, export_format='GLB')
 print(f"\nExported: {output_path}")

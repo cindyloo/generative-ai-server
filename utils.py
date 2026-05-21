@@ -982,9 +982,10 @@ body and axles: deforms_mesh=false. wheels: deforms_mesh=true."""
 def _build_vehicle_prompt() -> str:
     """
     Combined identify + joint placement prompt for vehicles.
-    Vehicles are a special case - the joint schema is rigid enough that
-    splitting identify/joints adds no value. Used by classify_with_vision()
-    when VEHICLE_KEYWORDS are detected in the user tag.
+    Uses standard y-up, z-depth convention matching all other rig types:
+      x = left/right  (0=left,  1=right)
+      y = up/down     (0=bottom/ground, 1=top)   wheels at y≈0.15
+      z = front/rear  (0=front, 1=rear)
     """
     return """Analyze this vehicle image for 3D rigging.
 
@@ -1005,28 +1006,28 @@ Return ONLY valid JSON with no markdown, no extra text, no backticks.
       "name": "body",
       "body_part": "body",
       "deforms_mesh": false,
-      "position_normalized": {"x": 0.5, "y": 0.5, "z": 0.5},
+      "position_normalized": {"x": 0.5, "y": 0.55, "z": 0.5},
       "animations": []
     },
     {
       "name": "front_axle",
       "body_part": "axle",
       "deforms_mesh": false,
-      "position_normalized": {"x": 0.5, "y": 0.25, "z": 0.15},
+      "position_normalized": {"x": 0.5, "y": 0.15, "z": 0.25},
       "animations": []
     },
     {
       "name": "rear_axle",
       "body_part": "axle",
       "deforms_mesh": false,
-      "position_normalized": {"x": 0.5, "y": 0.75, "z": 0.15},
+      "position_normalized": {"x": 0.5, "y": 0.15, "z": 0.75},
       "animations": []
     },
     {
       "name": "wheel_fl",
       "body_part": "wheel",
       "deforms_mesh": true,
-      "position_normalized": {"x": 0.15, "y": 0.25, "z": 0.15},
+      "position_normalized": {"x": 0.15, "y": 0.15, "z": 0.25},
       "wheel_radius_normalized": 0.18,
       "animations": [
         {"clip": "drive", "property": "rotation_euler", "axis": "x",
@@ -1037,7 +1038,7 @@ Return ONLY valid JSON with no markdown, no extra text, no backticks.
       "name": "wheel_fr",
       "body_part": "wheel",
       "deforms_mesh": true,
-      "position_normalized": {"x": 0.85, "y": 0.25, "z": 0.15},
+      "position_normalized": {"x": 0.85, "y": 0.15, "z": 0.25},
       "wheel_radius_normalized": 0.18,
       "animations": [
         {"clip": "drive", "property": "rotation_euler", "axis": "x",
@@ -1048,7 +1049,7 @@ Return ONLY valid JSON with no markdown, no extra text, no backticks.
       "name": "wheel_rl",
       "body_part": "wheel",
       "deforms_mesh": true,
-      "position_normalized": {"x": 0.15, "y": 0.75, "z": 0.15},
+      "position_normalized": {"x": 0.15, "y": 0.15, "z": 0.75},
       "wheel_radius_normalized": 0.18,
       "animations": [
         {"clip": "drive", "property": "rotation_euler", "axis": "x",
@@ -1059,7 +1060,7 @@ Return ONLY valid JSON with no markdown, no extra text, no backticks.
       "name": "wheel_rr",
       "body_part": "wheel",
       "deforms_mesh": true,
-      "position_normalized": {"x": 0.85, "y": 0.75, "z": 0.15},
+      "position_normalized": {"x": 0.85, "y": 0.15, "z": 0.75},
       "wheel_radius_normalized": 0.18,
       "animations": [
         {"clip": "drive", "property": "rotation_euler", "axis": "x",
@@ -1077,14 +1078,25 @@ Return ONLY valid JSON with no markdown, no extra text, no backticks.
   ]
 }
 
-Rules:
-- wheel_colors_rgb: identify actual tire and hub colors from the image as RGB 0-1
-- front wheels y=0.25, rear wheels y=0.75 — DO NOT set all wheels to y=0.5
-- left wheels x=0.15, right wheels x=0.85, all wheels z=0.15 (near bottom)
-- front_axle y must match front wheel y, rear_axle y must match rear wheel y
-- body and axles: deforms_mesh false, animations []
-- wheels: deforms_mesh true, keep the drive spin animations exactly as shown
-- x=0 is LEFT side of vehicle, x=1 is RIGHT side
-- left wheels must have x < 0.4, right wheels must have x > 0.6
-- z is DEPTH (front=0, rear=1), NOT left/right
+COORDINATE CONVENTION — same as all other rig types:
+  x = left/right:  0.0 = leftmost edge,  1.0 = rightmost edge
+  y = up/down:     0.0 = ground/bottom,  1.0 = top of vehicle
+  z = front/rear:  0.0 = front bumper,   1.0 = rear bumper
+
+WHEEL PLACEMENT:
+  Wheels are always near the ground: y ≈ 0.10–0.20
+  Front wheels: z ≈ 0.20–0.30
+  Rear wheels:  z ≈ 0.70–0.80
+  Left wheels:  x < 0.4
+  Right wheels: x > 0.6
+  front_axle z must match front wheel z
+  rear_axle  z must match rear wheel z
+  axle y must match wheel y (same height)
+
+OTHER RULES:
+  - wheel_colors_rgb: identify actual tire and hub colors from the image as RGB 0-1
+  - body and axles: deforms_mesh false, animations []
+  - wheels: deforms_mesh true, keep the drive spin animations exactly as shown
+  - Do NOT set all wheels to the same z — front and rear must differ
+  - wheel_radius_normalized: estimate wheel radius as fraction of total mesh size
 """
