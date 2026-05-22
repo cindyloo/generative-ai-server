@@ -41,30 +41,54 @@ with open(tire_verts_path) as f:
 print(f"Tire vertices from palette: {len(tire_vert_indices)}")
 tire_verts_np = verts[tire_vert_indices]
 
-# Split by X (left/right) then by Z (front/rear)
-left_verts  = tire_verts_np[tire_verts_np[:, 0] < 0]
-right_verts = tire_verts_np[tire_verts_np[:, 0] >= 0]
+# ══════════════════════════════════════════════════════════════════════════════
+# CLAUDE CONVENTION (NO DETECTION)
+# ══════════════════════════════════════════════════════════════════════════════
+# Claude ALWAYS uses:
+#   x = left-right (0=left, 1=right)
+#   y = front-rear (0=front, 1=rear)
+#   z = height (0=bottom, 1=top)
 
-print(f"Left tire verts: {len(left_verts)}")
+lr_idx = 0   # left-right axis
+fr_idx = 1   # front-rear axis
+h_idx = 2    # height axis
+
+print(f"\nUsing Claude convention axes:")
+print(f"  axis 0 (X) = left-right")
+print(f"  axis 1 (Y) = front-rear")
+print(f"  axis 2 (Z) = height")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SPLIT WHEELS BY LEFT-RIGHT, THEN FRONT-REAR
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Split by left-right axis (axis 0)
+left_verts  = tire_verts_np[tire_verts_np[:, lr_idx] < 0]
+right_verts = tire_verts_np[tire_verts_np[:, lr_idx] >= 0]
+
+print(f"\nLeft tire verts: {len(left_verts)}")
 print(f"Right tire verts: {len(right_verts)}")
 
 def split_front_rear(side_verts):
-    """Split by Y axis (front/back depth in Blender world space)."""
+    """Split by front-rear axis (axis 1)"""
     if len(side_verts) == 0:
         return np.zeros((0,3)), np.zeros((0,3))
-    y_median = np.median(side_verts[:, 1])  # ← index 1 (Y), not 2 (Z)
-    front    = side_verts[side_verts[:, 1] < y_median]
-    rear     = side_verts[side_verts[:, 1] >= y_median]
+    median = np.median(side_verts[:, fr_idx])
+    front = side_verts[side_verts[:, fr_idx] < median]
+    rear = side_verts[side_verts[:, fr_idx] >= median]
     return front, rear
 
 lf, lr = split_front_rear(left_verts)
 rf, rr = split_front_rear(right_verts)
 
+print(f"Front-left: {len(lf)}, Front-right: {len(rf)}")
+print(f"Rear-left: {len(lr)}, Rear-right: {len(rr)}")
+
 true_centroids = {
-    'wheel_rl': lf.mean(axis=0) if len(lf) > 0 else None,
-    'wheel_rr': lr.mean(axis=0) if len(lr) > 0 else None,
-    'wheel_fl': rf.mean(axis=0) if len(rf) > 0 else None,
-    'wheel_fr': rr.mean(axis=0) if len(rr) > 0 else None,
+    'wheel_fl': lf.mean(axis=0) if len(lf) > 0 else None,
+    'wheel_fr': rf.mean(axis=0) if len(rf) > 0 else None,
+    'wheel_rl': lr.mean(axis=0) if len(lr) > 0 else None,
+    'wheel_rr': rr.mean(axis=0) if len(rr) > 0 else None,
 }
 
 print("\nCentroids from tire vertices:")
@@ -72,7 +96,10 @@ for name, c in true_centroids.items():
     if c is not None:
         print(f"  {name}: ({c[0]:.3f},{c[1]:.3f},{c[2]:.3f})")
 
-# Mirror any missing centroids
+# ══════════════════════════════════════════════════════════════════════════════
+# MIRROR ANY MISSING CENTROIDS
+# ══════════════════════════════════════════════════════════════════════════════
+
 def mirror_wheel_name(name):
     replacements = [
         ('front_right', 'front_left'), ('front_left',  'front_right'),
@@ -90,10 +117,15 @@ for name in list(true_centroids.keys()):
         mirror_name = mirror_wheel_name(name)
         if mirror_name and true_centroids.get(mirror_name) is not None:
             src = true_centroids[mirror_name]
-            true_centroids[name] = np.array([-src[0], src[1], src[2]])
+            mirrored = src.copy()
+            mirrored[lr_idx] = -mirrored[lr_idx]  # Mirror across left-right axis
+            true_centroids[name] = mirrored
             print(f"  Mirrored {name} from {mirror_name}")
 
-# Assign all tire vertices to nearest centroid
+# ══════════════════════════════════════════════════════════════════════════════
+# ASSIGN TIRE VERTICES TO NEAREST CENTROID
+# ══════════════════════════════════════════════════════════════════════════════
+
 centroid_list  = [(name, c) for name, c in true_centroids.items() if c is not None]
 centroid_array = np.array([c for _, c in centroid_list])
 
@@ -112,7 +144,10 @@ for ci, (name, centroid) in enumerate(centroid_list):
 
 print(f"Total assigned: {sum(len(w[1]) for w in wheel_vert_groups)} of {len(tire_vert_indices)}")
 
-# Separate and export
+# ══════════════════════════════════════════════════════════════════════════════
+# SEPARATE WHEELS IN BLENDER
+# ══════════════════════════════════════════════════════════════════════════════
+
 bpy.context.view_layer.objects.active = mesh_obj
 mesh_obj.select_set(True)
 
@@ -137,10 +172,11 @@ mesh_objects = [o for o in bpy.data.objects if o.type == 'MESH']
 print(f"\nAfter separation: {len(mesh_objects)} objects")
 for o in mesh_objects:
     print(f"  {o.name}: {len(o.data.vertices)} verts")
-    
-# After separation, clean stray disconnected vertices from each wheel object.
-# Stray black chassis fragments get assigned to wheel groups by proximity
-# but are disconnected from the main tire geometry — remove them.
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CLEAN STRAY DISCONNECTED VERTICES
+# ══════════════════════════════════════════════════════════════════════════════
+
 all_meshes = [o for o in bpy.data.objects if o.type == 'MESH']
 body = max(all_meshes, key=lambda o: len(o.data.vertices))
 
@@ -156,9 +192,11 @@ for obj in all_meshes:
     bpy.ops.mesh.delete(type='VERT')
     bpy.ops.object.mode_set(mode='OBJECT')
     print(f"  Cleaned {obj.name}: {len(obj.data.vertices)} verts remaining")
-# Save Blender-space centroids to classify_json so animatesam.py can use
-# them directly as pivot points — no coordinate conversion needed since
-# these were computed from matrix_world @ v.co (already Blender world space)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SAVE BLENDER-SPACE CENTROIDS
+# ══════════════════════════════════════════════════════════════════════════════
+
 blender_centroids = {
     name: c.tolist() if c is not None else None
     for name, c in true_centroids.items()
@@ -172,6 +210,10 @@ print(f"\nBlender-space centroids saved to classify_json:")
 for name, c in blender_centroids.items():
     if c:
         print(f"  {name}: ({c[0]:.3f},{c[1]:.3f},{c[2]:.3f})")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# EXPORT
+# ══════════════════════════════════════════════════════════════════════════════
 
 bpy.ops.export_scene.gltf(filepath=output_path, export_format='GLB')
 print(f"\nExported: {output_path}")

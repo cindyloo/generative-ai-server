@@ -546,18 +546,53 @@ def joints_from_model(joints_data: dict, glb_path: str):
 
     Claude always outputs:
       x = left/right (0=left, 1=right)
-      y = bottom/top (0=bottom, 1=top)
-      z = ignored (we force center depth)
+      y = front/rear or height depending on mesh type
+      z = depth or height
 
-    But the mesh may be Y-up or Z-up depending on how Meshy exported it.
-    We detect the actual vertical axis as the one with the largest range,
-    then map Claude's semantic y → that axis and force the depth axis to 0.5.
+    Detects actual axis mapping from wheel joint spreads for accurate denormalization.
     """
     import trimesh
 
     hint_objects = joints_data.get('joint_hints', [])
     if not hint_objects or isinstance(hint_objects[0], str):
         return None, None, hint_objects
+
+    # ── Detect mesh orientation from wheel joint spreads ────────────────────────
+    wheel_joints = [j for j in hint_objects if j.get('body_part') == 'wheel']
+    lr_idx = 0   # Claude x = left-right
+    fr_idx = 1   # Claude y = front-rear
+    h_idx = 2    # Claude z = height
+    if wheel_joints and len(wheel_joints) >= 2:
+        spreads = {
+            'x': max(wj['position_normalized']['x'] for wj in wheel_joints) - min(wj['position_normalized']['x'] for wj in wheel_joints),
+            'y': max(wj['position_normalized']['y'] for wj in wheel_joints) - min(wj['position_normalized']['y'] for wj in wheel_joints),
+            'z': max(wj['position_normalized']['z'] for wj in wheel_joints) - min(wj['position_normalized']['z'] for wj in wheel_joints),
+        }
+        
+        log.info(f"\n{'='*60}")
+        log.info(f"WHEEL SPREAD ANALYSIS")
+        log.info(f"{'='*60}")
+        log.info(f"Wheel spreads: X={spreads['x']:.3f}, Y={spreads['y']:.3f}, Z={spreads['z']:.3f}")
+        
+        sorted_axes = sorted(spreads.items(), key=lambda t: t[1], reverse=True)
+        front_rear_axis = sorted_axes[0][0]
+        left_right_axis = sorted_axes[1][0]
+        height_axis = sorted_axes[2][0]
+        
+        log.info(f"Front-to-back axis: {front_rear_axis} (spread={spreads[front_rear_axis]:.3f})")
+        log.info(f"Left-right axis: {left_right_axis} (spread={spreads[left_right_axis]:.3f})")
+        log.info(f"Height axis: {height_axis} (spread={spreads[height_axis]:.3f})")
+        log.info(f"{'='*60}\n")
+        
+        
+        log.info(f"Axis indices: front_rear={fr_idx}, left_right={lr_idx}, height={h_idx}")
+    else:
+        # Fallback to default axes if no wheels detected
+        log.warning("No wheel joints for axis detection, using defaults: fr=2, lr=0, h=1")
+
+        front_rear_axis = 'z'
+        left_right_axis = 'x'
+        height_axis = 'y'
 
     mesh   = trimesh.load(glb_path, force='mesh')
     verts  = np.array(mesh.vertices)
@@ -566,25 +601,11 @@ def joints_from_model(joints_data: dict, glb_path: str):
     brange = bmax - bmin
     brange[brange == 0] = 1.0
 
-    # Detect mesh orientation: Y-up (standard) vs Z-up (some Meshy exports)
-    # We check explicitly rather than sorting by range, because X (side) and
-    # Z (depth) can have similar ranges which causes the sort to assign them wrong.
-    if brange[2] > brange[1] * 1.2:
-        # Z range is significantly larger than Y → Z-up mesh
-        vert_axis  = 2   # Z → vertical (Claude's y)
-        side_axis  = 0   # X → left/right (Claude's x)
-        depth_axis = 1   # Y → depth (forced to center)
-    else:
-        # Standard Y-up mesh
-        vert_axis  = 1   # Y → vertical (Claude's y)
-        side_axis  = 0   # X → left/right (Claude's x)
-        depth_axis = 2   # Z → depth (forced to center)
+    bounds_min = bmin
+    bounds_max = bmax
+    bounds_range = brange
 
-    axis_names = ['x', 'y', 'z']
-    log.info(f"Mesh axis mapping: vertical={axis_names[vert_axis]} "
-             f"side={axis_names[side_axis]} depth={axis_names[depth_axis]} "
-             f"ranges={brange.round(3)}")
-
+    # ── Denormalize Claude positions using detected axes ────────────────────────
     name_to_idx = {h['name']: i for i, h in enumerate(hint_objects)}
 
     joints = []
@@ -592,14 +613,15 @@ def joints_from_model(joints_data: dict, glb_path: str):
         p       = hint.get('position_normalized', {})
         norm_x  = np.clip(p.get('x', 0.5), 0.0, 1.0)
         norm_y  = np.clip(p.get('y', 0.5), 0.0, 1.0)
+        norm_z  = np.clip(p.get('z', 0.5), 0.0, 1.0)
 
-        # Build world position using detected axis mapping
-        norm = np.array([0.5, 0.5, 0.5])
-        norm[side_axis]  = norm_x   # Claude x → left/right axis
-        norm[vert_axis]  = norm_y   # Claude y → vertical axis
-        norm[depth_axis] = 0.5      # center depth always
+        # Build world position using detected axes
+        world_pos = np.zeros(3)
+        world_pos[lr_idx]  = bounds_min[lr_idx] + norm_x * bounds_range[lr_idx]   # Claude x → left-right axis
+        world_pos[fr_idx]  = bounds_min[fr_idx] + norm_y * bounds_range[fr_idx]   # Claude y → front-rear axis
+        world_pos[h_idx]   = bounds_min[h_idx] + norm_z * bounds_range[h_idx]     # Claude z → height axis
 
-        joints.append(tuple(bmin + norm * brange))
+        joints.append(tuple(world_pos))
 
     hierarchy = []
     for bone in joints_data.get('skeleton', []):
@@ -614,6 +636,9 @@ def joints_from_model(joints_data: dict, glb_path: str):
         if p is not None and c is not None:
             hierarchy.append((p, c))
 
+    log.info(f"Joints from model: {len(joints)} joints, {len(hierarchy)} bones")
+    log.info(f"Axis mapping: x→{left_right_axis}({lr_idx}), y→{front_rear_axis}({fr_idx}), z→{height_axis}({h_idx})")
+    
     return joints, hierarchy, hint_objects
 
 
@@ -628,20 +653,33 @@ def run_vehicle_pipeline(classify_id: str, glb_path: str,
     tire_verts     = os.path.join(RESULTS_DIR, f"{classify_id}_tire_verts.json")
     texture_path   = os.path.join(RESULTS_DIR, f"{classify_id}_texture.png")
 
-    
+
     record      = _store.get(classify_id)
     joints_data = (record.get('joints') or {}) if record else {}
     joint_hints = joints_data.get('joint_hints', [])
-    # Only inject wheel joints — body/axle joints not needed in animatesam
+
+    # ADD THIS DEBUG:
+    log.info(f"DEBUG: joints_data from store: {len(joint_hints)} hints")
+    for jh in [j for j in joint_hints if j.get('body_part') == 'wheel']:
+        p = jh.get('position_normalized', {})
+        log.info(f"  {jh['name']}: x={p.get('x')}, y={p.get('y')}, z={p.get('z')}")
+
+    # Only inject wheel joints
     classify_data['joint_hints'] = [
         j for j in joint_hints
         if j.get('body_part') == 'wheel'
     ]
+
+    log.info(f"DEBUG: classify_data['joint_hints'] about to write: {len(classify_data['joint_hints'])} hints")
+    for jh in classify_data['joint_hints']:
+        p = jh.get('position_normalized', {})
+        log.info(f"  {jh['name']}: x={p.get('x')}, y={p.get('y')}, z={p.get('z')}")
+
     with open(classify_json, 'w') as f:
         json.dump(classify_data, f, indent=2)
     log.info(f"Injected {len(classify_data['joint_hints'])} wheel joints into classify_json")
-     
-
+    
+    
     with open(glb_path, 'rb') as f:
         f.read(12)
         json_len = struct.unpack('<I', f.read(4))[0]; f.read(4)

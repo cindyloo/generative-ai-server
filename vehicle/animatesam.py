@@ -8,10 +8,10 @@ classify_json = sys.argv[sys.argv.index('--') + 3] \
                 if len(sys.argv) > sys.argv.index('--') + 3 else None
 
 # Load classify data
-wheel_joints           = []
-wheel_centroids        = {}
+wheel_joints            = []
+wheel_centroids         = {}
 blender_wheel_centroids = {}
-classify_data          = None
+classify_data           = None
 
 if classify_json and os.path.exists(classify_json):
     with open(classify_json) as f:
@@ -33,20 +33,39 @@ mesh_objects  = [o for o in bpy.data.objects if o.type == 'MESH']
 body_obj      = max(mesh_objects, key=lambda o: len(o.data.vertices))
 wheel_objects = [o for o in mesh_objects if o != body_obj]
 
-print(f"Body: {body_obj.name}")
-print(f"Wheels: {[o.name for o in wheel_objects]}")
+print(f"\nWheel centroid verification:")
+for wheel in wheel_objects:
+    verts_np = np.array([wheel.matrix_world @ v.co for v in wheel.data.vertices])
+    actual_center = verts_np.mean(axis=0)
+    print(f"  {wheel.name}: actual center = ({actual_center[0]:.3f}, {actual_center[1]:.3f}, {actual_center[2]:.3f})")
+
+print(f"\nAssigned Blender centroids:")
+for name, pos in blender_wheel_centroids.items():
+    if pos:
+        print(f"  {name}: ({pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f})")
 
 bpy.context.scene.frame_start = 1
 bpy.context.scene.frame_end   = 61
 
+# ══════════════════════════════════════════════════════════════════════════════
+# CLAUDE CONVENTION (NO DETECTION)
+# ══════════════════════════════════════════════════════════════════════════════
+# Claude ALWAYS uses:
+#   x = left-right
+#   y = front-rear
+#   z = height
+
+lr_idx = 0   # left-right axis
+fr_idx = 1   # front-rear axis
+h_idx = 2    # height axis
+
+print(f"\nUsing Claude convention axes:")
+print(f"  axis 0 (X) = left-right")
+print(f"  axis 1 (Y) = front-rear")
+print(f"  axis 2 (Z) = height")
+
 # ── Build Claude pivot positions in Blender world space ───────────────────────
-# Claude joint positions use y-up z-depth normalized convention.
-# Blender imports GLB with Y→Z conversion, so after import:
-#   Blender X = mesh X (left/right)   ← Claude x
-#   Blender Y = mesh Y (front/rear)   ← Claude y
-#   Blender Z = mesh Z (height)       ← Claude z
-# Denormalize using the full scene bounding box.
-claude_pivots = []   # list of (name, np.array([bx, by, bz]))
+claude_pivots = []
 
 if wheel_joints:
     all_verts = [(v.co.x, v.co.y, v.co.z)
@@ -54,80 +73,111 @@ if wheel_joints:
     x_min = min(v[0] for v in all_verts); x_max = max(v[0] for v in all_verts)
     y_min = min(v[1] for v in all_verts); y_max = max(v[1] for v in all_verts)
     z_min = min(v[2] for v in all_verts); z_max = max(v[2] for v in all_verts)
-
+    
+    bounds_min = np.array([x_min, y_min, z_min])
+    bounds_max = np.array([x_max, y_max, z_max])
+    bounds_range = bounds_max - bounds_min
+    
     for wj in wheel_joints:
-        p  = wj['position_normalized']
-        bx = x_min + p.get('x', 0.5) * (x_max - x_min)
-        by = y_min + p.get('y', 0.5) * (y_max - y_min)
-        bz = z_min + p.get('z', 0.5) * (z_max - z_min)
-        claude_pivots.append((wj['name'], np.array([bx, by, bz])))
+        p = wj['position_normalized']
+        cx = p.get('x', 0.5)
+        cy = p.get('y', 0.5)
+        cz = p.get('z', 0.5)
+        
+        world = np.zeros(3)
+        world[lr_idx] = bounds_min[lr_idx] + cx * bounds_range[lr_idx]
+        world[fr_idx] = bounds_min[fr_idx] + cy * bounds_range[fr_idx]
+        world[h_idx] = bounds_min[h_idx] + cz * bounds_range[h_idx]
+        
+        claude_pivots.append((wj['name'], world))
 
-    print(f"Claude wheel pivots (Blender space):")
-    for name, pos in claude_pivots:
-        print(f"  {name}: ({pos[0]:.3f},{pos[1]:.3f},{pos[2]:.3f})")
+# ── Rotation axis: wheels rotate around the height axis ─────────────────────
+rotation_axis = fr_idx
+print(f"Detected axes: front_rear={fr_idx}, left_right={lr_idx}, height={h_idx}")
+print(f"Rotation axis: {['X','Y','Z'][rotation_axis]} (index={rotation_axis})")
 
-# Centroid pools — pop matched ones to prevent duplicates
+# ── Initialize centroid pools ──────────────────────────────────────────────────
 remaining_blender = {k: v for k, v in blender_wheel_centroids.items() if v is not None}
 remaining_claude  = list(claude_pivots)
 
-# ── Animate each wheel ────────────────────────────────────────────────────────
+print(f"Available Blender centroids: {list(remaining_blender.keys())}")
+print(f"Available Claude pivots: {[name for name, _ in remaining_claude]}")
+
+# ── Animate each wheel ─────────────────────────────────────────────────────────
 for i, wheel in enumerate(wheel_objects):
-    verts_np  = np.array([wheel.matrix_world @ v.co for v in wheel.data.vertices])
-    median_pt = np.median(verts_np, axis=0)
+    verts_np = np.array([wheel.matrix_world @ v.co for v in wheel.data.vertices])
+    actual_center = verts_np.mean(axis=0)
+    distances = np.linalg.norm(verts_np - actual_center, axis=1)
+    
+    mean_dist = distances.mean()
+    std_dist = distances.std()
+    far_verts = np.sum(distances > mean_dist * 2)
+    
+    print(f"{wheel.name} VERTEX DIAGNOSTICS:")
+    print(f"  Total: {len(verts_np)}, Std dev: {std_dist:.3f}, Verts > 2x mean: {far_verts} ({far_verts/len(verts_np)*100:.1f}%)")
+    
+    if std_dist > mean_dist * 0.3 or far_verts > len(verts_np) * 0.1:
+        print(f"  ⚠️ ASYMMETRIC WHEEL - tire and rim may be separate!")
+        sorted_dists = np.sort(distances)
+        print(f"  Quartiles: {sorted_dists[len(sorted_dists)//4]:.3f}, {sorted_dists[len(sorted_dists)//2]:.3f}, {sorted_dists[3*len(sorted_dists)//4]:.3f}")
 
-    if remaining_blender:
-        # PRIMARY: Blender-space centroids from classify_wheels.py
-        # Already in Blender world space — no conversion needed
-        best_name, best_dist, best_pos = None, float('inf'), None
-        for name, pos in remaining_blender.items():
-            dist = np.linalg.norm(np.array(pos) - median_pt)
-            if dist < best_dist:
-                best_dist = dist
-                best_name = name
-                best_pos  = pos
-        remaining_blender.pop(best_name)
+    # DIAGNOSTIC: Check vertex distribution
+    distances = np.linalg.norm(verts_np - actual_center, axis=1)
+    
+    print(f"\n{wheel.name} VERTEX DIAGNOSTICS:")
+    print(f"  Total vertices: {len(verts_np)}")
+    print(f"  Centroid: ({actual_center[0]:.3f}, {actual_center[1]:.3f}, {actual_center[2]:.3f})")
+    print(f"  Min distance from center: {distances.min():.3f}")
+    print(f"  Max distance from center: {distances.max():.3f}")
+    print(f"  Mean distance from center: {distances.mean():.3f}")
+    print(f"  Std dev of distances: {distances.std():.3f}")
+    
+    # Check if bimodal - two clusters of verts?
+    sorted_dists = np.sort(distances)
+    quarter = len(sorted_dists) // 4
+    print(f"  Distance quartiles: {sorted_dists[quarter]:.3f}, {sorted_dists[quarter*2]:.3f}, {sorted_dists[quarter*3]:.3f}")
+    
+    # How many verts are far from center?
+    far_verts = np.sum(distances > distances.mean() * 2)
+    print(f"  Verts > 2x mean distance: {far_verts} ({far_verts/len(verts_np)*100:.1f}%)")
+    
+    
+    # Find BEST matching centroid by distance
+    best_name, best_dist = None, float('inf')
+    for name, pos in blender_wheel_centroids.items():
+        if pos is None:
+            continue
+        dist = np.linalg.norm(np.array(pos) - actual_center)
+        if dist < best_dist:
+            best_dist = dist
+            best_name = name
+    
+    if best_name:
+        best_pos = blender_wheel_centroids[best_name]
         cx, cy, cz = float(best_pos[0]), float(best_pos[1]), float(best_pos[2])
-        print(f"  {wheel.name}: Blender centroid ({best_name})=({cx:.3f},{cy:.3f},{cz:.3f})")
-
-    elif remaining_claude:
-        # SECONDARY: Claude joint positions in Blender space
-        best_name, best_dist, best_pos = None, float('inf'), None
-        for name, pos in remaining_claude:
-            dist = np.linalg.norm(pos - median_pt)
-            if dist < best_dist:
-                best_dist = dist
-                best_name = name
-                best_pos  = pos
-        remaining_claude = [(n, p) for n, p in remaining_claude if n != best_name]
-        cx, cy, cz = float(best_pos[0]), float(best_pos[1]), float(best_pos[2])
-        print(f"  {wheel.name}: Claude pivot ({best_name})=({cx:.3f},{cy:.3f},{cz:.3f})")
-
+        print(f"  {wheel.name}: Matched to {best_name} (distance={best_dist:.3f})")
     else:
-        # LAST RESORT: vertex mean in Blender space
-        cx = float(verts_np[:, 0].mean())
-        cy = float(verts_np[:, 1].mean())
-        cz = float(verts_np[:, 2].mean())
-        print(f"  {wheel.name}: vertex mean pivot=({cx:.3f},{cy:.3f},{cz:.3f})")
-
-    # ── Set origin to pivot ───────────────────────────────────────────────────
+        cx, cy, cz = float(actual_center[0]), float(actual_center[1]), float(actual_center[2])
+        print(f"  {wheel.name}: Using vertex mean")
+    
+    # Set origin to pivot
     bpy.context.view_layer.objects.active = wheel
     wheel.select_set(True)
     bpy.context.scene.cursor.location = (cx, cy, cz)
     bpy.ops.object.origin_set(type='ORIGIN_CURSOR')
     wheel.select_set(False)
 
-    # ── Create rotation animation ─────────────────────────────────────────────
+    # Create rotation animation
     wheel.rotation_mode = 'XYZ'
     action = bpy.data.actions.new(name=f"wheel_{i}_rot")
-    fc     = action.fcurves.new(data_path='rotation_euler', index=1)
+    fc     = action.fcurves.new(data_path='rotation_euler', index=rotation_axis)
     fc.keyframe_points.add(2)
     fc.keyframe_points[0].co = (1,  0.0)
     fc.keyframe_points[1].co = (61, math.pi * 2)
-
+    
     for kp in fc.keyframe_points:
         kp.interpolation = 'LINEAR'
 
-    # ── Push to NLA strip named "drive" ───────────────────────────────────────
     wheel.animation_data_create()
     wheel.animation_data.action = action
     track      = wheel.animation_data.nla_tracks.new()
@@ -136,7 +186,7 @@ for i, wheel in enumerate(wheel_objects):
     wheel.animation_data.action = None
 
     print(f"  {wheel.name}: NLA strip 'drive' created")
-
+    
 bpy.ops.export_scene.gltf(
     filepath=output_path,
     export_format='GLB',
