@@ -300,7 +300,7 @@ def classify_with_vision(img_bytes: bytes, mime_type: str,
     tag_ctx   = f'\nThe user identified this as: "{user_tag}".' if user_tag else ''
 
     prompt = (
-        utils._build_vehicle_prompt()
+        f"This is a {user_tag}.\n\n" + utils._build_vehicle_prompt()
         if tag_words & utils.VEHICLE_KEYWORDS
         else utils._build_classify_prompt(tag_ctx)
     )
@@ -540,59 +540,25 @@ def run_blender_rig(glb_path: str, json_path: str, rigged_path: str):
 
 def joints_from_model(joints_data: dict, glb_path: str):
     """
-    Map normalised joint positions (0–1) from the vision model onto mesh
-    world-space coordinates via bounding box interpolation.
-    Returns (joints, hierarchy, hint_objects).
+    Map normalised joint positions (0–1) onto mesh world-space.
 
-    Claude always outputs:
-      x = left/right (0=left, 1=right)
-      y = front/rear or height depending on mesh type
-      z = depth or height
+    Meshy exports Y-up. The camera is always a SIDE VIEW of the object, so:
+      Claude image-x (0=left edge of photo, 1=right edge)
+          → mesh Z  (front-to-rear in world space)
+      Claude image-y (0=top of photo, 1=bottom)
+          → mesh Y  (up-down) — INVERTED because image Y-down ≠ mesh Y-up
+      Claude image-z (depth hint, usually 0.5)
+          → mesh X  (left-right in world space, i.e. into/out of the photo)
 
-    Detects actual axis mapping from wheel joint spreads for accurate denormalization.
+    This is a FIXED mapping, not detected at runtime. The old wheel-spread
+    heuristic misidentifies axes when only 2 wheels are present and the
+    spread is entirely along image-X.
     """
     import trimesh
 
     hint_objects = joints_data.get('joint_hints', [])
     if not hint_objects or isinstance(hint_objects[0], str):
         return None, None, hint_objects
-
-    # ── Detect mesh orientation from wheel joint spreads ────────────────────────
-    wheel_joints = [j for j in hint_objects if j.get('body_part') == 'wheel']
-    lr_idx = 0   # Claude x = left-right
-    fr_idx = 1   # Claude y = front-rear
-    h_idx = 2    # Claude z = height
-    if wheel_joints and len(wheel_joints) >= 2:
-        spreads = {
-            'x': max(wj['position_normalized']['x'] for wj in wheel_joints) - min(wj['position_normalized']['x'] for wj in wheel_joints),
-            'y': max(wj['position_normalized']['y'] for wj in wheel_joints) - min(wj['position_normalized']['y'] for wj in wheel_joints),
-            'z': max(wj['position_normalized']['z'] for wj in wheel_joints) - min(wj['position_normalized']['z'] for wj in wheel_joints),
-        }
-        
-        log.info(f"\n{'='*60}")
-        log.info(f"WHEEL SPREAD ANALYSIS")
-        log.info(f"{'='*60}")
-        log.info(f"Wheel spreads: X={spreads['x']:.3f}, Y={spreads['y']:.3f}, Z={spreads['z']:.3f}")
-        
-        sorted_axes = sorted(spreads.items(), key=lambda t: t[1], reverse=True)
-        front_rear_axis = sorted_axes[0][0]
-        left_right_axis = sorted_axes[1][0]
-        height_axis = sorted_axes[2][0]
-        
-        log.info(f"Front-to-back axis: {front_rear_axis} (spread={spreads[front_rear_axis]:.3f})")
-        log.info(f"Left-right axis: {left_right_axis} (spread={spreads[left_right_axis]:.3f})")
-        log.info(f"Height axis: {height_axis} (spread={spreads[height_axis]:.3f})")
-        log.info(f"{'='*60}\n")
-        
-        
-        log.info(f"Axis indices: front_rear={fr_idx}, left_right={lr_idx}, height={h_idx}")
-    else:
-        # Fallback to default axes if no wheels detected
-        log.warning("No wheel joints for axis detection, using defaults: fr=2, lr=0, h=1")
-
-        front_rear_axis = 'z'
-        left_right_axis = 'x'
-        height_axis = 'y'
 
     mesh   = trimesh.load(glb_path, force='mesh')
     verts  = np.array(mesh.vertices)
@@ -601,25 +567,25 @@ def joints_from_model(joints_data: dict, glb_path: str):
     brange = bmax - bmin
     brange[brange == 0] = 1.0
 
-    bounds_min = bmin
-    bounds_max = bmax
-    bounds_range = brange
+    # Fixed axis mapping for Meshy Y-up + side-view camera
+    # mesh axis indices: 0=X (left/right), 1=Y (up), 2=Z (front/rear)
+    LR_IDX = 0   # mesh X  ← Claude z (depth, usually ~0.5)
+    UP_IDX = 1   # mesh Y  ← Claude y (inverted: image top = world top)
+    FR_IDX = 2   # mesh Z  ← Claude x (image horizontal = world front/rear)
 
-    # ── Denormalize Claude positions using detected axes ────────────────────────
     name_to_idx = {h['name']: i for i, h in enumerate(hint_objects)}
-
     joints = []
-    for hint in hint_objects:
-        p       = hint.get('position_normalized', {})
-        norm_x  = np.clip(p.get('x', 0.5), 0.0, 1.0)
-        norm_y  = np.clip(p.get('y', 0.5), 0.0, 1.0)
-        norm_z  = np.clip(p.get('z', 0.5), 0.0, 1.0)
 
-        # Build world position using detected axes
+    for hint in hint_objects:
+        p      = hint.get('position_normalized', {})
+        norm_x = np.clip(p.get('x', 0.5), 0.0, 1.0)   # image left→right
+        norm_y = np.clip(p.get('y', 0.5), 0.0, 1.0)   # image top→bottom
+        norm_z = np.clip(p.get('z', 0.5), 0.0, 1.0)   # image depth
+
         world_pos = np.zeros(3)
-        world_pos[lr_idx]  = bounds_min[lr_idx] + norm_x * bounds_range[lr_idx]   # Claude x → left-right axis
-        world_pos[fr_idx]  = bounds_min[fr_idx] + norm_y * bounds_range[fr_idx]   # Claude y → front-rear axis
-        world_pos[h_idx]   = bounds_min[h_idx] + norm_z * bounds_range[h_idx]     # Claude z → height axis
+        world_pos[FR_IDX] = bmin[FR_IDX] + norm_x * brange[FR_IDX]          # image-x → mesh-Z
+        world_pos[UP_IDX] = bmin[UP_IDX] + (1.0 - norm_y) * brange[UP_IDX]  # image-y inverted → mesh-Y
+        world_pos[LR_IDX] = bmin[LR_IDX] + norm_z * brange[LR_IDX]          # image-z → mesh-X (≈center)
 
         joints.append(tuple(world_pos))
 
@@ -636,9 +602,8 @@ def joints_from_model(joints_data: dict, glb_path: str):
         if p is not None and c is not None:
             hierarchy.append((p, c))
 
-    log.info(f"Joints from model: {len(joints)} joints, {len(hierarchy)} bones")
-    log.info(f"Axis mapping: x→{left_right_axis}({lr_idx}), y→{front_rear_axis}({fr_idx}), z→{height_axis}({h_idx})")
-    
+    log.info(f"joints_from_model: {len(joints)} joints, {len(hierarchy)} bones "
+             f"(fixed mapping: img-x→Z, img-y-inv→Y, img-z→X)")
     return joints, hierarchy, hint_objects
 
 
@@ -657,6 +622,7 @@ def run_vehicle_pipeline(classify_id: str, glb_path: str,
     record      = _store.get(classify_id)
     joints_data = (record.get('joints') or {}) if record else {}
     joint_hints = joints_data.get('joint_hints', [])
+    object_type = classify_data.get('object_type', '')
 
     # ADD THIS DEBUG:
     log.info(f"DEBUG: joints_data from store: {len(joint_hints)} hints")
@@ -664,16 +630,61 @@ def run_vehicle_pipeline(classify_id: str, glb_path: str,
         p = jh.get('position_normalized', {})
         log.info(f"  {jh['name']}: x={p.get('x')}, y={p.get('y')}, z={p.get('z')}")
 
+    TWO_WHEEL_KEYWORDS = ['bicycle', 'bike', 'motorcycle', 'motorbike', 'scooter', 'moped']
+    is_two_wheel = any(kw in object_type.lower() for kw in TWO_WHEEL_KEYWORDS)
+
+    if is_two_wheel:
+        wheel_hints = [j for j in joint_hints if j.get('body_part') == 'wheel']
+        if len(wheel_hints) == 4:
+            # We remap: Claude x → 3D z (front-rear), and set x=0.5 (centered)
+            wheel_hints_sorted = sorted(wheel_hints, key=lambda w: w['position_normalized']['x'])
+            front_pair = wheel_hints_sorted[:2]   # lower x = front
+            rear_pair  = wheel_hints_sorted[2:]   # higher x = rear
+
+            collapsed = []
+            if front_pair:
+                avg_x = sum(h['position_normalized']['x'] for h in front_pair) / len(front_pair)
+                avg_y = sum(h['position_normalized']['y'] for h in front_pair) / len(front_pair)
+                collapsed.append({**front_pair[0], 'name': 'wheel_fl', 'position_normalized': {
+                    'x': 0.5,    # centered left-right in 3D
+                    'y': avg_y,  # height unchanged
+                    'z': avg_x,  # Claude's image-x becomes 3D front-rear z
+                }})
+            if rear_pair:
+                avg_x = sum(h['position_normalized']['x'] for h in rear_pair) / len(rear_pair)
+                avg_y = sum(h['position_normalized']['y'] for h in rear_pair) / len(rear_pair)
+                collapsed.append({**rear_pair[0], 'name': 'wheel_rl', 'position_normalized': {
+                    'x': 0.5,    # centered left-right in 3D
+                    'y': avg_y,  # height unchanged
+                    'z': avg_x,  # Claude's image-x becomes 3D front-rear z
+                }})
+
+            # Replace wheel hints, keeping gear intact
+            joint_hints = [j for j in joint_hints if j.get('body_part') != 'wheel'] + collapsed
+            log.info(f"Collapsed 4 wheels to 2 for {object_type}")
+
+
+            
     # Only inject wheel joints
     classify_data['joint_hints'] = [
         j for j in joint_hints
-        if j.get('body_part') == 'wheel'
+        if j.get('body_part') in ['wheel', 'gear']
     ]
 
     log.info(f"DEBUG: classify_data['joint_hints'] about to write: {len(classify_data['joint_hints'])} hints")
     for jh in classify_data['joint_hints']:
         p = jh.get('position_normalized', {})
         log.info(f"  {jh['name']}: x={p.get('x')}, y={p.get('y')}, z={p.get('z')}")
+
+
+    wheel_joints_out = [j for j in classify_data['joint_hints'] if j.get('body_part') == 'wheel']
+    if len(wheel_joints_out) == 2:
+        z_spread = abs(wheel_joints_out[0]['position_normalized']['z'] -
+                       wheel_joints_out[1]['position_normalized']['z'])
+        y_spread = abs(wheel_joints_out[0]['position_normalized']['y'] -
+                       wheel_joints_out[1]['position_normalized']['y'])
+        classify_data['wheel_split_axis'] = 2 if z_spread > y_spread else 1
+        log.info(f"Wheel split axis: {classify_data['wheel_split_axis']}")
 
     with open(classify_json, 'w') as f:
         json.dump(classify_data, f, indent=2)
@@ -716,10 +727,7 @@ def run_vehicle_pipeline(classify_id: str, glb_path: str,
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         log.info(result.stdout[-2000:])
 
-        # After find_tire_verts.py runs, read the saved centroids file
-        # and inject into classify_json for animatesam.py to use as pivots.
-        # This uses find_tire_verts.py's own lf/lr/rf/rr split — consistent
-        # with classify_wheels.py's naming — rather than recomputing here.
+
         if script_name == 'find_tire_verts.py' and os.path.exists(tire_verts):
             try:
                 centroids_path = tire_verts.replace('.json', '_centroids.json')
