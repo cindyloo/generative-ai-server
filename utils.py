@@ -521,7 +521,7 @@ def _build_joints_prompt(object_type: str, category: str,
     n_joints: optional hint (treated as a suggestion).
     rig_type: humanoid|biped|quadruped|flying|vehicle|other
     """
-    MIN_JOINTS, MAX_JOINTS = 3, 16
+    MIN_JOINTS, MAX_JOINTS = 2, 16
     if n_joints:
         joints_instruction = (
             f"\nAim for approximately {n_joints} joints total, "
@@ -955,148 +955,99 @@ Return JSON in exactly this structure (adapt joint positions to match the image)
 
 {
   "joint_hints": [
-    {"name": "body",       "body_part": "body",  "deforms_mesh": false, "position_normalized": {"x": 0.5,  "y": 0.5,  "z": 0.5}},
-    {"name": "front_axle", "body_part": "axle",  "deforms_mesh": false, "position_normalized": {"x": 0.5,  "y": 0.25, "z": 0.15}},
-    {"name": "rear_axle",  "body_part": "axle",  "deforms_mesh": false, "position_normalized": {"x": 0.5,  "y": 0.75, "z": 0.15}},
-    {"name": "wheel_fl",   "body_part": "wheel", "deforms_mesh": true,  "position_normalized": {"x": 0.15, "y": 0.25, "z": 0.15}},
-    {"name": "wheel_fr",   "body_part": "wheel", "deforms_mesh": true,  "position_normalized": {"x": 0.85, "y": 0.25, "z": 0.15}},
-    {"name": "wheel_rl",   "body_part": "wheel", "deforms_mesh": true,  "position_normalized": {"x": 0.15, "y": 0.75, "z": 0.15}},
-    {"name": "wheel_rr",   "body_part": "wheel", "deforms_mesh": true,  "position_normalized": {"x": 0.85, "y": 0.75, "z": 0.15}}
+{"name": "gear",     "body_part": "gear",  "deforms_mesh": true,  "position_normalized": {"x": 0.5,  "y": 0.5,  "z": 0.15}, "wheel_radius_normalized": 0.06},
+{"name": "wheel_fl", "body_part": "wheel", "deforms_mesh": true,  "position_normalized": {"x": 0.15, "y": 0.25, "z": 0.15}, "wheel_radius_normalized": 0.35},
+{"name": "wheel_fr", "body_part": "wheel", "deforms_mesh": true,  "position_normalized": {"x": 0.85, "y": 0.25, "z": 0.15}, "wheel_radius_normalized": 0.35},
+{"name": "wheel_rl", "body_part": "wheel", "deforms_mesh": true,  "position_normalized": {"x": 0.15, "y": 0.75, "z": 0.15}, "wheel_radius_normalized": 0.35},
+{"name": "wheel_rr", "body_part": "wheel", "deforms_mesh": true,  "position_normalized": {"x": 0.85, "y": 0.75, "z": 0.15}, "wheel_radius_normalized": 0.35}
   ],
   "skeleton": [
     {"parent": "body",       "child": "front_axle"},
     {"parent": "body",       "child": "rear_axle"},
+    {"parent": "body",       "child": "gear"},
     {"parent": "front_axle", "child": "wheel_fl"},
     {"parent": "front_axle", "child": "wheel_fr"},
     {"parent": "rear_axle",  "child": "wheel_rl"},
     {"parent": "rear_axle",  "child": "wheel_rr"}
   ],
-  "suggested_joints": 7
-}
+  "suggested_joints": 7,
+  "gear" — a rotating disc/wheel that is driven by the drivetrain (chainring, sprocket, cog).
+          deforms_mesh: true, includes drive animation.
+  "wheel_radius_normalized" — measure from hub center to tire edge in pixels, divide by image height.
+          Wheels on a bicycle are typically 0.30–0.40. Gears/chainrings are typically 0.06–0.10.
 
-Left wheels x<0.4, right wheels x>0.6.
-front_axle y must match front wheel y, rear_axle y must match rear wheel y.
-body and axles: deforms_mesh=false. wheels: deforms_mesh=true."""
+  Left wheels x<0.4, right wheels x>0.6.
+  front_axle y must match front wheel y, rear_axle y must match rear wheel y.
+  body and axles: deforms_mesh=false. wheels: deforms_mesh=true.
+}
+"""
 
 
 def _build_vehicle_prompt() -> str:
-    """
-    Combined identify + joint placement prompt for vehicles.
-    Uses standard y-up, z-depth convention matching all other rig types:
-      x = left/right  (0=left,  1=right)
-      y = up/down     (0=bottom/ground, 1=top)   wheels at y≈0.15
-      z = front/rear  (0=front, 1=rear)
-    """
-    return """Analyze this vehicle image for 3D rigging.
+    return """Analyze this vehicle image for 3D rigging. Return ONLY valid JSON.
 
-Return ONLY valid JSON with no markdown, no extra text, no backticks.
+COORDINATE CONVENTION:
+  x = left/right (0=left, 1=right)
+  y = up/down    (0=ground, 1=top)  — wheels at y≈0.15
+  z = front/rear (0=front, 1=rear)
 
+STEP 1 — Identify vehicle type:
+  - Bicycle / motorcycle → 2 wheels (wheel_fl=front, wheel_rl=rear) + any visible gears
+  - Car / truck / bus   → 4 wheels (wheel_fl, wheel_fr, wheel_rl, wheel_rr)
+    Include all 4 wheels even if only 2 are visible — mirror hidden ones.
+
+STEP 2 — Identify rotating parts:
+  body_part values:
+    "body"  — chassis, no animation
+    "axle"  — axle rod, no animation
+    "wheel" — tire that contacts the ground, animates
+    "gear"  — chainring, sprocket, cog — does NOT touch ground, animates
+
+STEP 3 — Place joints:
+  Wheels: y≈0.15 (ground level)
+  Front:  z≈0.20–0.30
+  Rear:   z≈0.70–0.80
+  Left:   x<0.4, Right: x>0.6
+  Bicycle wheels: x≈0.5 (centered, only separated by z)
+  Gears:  y≈0.30–0.45 (above ground, center of frame)
+
+WHEEL PLACEMENT FOR BICYCLES — both wheels are centered (x≈0.5):
+  wheel_fl: {"x": 0.5, "y": 0.15, "z": 0.20}
+  wheel_rl: {"x": 0.5, "y": 0.15, "z": 0.80}
+  chainring: {"x": 0.5, "y": 0.35, "z": 0.50}
+
+OUTPUT FORMAT:
 {
-  "object_type": "toy truck",
+  "object_type": "<what you see>",
   "category": "vehicle",
   "needs_augmentation": false,
   "augment_prompt": "",
-  "wheel_colors_rgb": [
-    [0.05, 0.05, 0.05],
-    [0.85, 0.85, 0.85]
-  ],
-  "suggested_joints": 7,
+  "wheel_colors_rgb": [[r,g,b]],
+  "suggested_joints": <count>,
   "joint_hints": [
     {
-      "name": "body",
-      "body_part": "body",
-      "deforms_mesh": false,
-      "position_normalized": {"x": 0.5, "y": 0.55, "z": 0.5},
-      "animations": []
-    },
-    {
-      "name": "front_axle",
-      "body_part": "axle",
-      "deforms_mesh": false,
-      "position_normalized": {"x": 0.5, "y": 0.15, "z": 0.25},
-      "animations": []
-    },
-    {
-      "name": "rear_axle",
-      "body_part": "axle",
-      "deforms_mesh": false,
-      "position_normalized": {"x": 0.5, "y": 0.15, "z": 0.75},
-      "animations": []
-    },
-    {
-      "name": "wheel_fl",
-      "body_part": "wheel",
-      "deforms_mesh": true,
-      "position_normalized": {"x": 0.15, "y": 0.15, "z": 0.25},
-      "wheel_radius_normalized": 0.18,
-      "animations": [
-        {"clip": "drive", "property": "rotation_euler", "axis": "x",
-         "keyframes": [[0,0.0],[30,3.14159],[60,6.28318]], "loop": true}
-      ]
-    },
-    {
-      "name": "wheel_fr",
-      "body_part": "wheel",
-      "deforms_mesh": true,
-      "position_normalized": {"x": 0.85, "y": 0.15, "z": 0.25},
-      "wheel_radius_normalized": 0.18,
-      "animations": [
-        {"clip": "drive", "property": "rotation_euler", "axis": "x",
-         "keyframes": [[0,0.0],[30,3.14159],[60,6.28318]], "loop": true}
-      ]
-    },
-    {
-      "name": "wheel_rl",
-      "body_part": "wheel",
-      "deforms_mesh": true,
-      "position_normalized": {"x": 0.15, "y": 0.15, "z": 0.75},
-      "wheel_radius_normalized": 0.18,
-      "animations": [
-        {"clip": "drive", "property": "rotation_euler", "axis": "x",
-         "keyframes": [[0,0.0],[30,3.14159],[60,6.28318]], "loop": true}
-      ]
-    },
-    {
-      "name": "wheel_rr",
-      "body_part": "wheel",
-      "deforms_mesh": true,
-      "position_normalized": {"x": 0.85, "y": 0.15, "z": 0.75},
-      "wheel_radius_normalized": 0.18,
+      "name": "<name>",
+      "body_part": "<body|axle|wheel|gear>",
+      "deforms_mesh": <true if wheel or gear, else false>,
+      "position_normalized": {"x": 0.0, "y": 0.0, "z": 0.0},
+      "wheel_radius_normalized": <radius of this wheel or gear as a fraction of the total image height. E.g. if the wheel radius is 1/4 of the image height, return 0.25>,
+      
       "animations": [
         {"clip": "drive", "property": "rotation_euler", "axis": "x",
          "keyframes": [[0,0.0],[30,3.14159],[60,6.28318]], "loop": true}
       ]
     }
   ],
-  "skeleton": [
-    {"parent": "body",       "child": "front_axle"},
-    {"parent": "body",       "child": "rear_axle"},
-    {"parent": "front_axle", "child": "wheel_fl"},
-    {"parent": "front_axle", "child": "wheel_fr"},
-    {"parent": "rear_axle",  "child": "wheel_rl"},
-    {"parent": "rear_axle",  "child": "wheel_rr"}
-  ]
+  "skeleton": [{"parent": "<name>", "child": "<name>"}]
 }
 
-COORDINATE CONVENTION — same as all other rig types:
-  x = left/right:  0.0 = leftmost edge,  1.0 = rightmost edge
-  y = up/down:     0.0 = ground/bottom,  1.0 = top of vehicle
-  z = front/rear:  0.0 = front bumper,   1.0 = rear bumper
-
-WHEEL PLACEMENT:
-  Wheels are always near the ground: y ≈ 0.10–0.20
-  Front wheels: z ≈ 0.20–0.30
-  Rear wheels:  z ≈ 0.70–0.80
-  Left wheels:  x < 0.4
-  Right wheels: x > 0.6
-  front_axle z must match front wheel z
-  rear_axle  z must match rear wheel z
-  axle y must match wheel y (same height)
-
-OTHER RULES:
-  - wheel_colors_rgb: identify actual tire and hub colors from the image as RGB 0-1
-  - body and axles: deforms_mesh false, animations []
-  - wheels: deforms_mesh true, keep the drive spin animations exactly as shown
-  - Do NOT set all wheels to the same z — front and rear must differ
-  - wheel_radius_normalized: estimate wheel radius as fraction of total mesh size
+RULES:
+  - wheel_colors_rgb: list actual all tire/hub colors as RGB 0–1
+  - body/axle: deforms_mesh false, animations []
+  - wheel/gear: deforms_mesh true, include drive animation
+  - wheel_radius_normalized: radius of this wheel as a fraction of the image height. Measure carefully — count pixels from hub center to tire edge, divide by image height
+  - wheel_radius_normalized: MUST be inside each individual wheel/gear joint, not at the top level. measure the wheel radius in pixels and divide by 
+the total image height INCLUDING any padding/whitespace around the object.
+  Gear/chainring: typically 0.05–0.08. Bicycle wheel: typically 0.30–0.40. Car wheel: typically 0.12–0.18.
+  - front and rear wheels must have different z values
 """
