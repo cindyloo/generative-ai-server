@@ -17,7 +17,7 @@ if classify_json and os.path.exists(classify_json):
     with open(classify_json) as f:
         classify_data = json.load(f)
     wheel_joints            = [j for j in classify_data.get('joint_hints', [])
-                                if j.get('body_part') == 'wheel']
+                                if j.get('body_part') in ['wheel', 'gear']]
     wheel_centroids         = classify_data.get('wheel_centroids', {})
     blender_wheel_centroids = classify_data.get('blender_wheel_centroids', {})
     print(f"classify_json: {classify_json}")
@@ -30,8 +30,23 @@ bpy.ops.wm.read_factory_settings(use_empty=True)
 bpy.ops.import_scene.gltf(filepath=input_path)
 
 mesh_objects  = [o for o in bpy.data.objects if o.type == 'MESH']
-body_obj      = max(mesh_objects, key=lambda o: len(o.data.vertices))
+
+# Identify body as the object with worst match to any centroid
+def best_centroid_dist(obj):
+    verts_np = np.array([obj.matrix_world @ v.co for v in obj.data.vertices])
+    actual_center = verts_np.mean(axis=0)
+    if not blender_wheel_centroids:
+        return 0.0
+    return min(
+        np.linalg.norm(np.array(pos) - actual_center)
+        for pos in blender_wheel_centroids.values()
+        if pos is not None
+    )
+
+# Body is the object furthest from all centroids
+body_obj      = max(mesh_objects, key=best_centroid_dist)
 wheel_objects = [o for o in mesh_objects if o != body_obj]
+
 
 print(f"\nWheel centroid verification:")
 for wheel in wheel_objects:
@@ -141,7 +156,6 @@ for i, wheel in enumerate(wheel_objects):
     far_verts = np.sum(distances > distances.mean() * 2)
     print(f"  Verts > 2x mean distance: {far_verts} ({far_verts/len(verts_np)*100:.1f}%)")
     
-    
     # Find BEST matching centroid by distance
     best_name, best_dist = None, float('inf')
     for name, pos in blender_wheel_centroids.items():
@@ -151,14 +165,18 @@ for i, wheel in enumerate(wheel_objects):
         if dist < best_dist:
             best_dist = dist
             best_name = name
-    
-    if best_name:
-        best_pos = blender_wheel_centroids[best_name]
-        cx, cy, cz = float(best_pos[0]), float(best_pos[1]), float(best_pos[2])
-        print(f"  {wheel.name}: Matched to {best_name} (distance={best_dist:.3f})")
+
+    # Use stored centroid as pivot, fall back to vertex mean if not found
+    if best_name and blender_wheel_centroids.get(best_name):
+        pivot = blender_wheel_centroids[best_name]
+        print(f"  {wheel.name}: Using stored centroid '{best_name}' {np.array(pivot).round(3).tolist()}")
     else:
-        cx, cy, cz = float(actual_center[0]), float(actual_center[1]), float(actual_center[2])
-        print(f"  {wheel.name}: Using vertex mean")
+        pivot = actual_center.tolist()
+        print(f"  {wheel.name}: Using vertex mean (no stored centroid matched)")
+
+    cx, cy, cz = float(pivot[0]), float(pivot[1]), float(pivot[2])
+   
+    print(f"  {wheel.name}: Using {cx}, {cy}, {cz}")
     
     # Set origin to pivot
     bpy.context.view_layer.objects.active = wheel
