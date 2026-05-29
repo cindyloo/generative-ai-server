@@ -22,11 +22,28 @@ bmax   = verts.max(axis=0)
 brange = bmax - bmin
 brange[brange == 0] = 1.0
 
-FR_IDX = 0  # mesh X = front-to-rear
-UP_IDX = 1  # mesh Y = height
-LR_IDX = 2  # mesh Z = left-right
-
 print(f"Mesh bounds: X {bmin[0]:.3f}..{bmax[0]:.3f}, Y {bmin[1]:.3f}..{bmax[1]:.3f}, Z {bmin[2]:.3f}..{bmax[2]:.3f}")
+
+# ── Axis assignment ───────────────────────────────────────────────────────────
+# Vehicles (side view): axes are fixed by Meshy convention
+#   mesh X = front-to-rear, mesh Y = height, mesh Z = left-right/depth
+# Mechanical (front view): detect from geometry — thin axis = depth into screen
+is_vehicle = any(h.get('body_part') == 'wheel' for h in wheel_hints)
+
+if is_vehicle:
+    wide_axis = 0   # mesh X = front-to-rear
+    tall_axis = 1   # mesh Y = height
+    thin_axis = 2   # mesh Z = left-right/depth
+    print(f"Axis assignment: vehicle (fixed) wide(FR)=0 tall(UP)=1 thin(LR)=2")
+else:
+    thin_axis = int(np.argmin(brange))
+    remaining = sorted([i for i in range(3) if i != thin_axis],
+                       key=lambda i: brange[i], reverse=True)
+    wide_axis = remaining[0]
+    tall_axis = remaining[1]
+    print(f"Axis detection: mechanical (geometry) thin={thin_axis} wide={wide_axis} tall={tall_axis}")
+
+print(f"  ranges: thin={brange[thin_axis]:.3f} wide={brange[wide_axis]:.3f} tall={brange[tall_axis]:.3f}")
 
 centroids = {}
 is_two_wheel = len([h for h in wheel_hints if h.get('body_part') == 'wheel']) == 2
@@ -38,20 +55,12 @@ for hint in wheel_hints:
     norm_z = np.clip(p.get('z', 0.5), 0.0, 1.0)
 
     center = np.zeros(3)
-    if is_two_wheel:
-        # Bike: image-x = front-to-rear → mesh X, Z forced to center
-        center[FR_IDX] = bmin[FR_IDX] + norm_x * brange[FR_IDX]
-        center[LR_IDX] = (bmin[LR_IDX] + bmax[LR_IDX]) / 2.0
-    else:
-        # Car (4+ wheels): image-z = front-to-rear → mesh X
-        #                  image-x = left-right → mesh Z
-        center[FR_IDX] = bmin[FR_IDX] + norm_z * brange[FR_IDX]
-        center[LR_IDX] = bmin[LR_IDX] + norm_x * brange[LR_IDX]
-
-    center[UP_IDX] = bmin[UP_IDX] + norm_y * brange[UP_IDX]
+    center[wide_axis] = bmin[wide_axis] + norm_x * brange[wide_axis]
+    center[tall_axis] = bmin[tall_axis] + norm_y * brange[tall_axis]
+    center[thin_axis] = (bmin[thin_axis] + bmax[thin_axis]) / 2.0
 
     r_norm = hint.get('wheel_radius_normalized', 0.12)
-    radius = r_norm * brange[UP_IDX] * 1.5
+    radius = r_norm * brange[tall_axis] * 1.5
     dists  = np.linalg.norm(verts - center, axis=1)
     nearby = verts[dists <= radius]  # initial capture with r_norm estimate
 
@@ -61,16 +70,16 @@ for hint in wheel_hints:
         continue
 
     if len(nearby) > 10:
-        y_spread = nearby[:, UP_IDX].max() - nearby[:, UP_IDX].min()
-        z_spread = nearby[:, LR_IDX].max() - nearby[:, LR_IDX].min()
-        true_radius = min(y_spread, z_spread) / 2.0
+        y_spread = nearby[:, tall_axis].max() - nearby[:, tall_axis].min()
+        z_spread = nearby[:, thin_axis].max() - nearby[:, thin_axis].min()
+        true_radius = min(y_spread, z_spread) / 1.5
         print(f"    true_radius from spread: {true_radius:.3f} (vs r_norm radius: {radius:.3f})")
         nearby = verts[dists <= true_radius]
         radius = true_radius
 
     centroid = nearby.mean(axis=0)
-    z_spread = nearby[:, LR_IDX].max() - nearby[:, LR_IDX].min()
-    y_spread = nearby[:, UP_IDX].max() - nearby[:, UP_IDX].min()
+    z_spread = nearby[:, thin_axis].max() - nearby[:, thin_axis].min()
+    y_spread = nearby[:, tall_axis].max() - nearby[:, tall_axis].min()
     print(f"  '{hint['name']}': {len(nearby)} verts, centroid={centroid.round(3).tolist()}, spread Y={y_spread:.3f} Z={z_spread:.3f}")
 
     centroids[hint['name']] = {
@@ -87,5 +96,3 @@ with open(centroids_path, 'w') as f:
     json.dump(centroids, f, indent=2)
 
 print(f"Centroids written: {centroids_path}")
-
-
