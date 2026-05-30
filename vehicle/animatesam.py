@@ -10,8 +10,12 @@ classify_json = sys.argv[sys.argv.index('--') + 3] \
 # Load classify data
 wheel_joints            = []
 wheel_centroids         = {}
+# ── Load classify data ────────────────────────────────────────────────────────
 blender_wheel_centroids = {}
 classify_data           = None
+joint_hints_by_name     = {}
+is_mechanical           = False
+reference_radius        = None
 
 if classify_json and os.path.exists(classify_json):
     with open(classify_json) as f:
@@ -20,9 +24,11 @@ if classify_json and os.path.exists(classify_json):
                                 if j.get('body_part') in ['wheel', 'gear']]
     wheel_centroids         = classify_data.get('wheel_centroids', {})
     blender_wheel_centroids = classify_data.get('blender_wheel_centroids', {})
-    print(f"classify_json: {classify_json}")
-    print(f"Loaded {len(wheel_joints)} wheel joints")
+    joint_hints_by_name     = {j['name']: j for j in classify_data.get('joint_hints', [])}
+    is_mechanical           = classify_data.get('is_mechanical', False)
+    reference_radius        = classify_data.get('reference_radius_normalized', None)
     print(f"Loaded {len(blender_wheel_centroids)} Blender centroids")
+    print(f"is_mechanical: {is_mechanical}  reference_radius: {reference_radius}")
 else:
     print(f"classify_json not found: {classify_json}")
 
@@ -184,17 +190,61 @@ for i, wheel in enumerate(wheel_objects):
     bpy.context.scene.cursor.location = (cx, cy, cz)
     bpy.ops.object.origin_set(type='ORIGIN_CURSOR')
     wheel.select_set(False)
+    bpy.context.view_layer.update()
 
-    # Create rotation animation
+    # ── Vertex diagnostics ────────────────────────────────────────────────────
+    distances = np.linalg.norm(verts_np - actual_center, axis=1)
+    mean_dist = distances.mean()
+    far_verts = np.sum(distances > mean_dist * 2)
+    print(f"  verts={len(verts_np)} far={far_verts} ({far_verts/len(verts_np)*100:.1f}%)")
+    if distances.std() > mean_dist * 0.3 or far_verts > len(verts_np) * 0.1:
+        print(f"  ⚠️ may contain non-target geometry")
+
+    # ── Build animation ───────────────────────────────────────────────────────
     wheel.rotation_mode = 'XYZ'
     action = bpy.data.actions.new(name=f"wheel_{i}_rot")
-    fc     = action.fcurves.new(data_path='rotation_euler', index=rotation_axis)
-    fc.keyframe_points.add(2)
-    fc.keyframe_points[0].co = (1,  0.0)
-    fc.keyframe_points[1].co = (61, math.pi * 2)
-    
-    for kp in fc.keyframe_points:
-        kp.interpolation = 'LINEAR'
+
+    body_part = wheel.get('body_part')
+    if body_part == 'hinge':
+        hinge_axis  = hint.get('hinge_axis', 'y')
+        hinge_range = hint.get('hinge_range', [-90, 0])
+        axis_map    = {'x': 0, 'y': 1, 'z': 2}
+        rot_idx     = axis_map.get(hinge_axis.lower(), 1)
+        min_rad     = math.radians(hinge_range[0])
+        max_rad     = math.radians(hinge_range[1])
+        fc = action.fcurves.new(data_path='rotation_euler', index=rot_idx)
+        fc.keyframe_points.add(3)
+        fc.keyframe_points[0].co = (1,  max_rad)
+        fc.keyframe_points[1].co = (30, min_rad)
+        fc.keyframe_points[2].co = (61, max_rad)
+        for kp in fc.keyframe_points:
+            kp.interpolation = 'BEZIER'
+        print(f"  hinge animation: axis={hinge_axis} range={hinge_range}°")
+
+    elif body_part == 'gear' and is_mechanical and ref_r_mesh is not None:
+        r_norm      = hint.get('wheel_radius_normalized', 0.15)
+        rot_dir     = hint.get('rotation_direction', 1)
+        this_r_mesh = r_norm * full_y_range
+        speed_ratio = ref_r_mesh / max(this_r_mesh, 0.001)
+        total_angle = math.pi * 2 * speed_ratio * rot_dir
+        fc = action.fcurves.new(data_path='rotation_euler', index=rotation_axis)
+        fc.keyframe_points.add(2)
+        fc.keyframe_points[0].co = (1,  0.0)
+        fc.keyframe_points[1].co = (61, total_angle)
+        for kp in fc.keyframe_points:
+            kp.interpolation = 'LINEAR'
+        print(f"  gear: r_norm={r_norm:.3f} dir={rot_dir:+d} "
+              f"speed_ratio={speed_ratio:.2f} angle={math.degrees(total_angle):.1f}°")
+
+    else:
+        # Vehicle wheel or gear without speed ratio: one full rotation
+        fc = action.fcurves.new(data_path='rotation_euler', index=rotation_axis)
+        fc.keyframe_points.add(2)
+        fc.keyframe_points[0].co = (1,  0.0)
+        fc.keyframe_points[1].co = (61, math.pi * 2)
+        for kp in fc.keyframe_points:
+            kp.interpolation = 'LINEAR'
+        print(f"  wheel/gear: one full rotation around axis {rotation_axis}")
 
     wheel.animation_data_create()
     wheel.animation_data.action = action
@@ -202,9 +252,8 @@ for i, wheel in enumerate(wheel_objects):
     track.name = "drive"
     strip      = track.strips.new("drive", 1, action)
     wheel.animation_data.action = None
-
     print(f"  {wheel.name}: NLA strip 'drive' created")
-    
+
 bpy.ops.export_scene.gltf(
     filepath=output_path,
     export_format='GLB',

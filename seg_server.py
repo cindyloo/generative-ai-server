@@ -563,14 +563,15 @@ def classify_with_vision(img_bytes: bytes, mime_type: str,
     img_bytes = buf.getvalue()
 
     mime_type = utils.detect_mime_type(img_bytes)
-    tag_words = set((user_tag or '').lower().split('+'))
+    tag_words = set(re.split(r'[ +]', (user_tag or '').lower()))
     tag_ctx   = f'\nThe user identified this as: "{user_tag}".' if user_tag else ''
 
     prompt = (
-        f"This is a {user_tag}.\n\n" + utils._build_vehicle_prompt()
+        f"This is a vehicle {user_tag}.\n\n" + utils._build_vehicle_classify_prompt(tag_ctx)
         if tag_words & utils.VEHICLE_KEYWORDS
         else utils._build_classify_prompt(tag_ctx)
     )
+    log.info(f"prompt first 500 chars: {prompt[:500]}")
 
     img_base64 = base64.b64encode(img_bytes).decode('utf-8')
 
@@ -629,8 +630,15 @@ def classify_joints_with_vision(img_bytes: bytes, mime_type: str,
     img.save(buf, format='PNG', optimize=True)
     img_bytes  = buf.getvalue()
     mime_type  = utils.detect_mime_type(img_bytes)
-    prompt     = utils._build_joints_prompt(object_type, category, n_joints,
-                                             mesh_bounds=mesh_bounds)
+    
+    if rig_type == 'vehicle':
+        prompt = utils._build_vehicle_prompt(object_type, category, n_joints,
+                                             mesh_bounds=mesh_bounds, rig_type=rig_type)
+    else:
+        prompt = utils._build_joints_prompt(object_type, category, n_joints,
+                                             mesh_bounds=mesh_bounds, rig_type=rig_type)
+
+    log.info(f"prompt first 500 chars: {prompt[:500]}")
     img_base64 = base64.b64encode(img_bytes).decode('utf-8')
 
     for label, fn, args in [
@@ -2079,31 +2087,32 @@ def infer_joints():
             'source_image_path': active_path,
             'model_used':        model_used,
         }
+        log.info(f"GLB processing")
         if glb_path and os.path.exists(glb_path):
             try:
                 joints_data = snap_joints_to_mesh(joints_data, glb_path)
             except Exception as e:
                 log.warning(f"Snapping failed (non-fatal): {e}")
-
+            log.info(f"Snapped")
             try:
                 rig_type = classify_data.get('rig_type', '')
                 joints_data = mesh_guided_joint_correction(
                     joints_data, glb_path, rig_type)
             except Exception as e:
                 log.warning(f"Mesh-guided correction failed (non-fatal): {e}")
-
+            log.info(f"Mesh correction")
             try:
                 joints_data = enforce_bilateral_symmetry(joints_data)
             except Exception as e:
                 log.warning(f"Symmetry enforcement failed (non-fatal): {e}")
-
+            log.info(f"Mirrored")
             try:
                 viz_path = os.path.join(RESULTS_DIR,
                                         f"{classify_id}_joints_normalized_viz.glb")
                 visualize_normalized_joints(joints_data, glb_path, viz_path)
             except Exception as e:
                 log.warning(f"Normalized joints viz failed (non-fatal): {e}")
-
+            log.info(f"Visualized")
         _store.upsert_joints(classify_id, joints_data)
         log.info(f"Joints stored: {classify_id} "
                  f"({len(joints_info['joint_hints'])} hints, model={model_used})")
@@ -2230,7 +2239,14 @@ def visualize_normalized_joints(joints_data: dict, mesh_path: str,
         x     = bmin[0] + p.get('x', 0.5) * brange[0]
         y     = bmin[1] + p.get('y', 0.5) * brange[1]
         z     = bmin[2] + p.get('z', 0.5) * brange[2]
-
+        log.info(f"initial y {p.get('y', 0.5)} then  {y}")
+        norm_y = p.get('y', 0.5)
+        body_part = hint.get('body_part', '')
+        r_norm = hint.get('wheel_radius_normalized', 0.0)
+        norm_y = 1.0 - p.get('y', 0.5)  # invert image-y to mesh-y
+        y = bmin[1] + norm_y * brange[1]
+        log.info(f"setting {x} {y} {z}")
+        log.info(f"initial y {p.get('y')} r_norm={hint.get('wheel_radius_normalized')} body_part={hint.get('body_part')}")
         sphere = trimesh.creation.icosphere(radius=sphere_r)
         sphere.apply_translation([x, y, z])
         sphere.visual.face_colors = get_color(hint['name'])

@@ -257,16 +257,21 @@ try:
             vert_colors = img_arr[px_v, px_u]
 
             if isinstance(wheel_colors_data[0], dict):
+                # dict format: {color: [r,g,b]} where values are 0-1 floats
                 wheel_colors = np.array([[int(c['color'][i]*255) for i in range(3)]
                                           for c in wheel_colors_data])
-            else:
+            elif isinstance(wheel_colors_data[0][0], float) and max(wheel_colors_data[0]) <= 1.0:
+                # list of [r,g,b] floats 0-1
                 wheel_colors = np.array([[int(c[i]*255) for i in range(3)]
                                           for c in wheel_colors_data])
+            else:
+                # list of [r,g,b] integers 0-255 — use directly
+                wheel_colors = np.array(wheel_colors_data, dtype=int)
 
             color_mask = np.zeros(len(verts), dtype=bool)
             for wc in wheel_colors:
                 dists_c     = np.sqrt(np.sum((vert_colors.astype(int) - wc)**2, axis=1))
-                color_mask |= (dists_c < 60)
+                color_mask |= (dists_c < 80) #arbitratry color threshold
 
             if color_mask.sum() > 100:
                 color_filter_on = True
