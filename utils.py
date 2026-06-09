@@ -962,10 +962,10 @@ Return JSON in exactly this structure (adapt to match the image):
 {
   "joint_hints": [
     {
-      "name": "red gear",
+      "name": "gear",
       "body_part": "gear",
       "deforms_mesh": true,
-      "position_normalized": {"x": 0.47, "y": 0.28, "z": 0.5},
+      "position_normalized": {"x": 0.0, "y": 0.0, "z": 0.0},
       "wheel_radius_normalized": 0.18,
       "rotation_direction": 1,
       "animations": [
@@ -974,22 +974,33 @@ Return JSON in exactly this structure (adapt to match the image):
       ]
     },
     {
-      "name": "yellow gear",
+      "name": "gear",
       "body_part": "gear",
       "deforms_mesh": true,
-      "position_normalized": {"x": 0.47, "y": 0.28, "z": 0.5},
-      "wheel_radius_normalized": 0.18,
-      "rotation_direction": 1,
+      "position_normalized":{"x": 0.0, "y": 0.0, "z": 0.0},
+      "wheel_radius_normalized":  0.18,
+      "rotation_direction": -1,
       "animations": [
         {"clip": "drive", "property": "rotation_euler", "axis": "z",
-         "keyframes": [[0,0.0],[30,3.14159],[60,6.28318]], "loop": true}
+         "keyframes": [[0,0.0],[30,-3.14159],[60,-6.28318]], "loop": true}
+      ]
+    },
+    {
+      "name": "hinge",
+      "body_part": "hinge",
+      "deforms_mesh": true,
+      "position_normalized":{"x": 0.0, "y": 0.0, "z": 0.0},
+      "rotation_direction": -1,
+      "animations": [
+        {"clip": "drive", "property": "rotation_euler", "axis": "z",
+         "keyframes": [[0,0.0],[30,0.45],[60, 0.90]], "loop": true}
       ]
     }
   ],
   "skeleton": [
     {"parent": "body", "child": "gear"}
   ],
-  "wheel_colors_rgb": [[0.05, 0.05, 0.05]],
+  "wheel_colors_rgb": [[13, 13, 13]],
   "suggested_joints": 2
 }
  
@@ -997,9 +1008,10 @@ RULES FOR MECHANICAL OBJECTS:
 - Every rotating part: body_part "gear", deforms_mesh true
 - Every hinging part:  body_part "hinge", deforms_mesh true
 - Fixed bases/frames:  body_part "body",  deforms_mesh false
+- Each gear MUST have a unique position — do NOT copy positions from the example"
 - gear rotation_direction: +1 = counterclockwise, -1 = clockwise
   Adjacent meshing gears ALWAYS rotate in opposite directions.
-- wheel_radius_normalized: measure outer radius in pixels, divide by image height
+- wheel_radius_normalized: measure from gear CENTER to the TIP OF THE OUTERMOST TOOTH in pixels, divide by image height. Do NOT measure to the inner ring — include the full tooth height.
 - z is always 0.5 for all joints (front-facing flat objects)
 - y convention: 0=TOP of image, 1=BOTTOM (pixel convention)
 - Name parts descriptively: gear_red, gear_large, hinge_jaw, hinge_lid etc.
@@ -1158,8 +1170,8 @@ STEP 2 — Identify rotating parts:
     "wheel" — tire that contacts the ground, animates
     "gear"  — chainring, sprocket, cog — does NOT touch ground, animates
  
-STEP 3 — Place joints at the visual center of each wheel/gear circle:
-  x and y = pixel center of the hub as seen in the image.
+STEP 3 — CRITICAL Place joints at the visual center of each wheel/gear circle:
+  x and y = pixel perfect center of the wheel/gear as seen in the image.
   y=0 is the TOP of the image, y=1 is the BOTTOM — measure where the hub center actually is.
   Front:  z≈0.20–0.30
   Rear:   z≈0.70–0.80
@@ -1214,7 +1226,8 @@ FOR 4-WHEEL VEHICLES (side view):
   - body/axle: deforms_mesh false, animations []
   - wheel/gear: deforms_mesh true, include drive animation
   - wheel_radius_normalized: measure from hub center to OUTER TIRE EDGE in pixels,
-    divide by total image height. For large monster truck wheels this may be 0.35-0.45.
+    divide by total image height. For large monster truck wheels this may be 0.35-0.45, for gears,
+    gear CENTER to the TIP OF THE OUTERMOST TOOTH in pixels, divide by image height. Do NOT measure to the inner ring — include the full tooth height.
   - front and rear wheels MUST have different z values
   - left and right wheels MUST have different x values (left≈0.15, right≈0.85)
 """

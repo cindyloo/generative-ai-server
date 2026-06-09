@@ -63,25 +63,24 @@ if os.path.exists(centroids_path):
         if isinstance(v, dict):
             pos               = v['centroid']
             radius            = v.get('radius', 0.2)
-            candidate_indices = v.get('candidate_indices', None)
+            axis              = v.get('axis', [0, 1, 0])
         else:
             pos               = v
             radius            = 0.2
-            candidate_indices = None
+            axis              = 1
+
         # trimesh: Y=height, Z=left-right
         # Blender: Y=left-right, Z=height  →  swap Y and Z
         true_centroids[name] = {
             'centroid':          np.array([pos[0], pos[2], pos[1]]),
             'radius':            radius,
-            'candidate_indices': set(candidate_indices) if candidate_indices else None,
+            'name':              name,
+            'axis':              axis
+        
         }
 
     print(f"\nLoaded centroids from find_tire_verts: {list(true_centroids.keys())}")
-    for name, d in true_centroids.items():
-        c     = d['centroid']
-        n_cand = len(d['candidate_indices']) if d['candidate_indices'] else 0
-        print(f"  {name}: ({c[0]:.3f},{c[1]:.3f},{c[2]:.3f}) radius={d['radius']:.3f} "
-              f"candidates={n_cand}")
+
 else:
     print(f"WARNING: centroids file not found at {centroids_path}")
 
@@ -108,7 +107,7 @@ if not true_centroids:
                                ('wheel_rl', lr), ('wheel_rr', rr)]:
             true_centroids[name] = {
                 'centroid': cluster.mean(axis=0) if len(cluster) > 0 else None,
-                'radius':   0.2,
+                'radius':   0.2
             }
     elif num_wheels == 2:
         median = np.median(tire_verts_np[:, 1])
@@ -117,7 +116,7 @@ if not true_centroids:
         for name, cluster in [('wheel_fl', lf), ('wheel_rl', lr)]:
             true_centroids[name] = {
                 'centroid': cluster.mean(axis=0) if len(cluster) > 0 else None,
-                'radius':   0.2,
+                'radius':   0.2
             }
     else:
         raise RuntimeError(f"Unexpected wheel count: {num_wheels} and no centroids loaded")
@@ -166,15 +165,14 @@ if mask_dir and os.path.isdir(mask_dir):
 # Primary: SAM2 mask projection (excludes fork/frame pixels exactly)
 # Fallback: radius sphere from centroid
 # ══════════════════════════════════════════════════════════════════════════════
-centroid_list = [(name, d['centroid'], d['radius'], d.get('candidate_indices'))
+centroid_list = [(name, d['centroid'], d['radius'])
                  for name, d in true_centroids.items()
                  if d['centroid'] is not None]
 
 print("\nCentroids from tire vertices:")
-for name, centroid, radius, cand_idx in centroid_list:
-    n_cand = len(cand_idx) if cand_idx else 0
+for name, centroid, radius in centroid_list:
     print(f"  {name}: ({centroid[0]:.3f},{centroid[1]:.3f},{centroid[2]:.3f}) "
-          f"radius={radius:.3f} candidates={n_cand}")
+          f"radius={radius:.3f}")
 
 # ── Axis assignment ───────────────────────────────────────────────────────────
 # Vehicles (side view): fixed by Meshy convention
@@ -295,15 +293,28 @@ print(f"\nAssignment strategy: radius sphere" +
       (" + color filter" if color_filter_on else " (no color filter)"))
 
 wheel_vert_groups = []
-for name, centroid, radius, cand_idx in centroid_list:
-    print(f"\n[{name}]")
+for name, centroid, radius in centroid_list:
 
-    # ── Step 1: Geometric radius sphere ───────────────────────────────────────
+    # Step 1: Radius sphere
     dists     = np.linalg.norm(verts - centroid, axis=1)
     in_sphere = np.where(dists <= radius)[0]
     print(f"  Radius sphere:        {len(in_sphere):6d} verts  (r={radius:.3f})")
 
-    # ── Step 2: Color filter ──────────────────────────────────────────────────
+    # Step 2: Y-axis width constraint (thin axis = left-right in Blender)
+    y_dists   = np.abs(verts[in_sphere, 1] - centroid[1])
+    y_mask    = y_dists <= radius * 0.45
+    in_sphere = in_sphere[y_mask]
+    print(f"  After Y width cut:    {len(in_sphere):6d} verts  (y_hw={radius*0.35:.3f})")
+    x_dists   = np.abs(verts[in_sphere, 0] - centroid[0])
+    x_mask    = x_dists <= radius * 2  # tune this
+    in_sphere = in_sphere[x_mask]
+    # Step 2c: Z height constraint — keep only verts within tire radius in Z
+    z_dists   = np.abs(verts[in_sphere, 2] - centroid[2])
+    z_mask    = z_dists <= radius * .5  # tire height band
+    in_sphere = in_sphere[z_mask]
+    print(f"  After Z height cut:   {len(in_sphere):6d} verts  (z_hw={radius*0.6:.3f})")
+
+    # Step 3: Color filter
     if color_filter_on and color_mask is not None:
         filtered = in_sphere[color_mask[in_sphere]]
         pct      = len(filtered) / len(in_sphere) * 100 if len(in_sphere) > 0 else 0
@@ -311,38 +322,31 @@ for name, centroid, radius, cand_idx in centroid_list:
         if len(filtered) > 20:
             in_sphere = filtered
         else:
-            print(f"  Color filter too aggressive — reverting to full sphere")
+            print(f"  Color filter too aggressive — reverting to Y cut result")
+
+   # Step 4: Correct centroid Y to outer tire face
+    final_verts = verts[in_sphere]
+    y_vals      = final_verts[:, 1]
+    y_center    = (verts[:, 1].min() + verts[:, 1].max()) / 2.0
+
+    if centroid[1] > y_center:
+        corrected_y = float(np.percentile(y_vals, 95))  # right wheel outer face
     else:
-        print(f"  No color filter — using full sphere")
+        corrected_y = float(np.percentile(y_vals, 5))   # left wheel outer face
+
+    print(f"  Centroid Y corrected: {centroid[1]:.3f} → {corrected_y:.3f}")
+    true_centroids[name]['centroid'][1] = corrected_y
 
     wheel_verts = list(in_sphere)
     print(f"  Final:                {len(wheel_verts):6d} verts assigned to {name}")
     wheel_vert_groups.append((name, wheel_verts))
+    
+    
+    
+# ─────────────────────────────
 
-# ══════════════════════════════════════════════════════════════════════════════
-# SAVE BLENDER-SPACE CENTROIDS EARLY
-# Write before separation so animatesam.py always has them even if
-# separation partially fails on one of the parts.
-# ══════════════════════════════════════════════════════════════════════════════
-blender_centroids = {
-    name: centroid.tolist()
-    for name, centroid, radius, cand_idx in centroid_list
-}
-with open(classify_json, 'r') as f:
-    cdata = json.load(f)
-cdata['blender_wheel_centroids'] = blender_centroids
-with open(classify_json, 'w') as f:
-    json.dump(cdata, f, indent=2)
-
-print(f"\nBlender-space centroids saved to classify_json:")
-for name, c in blender_centroids.items():
-    print(f"  {name}: ({c[0]:.3f},{c[1]:.3f},{c[2]:.3f})")
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SEPARATE MESH OBJECTS
-# ══════════════════════════════════════════════════════════════════════════════
-bpy.context.view_layer.objects.active = mesh_obj
-mesh_obj.select_set(True)
+wheel_vert_groups_cleaned = []
+blender_mesh_verts = mesh_obj.data.vertices
 
 for name, vert_indices in wheel_vert_groups:
     if not vert_indices:
@@ -355,7 +359,8 @@ for name, vert_indices in wheel_vert_groups:
     if not vert_indices:
         print(f"  {name}: empty, skipping separation")
         continue
-
+    
+    existing_names = {o.name for o in bpy.data.objects if o.type == 'MESH'}
     # Re-establish mesh_obj as active and selected before each separation.
     # After mesh.separate(), Blender makes the new object active — we must
     # explicitly reset context or the next vertex_group_select() has no target.
@@ -385,10 +390,16 @@ for name, vert_indices in wheel_vert_groups:
     bpy.ops.object.mode_set(mode='EDIT')
     bpy.ops.mesh.separate(type='SELECTED')
     bpy.ops.object.mode_set(mode='OBJECT')
+    new_obj = next(o for o in bpy.data.objects
+        if o.type == 'MESH' and o.name not in existing_names)
+    new_obj.name = name
     print(f"  {name}: separated {len(selected_verts)} verts")
 
+
 mesh_objects = [o for o in bpy.data.objects if o.type == 'MESH']
-print(f"\nAfter separation: {len(mesh_objects)} objects")
+print(f"\nAfter SEPARATION: {len(mesh_objects)} objects")
+
+
 for o in mesh_objects:
     print(f"  {o.name}: {len(o.data.vertices)} verts")
 
@@ -396,6 +407,7 @@ for o in mesh_objects:
 # CLEAN STRAY DISCONNECTED VERTICES
 # ══════════════════════════════════════════════════════════════════════════════
 all_meshes = [o for o in bpy.data.objects if o.type == 'MESH']
+
 body       = max(all_meshes, key=lambda o: len(o.data.vertices))
 for obj in all_meshes:
     if obj == body:
@@ -409,6 +421,33 @@ for obj in all_meshes:
     bpy.ops.mesh.delete(type='VERT')
     bpy.ops.object.mode_set(mode='OBJECT')
     print(f"  Cleaned {obj.name}: {len(obj.data.vertices)} verts remaining")
+
+
+#recompute the centroid from its own verts after separation,
+#rather than trusting the trimesh-derived value from find_tire_verts.
+
+# Use RANSAC centroids from find_tire_verts, Y/Z swapped to Blender space
+blender_centroids = {}
+for name, d in true_centroids.items():
+    c = d['centroid']  # already Y/Z swapped on load (line 74)
+    blender_centroids[name] = {
+        'centroid': c.tolist() if hasattr(c, 'tolist') else list(c),
+        'radius': d.get('radius', 0.2)
+    }
+    print(f"  {name}: RANSAC centroid {np.array(c).round(3).tolist()}")
+
+# THEN write to classify_json:
+with open(classify_json, 'r') as f:
+    cdata = json.load(f)
+cdata['blender_wheel_centroids'] = blender_centroids
+with open(classify_json, 'w') as f:
+    json.dump(cdata, f, indent=2)
+
+print(f"\n NEW Blender-space centroids saved to classify_json:")
+for name, c in blender_centroids.items():
+    coords = c['centroid']
+    print(f"  {name}: ({coords[0]:.3f},{coords[1]:.3f},{coords[2]:.3f})")
+
 
 bpy.ops.export_scene.gltf(filepath=output_path, export_format='GLB')
 print(f"\nExported: {output_path}")

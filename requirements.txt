@@ -31,3 +31,5 @@ tinydb==4.8.0
 
 # Mesh I/O (for GLB↔USDZ conversion)
 meshio==5.3.4
+
+pyransac3d

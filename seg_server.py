@@ -568,7 +568,7 @@ def classify_with_vision(img_bytes: bytes, mime_type: str,
 
     prompt = (
         f"This is a vehicle {user_tag}.\n\n" + utils._build_vehicle_classify_prompt(tag_ctx)
-        if tag_words & utils.VEHICLE_KEYWORDS
+        if tag_words & utils.VEHICLE_KEYWORDS or tag_words & utils.MECHANICAL_KEYWORDS
         else utils._build_classify_prompt(tag_ctx)
     )
     log.info(f"prompt first 500 chars: {prompt[:500]}")
@@ -631,7 +631,7 @@ def classify_joints_with_vision(img_bytes: bytes, mime_type: str,
     img_bytes  = buf.getvalue()
     mime_type  = utils.detect_mime_type(img_bytes)
     
-    if rig_type == 'vehicle':
+    if rig_type == 'vehicle' or rig_type == "mechanical":
         prompt = utils._build_vehicle_prompt(object_type, category, n_joints,
                                              mesh_bounds=mesh_bounds, rig_type=rig_type)
     else:
@@ -1271,28 +1271,25 @@ def run_vehicle_pipeline(classify_id: str, glb_path: str,
     if is_two_wheel:
         wheel_hints = [j for j in joint_hints if j.get('body_part') == 'wheel']
         if len(wheel_hints) == 4:
-            # We remap: Claude x → 3D z (front-rear), and set x=0.5 (centered)
-            wheel_hints_sorted = sorted(wheel_hints, key=lambda w: w['position_normalized']['x'])
-            front_pair = wheel_hints_sorted[:2]   # lower x = front
-            rear_pair  = wheel_hints_sorted[2:]   # higher x = rear
+            # Sort by z to find front/rear pairs (z=front/rear in Claude convention)
+            wheel_hints_sorted = sorted(wheel_hints, key=lambda w: w['position_normalized']['z'])
+            front_pair = wheel_hints_sorted[:2]   # lower z = front
+            rear_pair  = wheel_hints_sorted[2:]   # higher z = rear
 
             collapsed = []
             if front_pair:
-                avg_x = sum(h['position_normalized']['x'] for h in front_pair) / len(front_pair)
+                avg_z = sum(h['position_normalized']['z'] for h in front_pair) / len(front_pair)
                 avg_y = sum(h['position_normalized']['y'] for h in front_pair) / len(front_pair)
+                r_norm = front_pair[0].get('wheel_radius_normalized', 0.12)
                 collapsed.append({**front_pair[0], 'name': 'wheel_fl',
-                   'position_normalized': {'x': avg_x, 'y': avg_y, 'z': 0.5}})
+                   'position_normalized': {'x': 0.5, 'y': avg_y, 'z': avg_z}})
             if rear_pair:
-                avg_x = sum(h['position_normalized']['x'] for h in rear_pair) / len(rear_pair)
+                avg_z = sum(h['position_normalized']['z'] for h in rear_pair) / len(rear_pair)
                 avg_y = sum(h['position_normalized']['y'] for h in rear_pair) / len(rear_pair)
                 collapsed.append({**rear_pair[0], 'name': 'wheel_rl',
-                   'position_normalized': {'x': avg_x, 'y': avg_y, 'z': 0.5}})
-
-            # Replace wheel hints, keeping gear intact
+                   'position_normalized': {'x': 0.5, 'y': avg_y, 'z': avg_z}})
             joint_hints = [j for j in joint_hints if j.get('body_part') != 'wheel'] + collapsed
             log.info(f"Collapsed 4 wheels to 2 for {object_type}")
-
-
             
     # Only inject wheel joints
     classify_data['joint_hints'] = [
@@ -1354,10 +1351,13 @@ def run_vehicle_pipeline(classify_id: str, glb_path: str,
             cmd  = [sys.executable, script] + args
 
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        log.info(result.stdout[-2000:])
+        log.info(result.stdout[-5000:])
 
 
-
+        if script_name == 'classify_wheels.py':
+            with open(classify_json) as _f:
+                _check = json.load(_f)
+            log.info(f"blender_wheel_centroids after classify_wheels: {_check.get('blender_wheel_centroids')}")
 
 
         if script_name == 'find_tire_verts.py' and os.path.exists(tire_verts):
@@ -2556,7 +2556,7 @@ def gallery_data():
         return jsonify([{
             'classify_id':     r.get('classify_id'),
             'label':           r.get('tag', 'model'),
-            'tags':            r.get('tags', []),
+            'tags':            r.get('tags', 'model'),
             'rigged_path':     (r.get('rig')      or {}).get('rigged_glb_path'),
             'segmented_image': (r.get('classify') or {}).get('segmented_image_path'),
             'active_image':    r.get('active_image_path'),
@@ -2564,6 +2564,9 @@ def gallery_data():
             'has_mesh':        bool((r.get('mesh') or {}).get('glb_path')),
             'rig_status':      (r.get('rig') or {}).get('status'),
             'created_at':      (r.get('rig') or {}).get('created_at'),
+            'rigged_path':      _local_url(((r.get('rig') or {}).get('rigged_glb_path')), request.host),
+            'active_path':      _local_url(r.get('glb_path'),request.host),
+            'url':              _local_url(((r.get('rig') or {}).get('rigged_glb_path')), request.host)
         } for r in records])
     except Exception as e:
         log.error(f"/gallery_data error: {e}")

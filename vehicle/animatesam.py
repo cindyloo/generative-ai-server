@@ -9,9 +9,10 @@ classify_json = sys.argv[sys.argv.index('--') + 3] \
 
 # Load classify data
 wheel_joints            = []
-wheel_centroids         = {}
+
 # ── Load classify data ────────────────────────────────────────────────────────
 blender_wheel_centroids = {}
+fallback_wheel_centroids = {}
 classify_data           = None
 joint_hints_by_name     = {}
 is_mechanical           = False
@@ -22,20 +23,58 @@ if classify_json and os.path.exists(classify_json):
         classify_data = json.load(f)
     wheel_joints            = [j for j in classify_data.get('joint_hints', [])
                                 if j.get('body_part') in ['wheel', 'gear']]
-    wheel_centroids         = classify_data.get('wheel_centroids', {})
+    fallback_wheel_centroids         = classify_data.get('wheel_centroids', {})
     blender_wheel_centroids = classify_data.get('blender_wheel_centroids', {})
     joint_hints_by_name     = {j['name']: j for j in classify_data.get('joint_hints', [])}
     is_mechanical           = classify_data.get('is_mechanical', False)
     reference_radius        = classify_data.get('reference_radius_normalized', None)
-    print(f"Loaded {len(blender_wheel_centroids)} Blender centroids")
+    print(f"Loaded {len(fallback_wheel_centroids)} Fallback centroids {fallback_wheel_centroids}")
+    print(f"Loaded {len(blender_wheel_centroids)} Blender centroids {blender_wheel_centroids}")
     print(f"is_mechanical: {is_mechanical}  reference_radius: {reference_radius}")
 else:
     print(f"classify_json not found: {classify_json}")
 
+
+
+centroids = {}
+
+# Check if our High-Precision mathematical keys exist in the payload
+if 'blender_wheel_centroids' in classify_data:
+    print("INFO: Blender loading high-precision mathematical centroids keys.")
+    for name, data in classify_data['blender_wheel_centroids'].items():
+        # Extracted directly from our precise Taubin Circle Fit!
+        precise_xyz = data['centroid']
+        
+        # Keep internal script dictionary structured smoothly
+        centroids[name] = {
+            'centroid': [precise_xyz[0], precise_xyz[1], precise_xyz[2]],
+            'radius': float(data['radius'])
+        }
+    
+else:
+    # FALLBACK: Keep old bounding box code just in case a file misses processing
+    print("WARNING: High-precision keys missing, falling back to box approximations.")
+    for hint in classify_data.get('joint_hints', []):
+        name = hint['name']
+        p = hint.get('position_normalized', {})
+        cx = bmin[0] + p.get('x', 0.5) * brange[0]
+        cy = bmin[1] + (1.0 - p.get('y', 0.5)) * brange[1]
+        cz = bmin[2] + p.get('z', 0.5) * brange[2]
+        centroids[name] = {
+            'centroid': [cx, cy, cz],
+            'radius': hint.get('wheel_radius_normalized', 0.1) * np.max(brange)
+        }
+        
+blender_wheel_centroids = {
+    name: (v['centroid'] if isinstance(v, dict) else v)
+    for name, v in blender_wheel_centroids.items()
+    if v is not None
+}
+
 bpy.ops.wm.read_factory_settings(use_empty=True)
 bpy.ops.import_scene.gltf(filepath=input_path)
 
-mesh_objects  = [o for o in bpy.data.objects if o.type == 'MESH']
+mesh_objects  = [o for o in bpy.data.objects if o.type == 'MESH' and o.name != 'Mesh_0']
 
 # Identify body as the object with worst match to any centroid
 def best_centroid_dist(obj):
@@ -49,21 +88,28 @@ def best_centroid_dist(obj):
         if pos is not None
     )
 
-# Body is the object furthest from all centroids
-body_obj      = max(mesh_objects, key=best_centroid_dist)
-wheel_objects = [o for o in mesh_objects if o != body_obj]
+wheel_objects = sorted(mesh_objects, key=lambda o: o.name)
 
-
-print(f"\nWheel centroid verification:")
+print(f"\nWheel centroid verification (no override):")
 for wheel in wheel_objects:
     verts_np = np.array([wheel.matrix_world @ v.co for v in wheel.data.vertices])
     actual_center = verts_np.mean(axis=0)
-    print(f"  {wheel.name}: actual center = ({actual_center[0]:.3f}, {actual_center[1]:.3f}, {actual_center[2]:.3f})")
-
-print(f"\nAssigned Blender centroids:")
+    stored = blender_wheel_centroids.get(wheel.name)
+    
+    if stored is not None:
+        print(f"  {wheel.name}: using Taubin pivot {stored}, mesh mean was ({actual_center[0]:.3f},{actual_center[1]:.3f},{actual_center[2]:.3f})")
+        # DO NOT override — keep the precise Taubin centroid
+    else:
+        # Only fall back to mesh mean if no stored centroid exists
+        blender_wheel_centroids[wheel.name] = actual_center.tolist()
+        print(f"  {wheel.name}: no stored centroid, falling back to mesh mean")
+        
+print(f"\nAssigned Blender centroids (UPDATED):")
 for name, pos in blender_wheel_centroids.items():
     if pos:
-        print(f"  {name}: ({pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f})")
+        c = pos['centroid'] if isinstance(pos, dict) else pos
+        print(f"  {name}: ({c[0]:.3f}, {c[1]:.3f}, {c[2]:.3f})")
+        
 
 bpy.context.scene.frame_start = 1
 bpy.context.scene.frame_end   = 61
@@ -162,25 +208,19 @@ for i, wheel in enumerate(wheel_objects):
     far_verts = np.sum(distances > distances.mean() * 2)
     print(f"  Verts > 2x mean distance: {far_verts} ({far_verts/len(verts_np)*100:.1f}%)")
     
-    # Find BEST matching centroid by distance
-    best_name, best_dist = None, float('inf')
-    for name, pos in blender_wheel_centroids.items():
-        if pos is None:
-            continue
-        dist = np.linalg.norm(np.array(pos) - actual_center)
-        if dist < best_dist:
-            best_dist = dist
-            best_name = name
-
-    # Use stored centroid as pivot, fall back to vertex mean if not found
-    if best_name and blender_wheel_centroids.get(best_name):
-        pivot = blender_wheel_centroids[best_name]
-        print(f"  {wheel.name}: Using stored centroid '{best_name}' {np.array(pivot).round(3).tolist()}")
+    pivot = blender_wheel_centroids.get(wheel.name)
+    cx = 0.0
+    cy = 0.0
+    cz = 0.0
+    if pivot is not None:
+        cx, cy, cz = float(pivot[0]), float(pivot[1]), float(pivot[2])
     else:
-        pivot = actual_center.tolist()
-        print(f"  {wheel.name}: Using vertex mean (no stored centroid matched)")
+        cx = verts_np[:, lr_idx].mean()
+        cy = verts_np[:, fr_idx].mean()
+        cz = verts_np[:, h_idx].mean()
 
-    cx, cy, cz = float(pivot[0]), float(pivot[1]), float(pivot[2])
+
+    print(f"  {wheel.name}: hub center ({cx:.3f}, {cy:.3f}, {cz:.3f}) ")
    
     print(f"  {wheel.name}: Using {cx}, {cy}, {cz}")
     

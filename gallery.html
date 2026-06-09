@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>My Models</title>
+  <script type="module"
+    src="https://ajax.googleapis.com/ajax/libs/model-viewer/3.4.0/model-viewer.min.js">
+  </script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: sans-serif;
+      background: #111;
+      color: #fff;
+      padding: 10px;
+    }
+
+    /* ── Search bar ───────────────────────────────────────── */
+    #search-bar {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 10px;
+    }
+    #search-input {
+      flex: 1;
+      padding: 10px 14px;
+      border-radius: 10px;
+      border: none;
+      font-size: 16px;
+      background: #222;
+      color: #fff;
+      outline: none;
+    }
+    #search-input::placeholder { color: #555; }
+    #clear-btn {
+      padding: 10px 14px;
+      border-radius: 10px;
+      border: none;
+      background: #333;
+      color: #aaa;
+      font-size: 18px;
+      cursor: pointer;
+      line-height: 1;
+    }
+    #clear-btn:active { background: #444; }
+
+    /* ── Tag chips ────────────────────────────────────────── */
+    #tag-chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-bottom: 12px;
+      min-height: 0;
+    }
+    .chip {
+      padding: 5px 13px;
+      border-radius: 20px;
+      background: #2a2a2a;
+      color: #aaa;
+      font-size: 13px;
+      cursor: pointer;
+      border: 1px solid #444;
+      user-select: none;
+      transition: background 0.15s, color 0.15s;
+    }
+    .chip.active {
+      background: #1a73e8;
+      color: #fff;
+      border-color: #1a73e8;
+    }
+
+    /* ── Results count ────────────────────────────────────── */
+    #result-count {
+      font-size: 12px;
+      color: #555;
+      margin-bottom: 8px;
+    }
+
+    /* ── Model grid ───────────────────────────────────────── */
+    #grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 10px;
+    }
+
+    .card {
+      background: #1c1c1c;
+      border-radius: 12px;
+      overflow: hidden;
+      cursor: pointer;
+      border: 2px solid transparent;
+      transition: border-color 0.15s, transform 0.1s;
+      -webkit-tap-highlight-color: transparent;
+    }
+    .card:active {
+      border-color: #1a73e8;
+      transform: scale(0.97);
+    }
+
+    model-viewer {
+      width: 100%;
+      height: 150px;
+      background: #252525;
+      --poster-color: transparent;
+      pointer-events: none; /* taps go to card, not model-viewer orbit */
+    }
+
+    .card-footer {
+      padding: 7px 9px;
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+    }
+    .card-label {
+      font-size: 13px;
+      color: #ddd;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .card-tags {
+      font-size: 11px;
+      color: #555;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    /* ── Empty / loading states ───────────────────────────── */
+    .state-msg {
+      grid-column: span 2;
+      text-align: center;
+      padding: 48px 16px;
+      color: #444;
+      font-size: 15px;
+      line-height: 1.6;
+    }
+    .state-msg .icon { font-size: 36px; display: block; margin-bottom: 8px; }
+
+    /* ── Loading spinner ──────────────────────────────────── */
+    #loading {
+      display: flex;
+      justify-content: center;
+      padding: 48px;
+    }
+    .spinner {
+      width: 32px;
+      height: 32px;
+      border: 3px solid #333;
+      border-top-color: #1a73e8;
+      border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+
+  <div id="search-bar">
+    <input id="search-input" type="text" placeholder="Search models…" oninput="applyFilter()">
+    <button id="clear-btn" onclick="clearFilter()">✕</button>
+  </div>
+
+  <div id="tag-chips"></div>
+  <div id="result-count"></div>
+
+  <div id="loading"><div class="spinner"></div></div>
+  <div id="grid" style="display:none"></div>
+
+  <script>
+    // ── Config ─────────────────────────────────────────────────────────────
+    // user_id is passed as a query param by App Inventor:
+    //   WebViewer.HomeUrl = "http://server/gallery_page?user_id=" & userId
+    const params  = new URLSearchParams(window.location.search);
+    const USER_ID = params.get('user_id') || '';
+    const BASE    = window.location.origin;
+
+    // ── State ───────────────────────────────────────────────────────────────
+    let allModels = [];
+    let activeTag = null;
+
+    // ── Fetch data from server ──────────────────────────────────────────────
+    async function loadModels() {
+      try {
+        const res  = await fetch(`${BASE}/gallery_data?user_id=${encodeURIComponent(USER_ID)}`);
+        allModels  = await res.json();
+        buildTagChips();
+        applyFilter();
+      } catch (err) {
+        document.getElementById('loading').innerHTML =
+          '<div class="state-msg"><span class="icon">⚠️</span>Could not load models.<br>Check your connection.</div>';
+        return;
+      }
+      document.getElementById('loading').style.display = 'none';
+      document.getElementById('grid').style.display    = 'grid';
+    }
+
+    // ── Build tag chip row from all unique tags ─────────────────────────────
+    function buildTagChips() {
+      const allTags = [...new Set(allModels.flatMap(m => m.tags))].sort();
+      const el      = document.getElementById('tag-chips');
+      el.innerHTML  = '';
+      allTags.forEach(tag => {
+        const chip     = document.createElement('div');
+        chip.className = 'chip';
+        chip.textContent = tag;
+        chip.dataset.tag = tag;
+        chip.onclick   = () => toggleTag(tag);
+        el.appendChild(chip);
+      });
+    }
+
+    function toggleTag(tag) {
+      activeTag = (activeTag === tag) ? null : tag;
+      document.querySelectorAll('.chip').forEach(c => {
+        c.classList.toggle('active', c.dataset.tag === activeTag);
+      });
+      applyFilter();
+    }
+
+    function clearFilter() {
+      activeTag = null;
+      document.getElementById('search-input').value = '';
+      document.querySelectorAll('.chip').forEach(c => c.classList.remove('active'));
+      applyFilter();
+    }
+
+    // ── Filter and re-render ────────────────────────────────────────────────
+    function applyFilter() {
+      const text     = document.getElementById('search-input').value.toLowerCase().trim();
+      const filtered = allModels.filter(m => {
+        const matchTag    = !activeTag || m.tags.includes(activeTag);
+        const matchSearch = !text
+          || m.label.toLowerCase().includes(text)
+          || m.tags.some(t => t.includes(text));
+        return matchTag && matchSearch;
+      });
+      renderGrid(filtered);
+    }
+
+    // ── Render grid ─────────────────────────────────────────────────────────
+    function renderGrid(models) {
+      const grid    = document.getElementById('grid');
+      const countEl = document.getElementById('result-count');
+      grid.innerHTML = '';
+
+      countEl.textContent = models.length === allModels.length
+        ? `${models.length} model${models.length !== 1 ? 's' : ''}`
+        : `${models.length} of ${allModels.length} models`;
+
+      if (models.length === 0) {
+        grid.innerHTML = `<div class="state-msg">
+          <span class="icon">🔍</span>
+          No models match "${document.getElementById('search-input').value || activeTag}"
+        </div>`;
+        return;
+      }
+
+      if (allModels.length === 0) {
+        grid.innerHTML = `<div class="state-msg">
+          <span class="icon">📦</span>
+          No models yet.<br>Create your first one!
+        </div>`;
+        return;
+      }
+
+      models.forEach(m => {
+        const card       = document.createElement('div');
+        card.className   = 'card';
+        card.innerHTML   = `
+        <!-- AFTER -->
+        <model-viewer
+          src="${m.rigged_path || m.active_path}"
+          auto-rotate
+          rotation-per-second="30deg"
+          shadow-intensity="0.8"
+          exposure="0.9"
+          animation-name="">
+        </model-viewer>
+          <div class="card-footer">
+            <div class="card-label">${m.label}</div>
+            <div class="card-tags">${m.tags.join(' · ')}</div>
+          </div>
+        `;
+
+        // Send selected URL back to App Inventor
+        card.onclick = () => {
+          try {
+            // Works in MIT App Inventor WebViewer component
+            window.AppInventor.setWebViewString(m.url);
+          } catch (e) {
+            // Fallback for testing in a regular browser
+            console.log('Selected:', m.url);
+          }
+        };
+        
+        const mv = card.querySelector('model-viewer');
+
+        card.addEventListener('mouseenter', () => {
+          mv.play({ repetitions: Infinity });
+        });
+        card.addEventListener('mouseleave', () => {
+          mv.pause();
+          mv.currentTime = 0;
+        });
+
+        grid.appendChild(card);
+      });
+    }
+
+    // ── Init ────────────────────────────────────────────────────────────────
+    loadModels();
+  </script>
+</body>
+</html>

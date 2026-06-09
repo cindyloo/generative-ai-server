@@ -1,15 +1,11 @@
 import os
 import sys
 import json
-import struct
 import numpy as np
 import trimesh
 from PIL import Image
-import logging
 
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger('Filtering verts and centroids...')
-
+# ── 1. Pipeline Arguments ─────────────────────────────────────────────────────
 glb_path        = sys.argv[1]
 classify_json   = sys.argv[2]
 tire_verts_path = sys.argv[3]
@@ -19,192 +15,209 @@ with open(classify_json) as f:
     classify_data = json.load(f)
 
 joint_hints = classify_data.get('joint_hints', [])
-wheel_hints = [h for h in joint_hints if h.get('body_part') in ['wheel', 'gear']]
+wheel_hints = [h for h in joint_hints if h.get('body_part') in ['wheel', 'gear', 'chainring']]
 
-mesh   = trimesh.load(glb_path, force='mesh')
-verts  = np.array(mesh.vertices)
-bmin   = verts.min(axis=0)
-bmax   = verts.max(axis=0)
-brange = bmax - bmin
-brange[brange == 0] = 1.0
-n_verts = len(verts)
-
-print(f"Mesh bounds: X {bmin[0]:.3f}..{bmax[0]:.3f}, "
-      f"Y {bmin[1]:.3f}..{bmax[1]:.3f}, Z {bmin[2]:.3f}..{bmax[2]:.3f}")
-
-# ── Axis assignment ───────────────────────────────────────────────────────────
-# Vehicles (side view): fixed by Meshy convention
-#   mesh X = front-to-rear, mesh Y = height, mesh Z = left-right/depth
-# Mechanical (front view): detect from geometry
-is_vehicle = any(h.get('body_part') == 'wheel' for h in wheel_hints)
-
-if is_vehicle:
-    wide_axis = 0   # mesh X = front-to-rear
-    tall_axis = 1   # mesh Y = height
-    thin_axis = 2   # mesh Z = left-right/depth
-    print(f"Axis assignment: vehicle (fixed) wide=0 tall=1 thin=2")
+scene = trimesh.load(glb_path)
+if isinstance(scene, trimesh.Scene):
+    mesh = scene.to_geometry()
 else:
-    thin_axis = int(np.argmin(brange))
-    remaining = sorted([i for i in range(3) if i != thin_axis],
-                       key=lambda i: brange[i], reverse=True)
-    wide_axis = remaining[0]
-    tall_axis = remaining[1]
-    print(f"Axis detection: mechanical thin={thin_axis} wide={wide_axis} tall={tall_axis}")
+    mesh = scene
 
-print(f"  ranges: thin={brange[thin_axis]:.3f} wide={brange[wide_axis]:.3f} tall={brange[tall_axis]:.3f}")
+verts = np.array(mesh.vertices)
+n_verts = len(verts)
+print(f"Loaded mesh with {n_verts} vertices.")
 
-is_two_wheel = len([h for h in wheel_hints if h.get('body_part') == 'wheel']) == 2
+# ── 2. Native Color Profile Mapping ───────────────────────────────────────────
+wheel_colors_data = classify_data.get('wheel_colors_rgb', [])
+body_colors_data = classify_data.get('body_colors_rgb', [])
+has_texture = os.path.exists(texture_path) and hasattr(mesh.visual, 'uv') and mesh.visual.uv is not None
 
-# ══════════════════════════════════════════════════════════════════════════════
-# OPTIONAL COLOR FILTER
-# Uses wheel_colors_rgb from classify JSON (merged from joints data).
-# Skipped gracefully if not available.
-# ══════════════════════════════════════════════════════════════════════════════
-candidate_mask  = np.ones(n_verts, dtype=bool)
-color_filter_on = False
+if has_texture and wheel_colors_data:
+    try:
+        uvs = mesh.visual.uv
+        img = Image.open(texture_path).convert('RGB')
+        iw, ih = img.size
+        img_arr = np.array(img)
 
-print(f"\n[Filters]  total verts: {n_verts}")
+        px_u = (uvs[:, 0] * iw).astype(int) % iw
+        px_v = ((1.0 - uvs[:, 1]) * ih).astype(int) % ih
+        vert_colors = img_arr[px_v, px_u]
 
-try:
-    wheel_colors_data = classify_data.get('wheel_colors_rgb', [])
-    if wheel_colors_data and os.path.exists(texture_path):
-        with open(glb_path, 'rb') as f:
-            f.read(12)
-            json_len = struct.unpack('<I', f.read(4))[0]; f.read(4)
-            j        = json.loads(f.read(json_len))
-            bin_len  = struct.unpack('<I', f.read(4))[0]; f.read(4)
-            binary   = f.read(bin_len)
-
-        def read_accessor(acc_idx):
-            acc   = j['accessors'][acc_idx]
-            bv    = j['bufferViews'][acc['bufferView']]
-            start = bv.get('byteOffset', 0) + acc.get('byteOffset', 0)
-            count = acc['count']
-            nc    = {'SCALAR':1,'VEC2':2,'VEC3':3,'VEC4':4}[acc['type']]
-            fmt   = {5126:'f', 5123:'H', 5125:'I'}[acc['componentType']]
-            data  = struct.unpack_from(f'<{count*nc}{fmt}', binary, start)
-            return np.array(data).reshape(count, nc) if nc > 1 else np.array(data)
-
-        prim   = j['meshes'][0]['primitives'][0]
-        uv_idx = prim['attributes'].get('TEXCOORD_0')
-
-        if uv_idx is not None:
-            uvs     = read_accessor(uv_idx)
-            img_arr = np.array(Image.open(texture_path).convert('RGB'))
-            ih, iw  = img_arr.shape[:2]
-            px_u    = (uvs[:, 0] * iw).astype(int) % iw
-            px_v    = ((1.0 - uvs[:, 1]) * ih).astype(int) % ih  # flip V: GLB v=0=bottom, image y=0=top
-            vert_colors = img_arr[px_v, px_u]
-
-            if isinstance(wheel_colors_data[0], dict):
-                # dict format: {color: [r,g,b]} where values are 0-1 floats
-                wheel_colors = np.array([[int(c['color'][i]*255) for i in range(3)]
-                                          for c in wheel_colors_data])
-            elif isinstance(wheel_colors_data[0][0], float) and max(wheel_colors_data[0]) <= 1.0:
-                # list of [r,g,b] floats 0-1
-                wheel_colors = np.array([[int(c[i]*255) for i in range(3)]
-                                          for c in wheel_colors_data])
+        # Normalize wheel color arrays
+        if isinstance(wheel_colors_data, dict):
+            wheel_colors = np.array([[int(c['color'][i]*255) for i in range(3)] for c in wheel_colors_data])
+        elif isinstance(wheel_colors_data, (list, np.ndarray)):
+            if len(wheel_colors_data) > 0 and max(np.array(wheel_colors_data).flatten()) <= 1.0:
+                wheel_colors = np.array([[int(c[i]*255) for i in range(3)] for c in wheel_colors_data])
             else:
-                # list of [r,g,b] integers 0-255 — use directly
                 wheel_colors = np.array(wheel_colors_data, dtype=int)
-
-            # Debug: sample actual texture colors
-            sample_idx = np.random.choice(len(vert_colors), min(20, len(vert_colors)), replace=False)
-            print(f"  Sample vert colors (random): {vert_colors[sample_idx].tolist()}")
-            print(f"  Looking for wheel colors: {wheel_colors.tolist()}")
-            print(f"  UV range: u={uvs[:,0].min():.3f}..{uvs[:,0].max():.3f} v={uvs[:,1].min():.3f}..{uvs[:,1].max():.3f}")
-            print(f"  Texture size: {iw}x{ih}")
-
-            color_mask = np.zeros(n_verts, dtype=bool)
-            for wc in wheel_colors:
-                dists      = np.sqrt(np.sum((vert_colors.astype(int) - wc)**2, axis=1))
-                color_mask |= (dists < 80)
-
-            if color_mask.sum() > 100:
-                candidate_mask  = color_mask
-                color_filter_on = True
-                log.info(f"\nMesh bounds:")
-                print(f"  Color filter: {color_mask.sum()} verts "
-                      f"({color_mask.sum()/n_verts*100:.1f}%) "
-                      f"← colors: {wheel_colors.tolist()}")
+        
+        # Normalize body color arrays for reference
+        if body_colors_data:
+            if max(np.array(body_colors_data).flatten()) <= 1.0:
+                body_colors = np.array([[int(c[i]*255) for i in range(3)] for c in body_colors_data])
             else:
-                print(f"  Color filter too aggressive ({color_mask.sum()} verts) — skipped")
-        else:
-            print(f"  Color filter: skipped (no UVs)")
-    else:
-        reason = "no wheel_colors_rgb" if not wheel_colors_data else "texture not found"
-        print(f"  Color filter: skipped ({reason})")
-except Exception as e:
-    print(f"  Color filter: failed ({e}) — using all verts")
+                body_colors = np.array(body_colors_data, dtype=int)
+    except Exception as e:
+        has_texture = False
+        print(f"Texture extraction failed: {e}. Falling back to clean geometry math.")
 
-# ══════════════════════════════════════════════════════════════════════════════
-# FIND CENTROIDS
-# ══════════════════════════════════════════════════════════════════════════════
-centroids = {}
+# ── 3. High-Precision Mathematical Math Processing ────────────────────────────
+output_centroids = {}
 
 for hint in wheel_hints:
-    name  = hint['name']
-    p     = hint.get('position_normalized', {})
-    norm_x = np.clip(p.get('x', 0.5), 0.0, 1.0)
-    norm_y = np.clip(p.get('y', 0.5), 0.0, 1.0)
-    norm_z = np.clip(p.get('z', 0.5), 0.0, 1.0)
+    name = hint['name']
+    p = hint.get('position_normalized', {})
+    bmin, bmax = verts.min(axis=0), verts.max(axis=0)
+    brange = bmax - bmin
+    
+    hint_center = bmin + np.array([p.get('x', 0.5), 1.0 - p.get('y', 0.5), p.get('z', 0.5)]) * brange
+    hint_dists = np.linalg.norm(verts - hint_center, axis=1)
+    spatial_threshold = np.max(brange) * 0.25
+    
+    # Generate the local base color mask if texture space is valid
+    local_color_mask = np.ones(n_verts, dtype=bool)
+    if has_texture:
+        # Step A: Find matching wheel color vertices
+        match_mask = np.zeros(n_verts, dtype=bool)
+        for wc in wheel_colors:
+            dists = np.linalg.norm(vert_colors - wc, axis=1)
+            match_mask |= (dists < 60)
+            
+        # Step B: Apply body exclusion ONLY for thin bike chainrings, NEVER for wheels or gears
+        if "chainring" in name and body_colors_data:
+            for bc in body_colors:
+                body_dists = np.linalg.norm(vert_colors - bc, axis=1)
+                match_mask &= (body_dists >= 80)
+        
+        if match_mask.sum() > 50:
+            local_color_mask = match_mask
 
-    # Claude uses y=0=top, mesh uses y=0=bottom — invert
-    norm_y_mesh = np.clip(1.0 - p.get('y', 0.5), 0.0, 1.0)
+    # Combine spatial proximity with our local color mask
+    local_mask = local_color_mask & (hint_dists < spatial_threshold)
+    component_verts = verts[local_mask]
+    
+    if len(component_verts) < 10:
+        # Final fallback: if color matching stripped everything, fall back to loose geometry profile
+        component_verts = verts[hint_dists < spatial_threshold]
+        if len(component_verts) < 10:
+            continue
 
-    center = np.zeros(3)
-    if is_two_wheel and hint.get('body_part') == 'wheel':
-        # Bike: front/rear position is in x, left/right forced to center
-        center[wide_axis] = bmin[wide_axis] + norm_x * brange[wide_axis]
-        center[thin_axis] = (bmin[thin_axis] + bmax[thin_axis]) / 2.0
-    else:
-        # Car (4-wheel): Claude x = left/right → thin_axis (mesh Z)
-        #                Claude z = front/rear  → wide_axis (mesh X)
-        center[wide_axis] = bmin[wide_axis] + norm_z * brange[wide_axis]
-        center[thin_axis] = bmin[thin_axis] + norm_x * brange[thin_axis]
-    center[tall_axis] = bmin[tall_axis] + norm_y_mesh * brange[tall_axis]
+    # Adaptive density clustering rules
+    if "chainring" in name:
+        local_med = np.median(component_verts, axis=0)
+        local_dists = np.linalg.norm(component_verts - local_med, axis=1)
+        component_verts = component_verts[local_dists < np.percentile(local_dists, 60)]
+    elif "wheel" in name or "gear" in name:
+        local_med = np.median(component_verts, axis=0)
+        local_dists = np.linalg.norm(component_verts - local_med, axis=1)
+        component_verts = component_verts[local_dists < np.percentile(local_dists, 99)] # Keep full thickness
 
-    r_norm = hint.get('wheel_radius_normalized', 0.12)
-    radius = r_norm * brange[tall_axis]   # use r_norm directly, no multiplier
-    dists  = np.linalg.norm(verts - center, axis=1)
+    # Run PCA Normal Vector Extraction
+       # Run PCA Normal Vector Extraction
+    mean = np.mean(component_verts, axis=0)
+    centered = component_verts - mean
+    cov = np.cov(centered.T)
+    eigenvalues, eigenvectors = np.linalg.eigh(cov)
+    
+    rotation_axis = eigenvectors[:, np.argmin(eigenvalues)]
+    u_axis = eigenvectors[:, np.argmax(eigenvalues)]
+    v_axis = np.cross(rotation_axis, u_axis)
 
-    # Apply color filter to sphere
-    in_sphere = np.where(dists <= radius)[0]
-    if color_filter_on:
-        filtered = in_sphere[candidate_mask[in_sphere]]
-        pct = len(filtered) / len(in_sphere) * 100 if len(in_sphere) > 0 else 0
-        print(f"\n[{name}] sphere={len(in_sphere)} → color filter={len(filtered)} ({pct:.1f}% kept)")
-        if len(filtered) > 20:
-            nearby = verts[filtered]
-            dists_filtered = dists[filtered]
-        else:
-            print(f"  Color filter too aggressive — using full sphere")
-            nearby = verts[in_sphere]
-            dists_filtered = dists[in_sphere]
-    else:
-        nearby = verts[in_sphere]
-        dists_filtered = dists[in_sphere]
-        print(f"\n[{name}] sphere={len(in_sphere)} verts")
+    # ── NEW FILTER: Axial Thickness Cut (Removes Undercarriage/Axle Bleed) ──
+    # Project vertices along the rotation axis line to measure their lateral depth
+    depths = np.dot(centered, rotation_axis)
+    
+    # Calculate the thickness spread (standard deviation of depth)
+    depth_std = np.std(depths)
+    
+    # If the selection bleeds too deep along the axis (common with matching chassis/axles),
+    # slice it off at 2.0 standard deviations from the wheel center plane.
+    # This keeps the full tire thickness but cuts off the undercarriage extending inward.
+    if "wheel" in name or "gear" in name:
+        axial_mask = np.abs(depths) < (depth_std * 2.0)
+        component_verts = component_verts[axial_mask]
+        
+        # Re-center data after trimming the stray undercarriage parts
+        mean = np.mean(component_verts, axis=0)
+        centered = component_verts - mean
+    # ─────────────────────────────────────────────────────────────────────────
 
-    if len(nearby) == 0:
-        print(f"  ERROR: no vertices found, using seed position")
-        centroids[name] = {'centroid': center.tolist(), 'radius': float(radius)}
-        continue
+    pts_2d = np.column_stack((np.dot(centered, u_axis), np.dot(centered, v_axis)))
 
-    centroid = nearby.mean(axis=0)
-    print(f"  '{name}': {len(nearby)} verts, centroid={centroid.round(3).tolist()}, radius={radius:.3f}")
+    # Taubin Circle Fitting Loop
+    # ── 4. Precise Pivot & Exact Radial Boundary Calculation ──────────────────
+    try:
+        X = pts_2d[:, 0]
+        Y = pts_2d[:, 1]
+        Z = X**2 + Y**2
+        M_z = np.column_stack((Z, X, Y, np.ones(len(X))))
+        M = np.dot(M_z.T, M_z) / len(X)
+        
+        w, v = np.linalg.eig(M)
+        imin = np.argmin(np.abs(w))
+        A, B, C, D = v[:, imin]
+        
+        center_2d_u = -B / (2 * A)
+        center_2d_v = -C / (2 * A)
+        
+        # Calculate the high-precision mathematical pivot center
+        precise_pivot = mean + (center_2d_u * u_axis) + (center_2d_v * v_axis)
 
-    centroids[name] = {
-        'centroid': centroid.tolist(),
-        'radius':   float(radius),
+        # ── Cylindrical re-filter using component_verts (not full verts) ──────────
+        # All arrays must be scoped to component_verts to avoid size mismatch
+        relative_positions = component_verts - precise_pivot                          # (N_component, 3)
+        axial_depths = np.dot(relative_positions, rotation_axis)                      # (N_component,)
+        radial_vecs = relative_positions - np.outer(axial_depths, rotation_axis)      # (N_component, 3)
+        radial_dists = np.linalg.norm(radial_vecs, axis=1)                            # (N_component,)
+
+        # Use 99th percentile of component verts as the true radius
+        calculated_radius = float(np.percentile(radial_dists, 99))
+
+        # Re-filter component_verts to the tight cylinder
+        if "wheel" in name or "gear" in name:
+            tight_mask = (
+                (radial_dists <= calculated_radius * 1.05) &
+                (np.abs(axial_depths) <= calculated_radius * 0.6)
+            )
+            component_verts = component_verts[tight_mask]
+
+            # Recompute final radius from the cleaned verts
+            relative_positions = component_verts - precise_pivot
+            axial_depths = np.dot(relative_positions, rotation_axis)
+            radial_dists = np.linalg.norm(
+                relative_positions - np.outer(axial_depths, rotation_axis), axis=1
+            )
+            calculated_radius = float(np.percentile(radial_dists, 99))        # Hard limits to prevent runaway math on specific components
+        elif "chainring" in name:
+            calculated_radius = min(calculated_radius, np.max(brange) * 0.08)
+        
+            
+    except Exception as e:
+        print(f"Mathematical fit failed for {name} ({e}), using absolute fallbacks.")
+        precise_pivot = mean
+        calculated_radius = 0.25 if "wheel" in name else 0.05
+
+
+    precise_pivot_list = [float(x) for x in precise_pivot]
+    rotation_axis_list = [float(x) for x in rotation_axis]
+    
+    output_centroids[name] = {
+        'centroid': precise_pivot_list,
+        'radius': float(calculated_radius),
+        'name': name,
+        'axis': rotation_axis_list
     }
 
+# ── 4. Pipeline Export Handshakes ─────────────────────────────────────────────
+classify_data['wheel_centroids'] = output_centroids
+with open(classify_json, 'w') as f:
+    json.dump(classify_data, f, indent=4)
 
-with open(tire_verts_path, 'w') as f:
-    json.dump({'wheel_hints': wheel_hints}, f, indent=2)
-
-centroids_path = tire_verts_path.replace('.json', '_centroids.json')
+# Build standard and alternative centroid text paths explicitly
+centroids_path = tire_verts_path.replace('.json', '_centroids.json') if tire_verts_path.endswith('.json') else os.path.splitext(tire_verts_path)[0] + '_centroids.json'
 with open(centroids_path, 'w') as f:
-    json.dump(centroids, f, indent=2)
+    json.dump(output_centroids, f, indent=4)
 
-print(f"\nCentroids written: {centroids_path}")
+print(f"INFO:seg_server:High-Precision Centroids Exported to {centroids_path}")
+print(f"INFO:seg_server:Wheel centroids injected from find_tire_verts: {json.dumps(output_centroids)}")
