@@ -414,15 +414,16 @@ for obj in all_meshes:
         cx     = float(wx_all.mean())
         cy     = 0.0; cz = 0.0; half_thick = 0; radius = 0.4
 
-    # Use Taubin axis for slicing — works regardless of car orientation.
-    # Keep verts within ±half_thick along the thin axis and ±radius radially.
-    axis_raw = centroid_data.get('axis', [1, 0, 0]) if centroid_data else [1, 0, 0]
+    # Slice on thin axis only (Y for a car facing left in Blender).
+    # Uses Taubin axis so it works regardless of car orientation in the GLB.
+    # Only removes verts outside ±half_thick along the axle direction.
+    # Voronoi already handled radial assignment so no radial cut needed here.
+    axis_raw = centroid_data.get('axis', [0, 1, 0]) if centroid_data else [0, 1, 0]
     import mathutils
-    thin_axis = mathutils.Vector(axis_raw).normalized()
+    thin_axis   = mathutils.Vector(axis_raw).normalized()
     centroid_pt = mathutils.Vector([cx, cy, cz])
-    axial_margin  = (half_thick * 1.1) if half_thick > 0 else (radius * 0.3)
-    radial_margin = radius * 1.1
-    print(f"  {obj.name}: axial-slice ±{axial_margin:.3f} radial ±{radial_margin:.3f} (axis {[round(float(x),3) for x in thin_axis]})")
+    axial_margin = (half_thick * 1.1) if half_thick > 0 else (radius * 0.3)
+    print(f"  {obj.name}: thin-axis slice ±{axial_margin:.3f} (axis {[round(float(x),3) for x in thin_axis]})")
 
     bpy.context.view_layer.objects.active = obj
     obj.select_set(True)
@@ -430,12 +431,26 @@ for obj in all_meshes:
     bpy.ops.mesh.select_all(action='DESELECT')
     bpy.ops.object.mode_set(mode='OBJECT')
 
+    # Cut inward chassis verts using world X.
+    # Compute the inner face X from the wheel's own vert distribution:
+    # the 98th/2nd percentile on the inward side gives the inner tyre face.
+    wx_all = np.array([float((obj.matrix_world @ v.co).x) for v in obj.data.vertices])
+    if cx < 0:
+        # left wheel: inner face = most-positive X (closest to chassis)
+        x_inner = float(np.percentile(wx_all, 95))   # 85th pct = inner face
+    else:
+        # right wheel: inner face = most-negative X (closest to chassis)
+        x_inner = float(np.percentile(wx_all, 05))
+
+    print(f"  {obj.name}: X inner face at {x_inner:.3f} (cx={cx:.3f})")
+
     for v in obj.data.vertices:
-        co      = obj.matrix_world @ v.co
-        rel     = co - centroid_pt
-        axial   = rel.dot(thin_axis)
-        radial  = (rel - axial * thin_axis).length
-        v.select = bool(abs(axial) > axial_margin or radial > radial_margin)
+        co = obj.matrix_world @ v.co
+        wx = float(co.x)
+        if cx < 0:
+            v.select = bool(wx > x_inner)
+        else:
+            v.select = bool(wx < x_inner)
 
     bpy.ops.object.mode_set(mode='EDIT')
     bpy.ops.mesh.delete(type='VERT')
