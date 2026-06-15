@@ -115,278 +115,11 @@ _rig_tasks    = {}
 _mesh_tasks   = {}
 _blender_lock = threading.Lock()
 
-
-
 # ── rembg ──────────────────────────────────────────────────────────────────────
 
 log.info("Loading rembg model...")
 rembg_session = new_session("u2net")
 log.info("rembg ready.")
-
-
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SAM2 segmentation
-# ══════════════════════════════════════════════════════════════════════════════
-
-_sam2_predictor = None
-
-def _get_sam2():
-    global _sam2_predictor
-    if _sam2_predictor is None:
-        import torch
-        from sam2.build_sam import build_sam2
-        from sam2.sam2_image_predictor import SAM2ImagePredictor
-        import sam2 as sam2_pkg
-        sam2_dir        = os.path.dirname(sam2_pkg.__file__)
-        sam2_config     = os.environ.get('SAM2_CONFIG',
-            os.path.join(sam2_dir, 'configs/sam2.1/sam2.1_hiera_s.yaml'))
-        sam2_checkpoint = os.environ.get('SAM2_CHECKPOINT',
-            'checkpoints/sam2.1_hiera_small.pt')
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        model           = build_sam2(sam2_config, sam2_checkpoint, device=device)
-        _sam2_predictor = SAM2ImagePredictor(model)
-        log.info(f"SAM2 ready ({device}).")
-    return _sam2_predictor
-
-
-def segment_parts_with_sam2(img_path: str, joint_hints: list,
-                             classify_id: str, results_dir: str) -> dict:
-    """
-    Generate per-part SAM2 masks using Hough Circle detection to find the
-    true center/radius, then build anatomically-correct prompt points.
-
-    Saves masks to results_dir/<classify_id>_mask_<name>.png
-    Saves wheel_centers.json to results_dir/<classify_id>_masks/
-
-    Returns { hint_name: absolute_mask_path }
-    """
-    import torch
-    import cv2
-    from PIL import Image as PILImage, ImageDraw
-    print("loading sam2")
-    predictor = _get_sam2()
-
-    img         = PILImage.open(img_path).convert('RGB')
-    img_w, img_h = img.size
-    img_rgba    = np.array(PILImage.open(img_path).convert('RGBA'))
-    alpha       = img_rgba[:, :, 3]
-
-    rows = np.where(alpha.max(axis=1) > 0)[0]
-    cols = np.where(alpha.max(axis=0) > 0)[0]
-
-    obj_top    = int(rows.min())
-    obj_bottom = int(rows.max())
-    obj_left   = int(cols.min())
-    obj_right  = int(cols.max())
-    obj_h      = obj_bottom - obj_top
-    obj_w      = obj_right  - obj_left
-
-    log.info(f"Object bounds from alpha: "
-             f"top={obj_top} bottom={obj_bottom} "
-             f"left={obj_left} right={obj_right} "
-             f"obj_h={obj_h} obj_w={obj_w} "
-             f"img_h={img_h} img_w={img_w}")
-
-    img_np = np.array(img)
-    predictor.set_image(img_np)
-
-    wheel_hints = [h for h in joint_hints
-                   if h.get('body_part') in ('wheel', 'gear', 'hinge')]
-
-    mask_paths = {}
-    centers    = {}
-
-    centers['_image_bounds'] = {
-        'obj_top':    obj_top,
-        'obj_bottom': obj_bottom,
-        'obj_left':   obj_left,
-        'obj_right':  obj_right,
-        'img_w':      img_w,
-        'img_h':      img_h,
-    }
-
-    for hint in wheel_hints:
-        name      = hint['name']
-        p         = hint.get('position_normalized', {})
-        r_norm    = hint.get('wheel_radius_normalized', 0.15)
-        body_part = hint.get('body_part', 'wheel')
-        is_gear   = (body_part == 'gear')
-
-        # ── Step 1: rough bbox from normalized position ───────────────────────
-        r_px = r_norm * img_h   # not max(img_w, img_h)
-        pad  = 0.05 * img_h
-
-
-        cx_rough = p.get('x', 0.5) * img_w
-        cy_rough = (1.0 - p.get('y', 0.5)) * img_h
-
-        x1 = max(0,     int(cx_rough - r_px - pad))
-        y1 = max(0,     int(cy_rough - r_px - pad))
-        x2 = min(img_w, int(cx_rough + r_px + pad))
-        y2 = min(img_h, int(cy_rough + r_px + pad))
-
-        log.info(f"SAM2 [{name}] rough bbox=({x1},{y1},{x2},{y2}) "
-                 f"rough_center=({cx_rough:.0f},{cy_rough:.0f})")
-
-        # ── Step 2: Hough circle inside bbox ─────────────────────────────────
-        crop    = img_np[y1:y2, x1:x2]
-        gray    = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
-        blurred = cv2.GaussianBlur(gray, (9, 9), 2)
-
-        box_w, box_h = x2 - x1, y2 - y1
-        min_r    = int(min(box_w, box_h) * 0.28)
-        max_r    = int(min(box_w, box_h) * 0.62)
-        min_dist = 1 if is_gear else min(box_w, box_h)
-
-        circles = cv2.HoughCircles(
-            blurred, cv2.HOUGH_GRADIENT,
-            dp=1.2, minDist=min_dist,
-            param1=80, param2=35,
-            minRadius=min_r, maxRadius=max_r,
-        )
-        if circles is None:
-            circles = cv2.HoughCircles(
-                blurred, cv2.HOUGH_GRADIENT,
-                dp=1.5, minDist=min(box_w, box_h),
-                param1=60, param2=25,
-                minRadius=int(min_r * 0.7), maxRadius=int(max_r * 1.2),
-            )
-
-        if circles is not None:
-            bcx, bcy = box_w / 2, box_h / 2
-            best     = min(circles[0],
-                           key=lambda c: np.hypot(c[0] - bcx, c[1] - bcy))
-
-            # Validate: reject if Hough result is too far from hint (gear only)
-            cx_det = int(x1 + best[0])
-            cy_det = int(y1 + best[1])
-            if is_gear:
-                dist_from_hint = np.hypot(cx_det - cx_rough, cy_det - cy_rough)
-                if dist_from_hint > r_px * 2.0:
-                    log.warning(f"SAM2 [{name}] Hough result ({cx_det},{cy_det}) "
-                                f"is {dist_from_hint:.0f}px from hint — rejecting")
-                    cx = int(cx_rough); cy = int(cy_rough)
-                    radius = int(r_px * 0.9)
-                else:
-                    cx, cy, radius = cx_det, cy_det, int(best[2])
-            else:
-                cx, cy, radius = cx_det, cy_det, int(best[2])
-            log.info(f"SAM2 [{name}] Hough circle: center=({cx},{cy}) radius={radius}")
-        else:
-            cx     = int(cx_rough)
-            cy     = int(cy_rough)
-            radius = int(r_px * 0.9)
-            log.warning(f"SAM2 [{name}] Hough failed — using rough center ({cx},{cy}) r={radius}")
-
-        # ── Step 3: anatomical prompt points ─────────────────────────────────
-        def clamp_pt(x, y):
-            return (int(np.clip(x, 0, img_w - 1)),
-                    int(np.clip(y, 0, img_h - 1)))
-
-        point_list = [clamp_pt(cx, cy)]
-        label_list = [1]
-
-        for deg in (0, 90, 180, 270):
-            rad = np.radians(deg)
-            point_list.append(clamp_pt(cx + radius * 0.90 * np.cos(rad),
-                                       cy + radius * 0.90 * np.sin(rad)))
-            label_list.append(1)
-
-        for deg in (45, 135, 225, 315):
-            rad = np.radians(deg)
-            point_list.append(clamp_pt(cx + radius * 0.72 * np.cos(rad),
-                                       cy + radius * 0.72 * np.sin(rad)))
-            label_list.append(1)
-
-        point_list.append(clamp_pt(cx + radius * 1.25, cy))
-        label_list.append(0)
-
-        point_coords = np.array(point_list)
-        point_labels = np.array(label_list)
-
-        margin = int(radius * 0.15)
-        box = np.array([
-            max(0,     cx - radius - margin),
-            max(0,     cy - radius - margin),
-            min(img_w, cx + radius + margin),
-            min(img_h, cy + radius + margin),
-        ])
-
-        # ── Step 4: SAM2 predict ──────────────────────────────────────────────
-        with torch.inference_mode():
-            masks, scores, _ = predictor.predict(
-                point_coords=point_coords,
-                point_labels=point_labels,
-                box=box,
-                multimask_output=True,
-            )
-
-        best_idx  = int(np.argmax(scores))
-        best_mask = masks[best_idx].astype(bool)
-
-        ys, xs  = np.where(best_mask)
-        mask_cx = int(xs.mean()) if len(xs) > 0 else cx
-        mask_cy = int(ys.mean()) if len(ys) > 0 else cy
-
-        centers[name] = {
-            'hough_cx': cx,
-            'hough_cy': cy,
-            'hough_r':  radius,
-            'mask_cx':  mask_cx,
-            'mask_cy':  mask_cy,
-            'img_w':    img_w,
-            'img_h':    img_h,
-            'norm_cx':  mask_cx / img_w,
-            'norm_cy':  mask_cy / img_h,
-            'norm_r':   radius / max(img_w, img_h),
-        }
-        log.info(f"SAM2 [{name}] score={scores[best_idx]:.3f} "
-                 f"pixels={best_mask.sum()} "
-                 f"points={len(point_coords)} "
-                 f"box={box.tolist()}")
-
-        # ── Step 5: save mask ─────────────────────────────────────────────────
-        mask_path = os.path.join(results_dir, f"{classify_id}_mask_{name}.png")
-        PILImage.fromarray((best_mask * 255).astype(np.uint8)).save(mask_path)
-        mask_paths[name] = mask_path
-
-        # ── Debug overlay ─────────────────────────────────────────────────────
-        debug_img = PILImage.fromarray(img_np.copy())
-        draw      = ImageDraw.Draw(debug_img)
-
-        mask_rgba = np.zeros((*best_mask.shape, 4), dtype=np.uint8)
-        mask_rgba[best_mask, 1] = 180
-        mask_rgba[best_mask, 3] = 80
-        overlay = PILImage.fromarray(mask_rgba, 'RGBA')
-        debug_img.paste(overlay, mask=overlay)
-
-        draw.ellipse([cx - radius, cy - radius, cx + radius, cy + radius],
-                     outline='cyan', width=2)
-        draw.rectangle([x1, y1, x2, y2], outline='red', width=2)
-
-        for (px_c, py_c), lbl in zip(point_list, label_list):
-            color = 'yellow' if lbl == 1 else 'red'
-            r_dot = 7
-            draw.ellipse([px_c - r_dot, py_c - r_dot,
-                          px_c + r_dot, py_c + r_dot],
-                         fill=color, outline='white', width=1)
-
-        debug_path = os.path.join(results_dir,
-                                  f"{classify_id}_sam2_debug_{name}.png")
-        debug_img.save(debug_path)
-        log.info(f"SAM2 debug image → {debug_path}")
-
-    # Save wheel_centers.json into mask_dir
-
-    mask_dir = os.path.abspath(os.path.join(RESULTS_DIR, f"{classify_id}_masks"))
-    centers_path = os.path.join(mask_dir, 'wheel_centers.json')
-    os.makedirs(mask_dir, exist_ok=True)
-    with open(centers_path, 'w') as f:
-        json.dump(centers, f, indent=2)
-
-    return mask_paths
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -563,15 +296,14 @@ def classify_with_vision(img_bytes: bytes, mime_type: str,
     img_bytes = buf.getvalue()
 
     mime_type = utils.detect_mime_type(img_bytes)
-    tag_words = set(re.split(r'[ +]', (user_tag or '').lower()))
+    tag_words = set((user_tag or '').lower().split('+'))
     tag_ctx   = f'\nThe user identified this as: "{user_tag}".' if user_tag else ''
 
     prompt = (
-        f"This is a vehicle {user_tag}.\n\n" + utils._build_vehicle_classify_prompt(tag_ctx)
-        if tag_words & utils.VEHICLE_KEYWORDS or tag_words & utils.MECHANICAL_KEYWORDS
+        utils._build_vehicle_prompt()
+        if tag_words & utils.VEHICLE_KEYWORDS
         else utils._build_classify_prompt(tag_ctx)
     )
-    log.info(f"prompt first 500 chars: {prompt[:500]}")
 
     img_base64 = base64.b64encode(img_bytes).decode('utf-8')
 
@@ -630,15 +362,8 @@ def classify_joints_with_vision(img_bytes: bytes, mime_type: str,
     img.save(buf, format='PNG', optimize=True)
     img_bytes  = buf.getvalue()
     mime_type  = utils.detect_mime_type(img_bytes)
-    
-    if rig_type == 'vehicle' or rig_type == "mechanical":
-        prompt = utils._build_vehicle_prompt(object_type, category, n_joints,
-                                             mesh_bounds=mesh_bounds, rig_type=rig_type)
-    else:
-        prompt = utils._build_joints_prompt(object_type, category, n_joints,
-                                             mesh_bounds=mesh_bounds, rig_type=rig_type)
-
-    log.info(f"prompt first 500 chars: {prompt[:500]}")
+    prompt     = utils._build_joints_prompt(object_type, category, n_joints,
+                                             mesh_bounds=mesh_bounds)
     img_base64 = base64.b64encode(img_bytes).decode('utf-8')
 
     for label, fn, args in [
@@ -806,7 +531,7 @@ def run_blender_rig(glb_path: str, json_path: str, rigged_path: str):
                '--input',     os.path.abspath(glb_path),
                '--output',    os.path.abspath(rigged_path)]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        log.info(result.stdout)
+        log.info(result.stdout[-2000:])
         if result.returncode != 0:
             raise RuntimeError(f"Blender failed: {result.stderr[-200:]}")
         if not os.path.exists(rigged_path):
@@ -815,25 +540,59 @@ def run_blender_rig(glb_path: str, json_path: str, rigged_path: str):
 
 def joints_from_model(joints_data: dict, glb_path: str):
     """
-    Map normalised joint positions (0–1) onto mesh world-space.
+    Map normalised joint positions (0–1) from the vision model onto mesh
+    world-space coordinates via bounding box interpolation.
+    Returns (joints, hierarchy, hint_objects).
 
-    Meshy exports Y-up. The camera is always a SIDE VIEW of the object, so:
-      Claude image-x (0=left edge of photo, 1=right edge)
-          → mesh Z  (front-to-rear in world space)
-      Claude image-y (0=top of photo, 1=bottom)
-          → mesh Y  (up-down) — INVERTED because image Y-down ≠ mesh Y-up
-      Claude image-z (depth hint, usually 0.5)
-          → mesh X  (left-right in world space, i.e. into/out of the photo)
+    Claude always outputs:
+      x = left/right (0=left, 1=right)
+      y = front/rear or height depending on mesh type
+      z = depth or height
 
-    This is a FIXED mapping, not detected at runtime. The old wheel-spread
-    heuristic misidentifies axes when only 2 wheels are present and the
-    spread is entirely along image-X.
+    Detects actual axis mapping from wheel joint spreads for accurate denormalization.
     """
     import trimesh
 
     hint_objects = joints_data.get('joint_hints', [])
     if not hint_objects or isinstance(hint_objects[0], str):
         return None, None, hint_objects
+
+    # ── Detect mesh orientation from wheel joint spreads ────────────────────────
+    wheel_joints = [j for j in hint_objects if j.get('body_part') == 'wheel']
+    lr_idx = 0   # Claude x = left-right
+    fr_idx = 1   # Claude y = front-rear
+    h_idx = 2    # Claude z = height
+    if wheel_joints and len(wheel_joints) >= 2:
+        spreads = {
+            'x': max(wj['position_normalized']['x'] for wj in wheel_joints) - min(wj['position_normalized']['x'] for wj in wheel_joints),
+            'y': max(wj['position_normalized']['y'] for wj in wheel_joints) - min(wj['position_normalized']['y'] for wj in wheel_joints),
+            'z': max(wj['position_normalized']['z'] for wj in wheel_joints) - min(wj['position_normalized']['z'] for wj in wheel_joints),
+        }
+        
+        log.info(f"\n{'='*60}")
+        log.info(f"WHEEL SPREAD ANALYSIS")
+        log.info(f"{'='*60}")
+        log.info(f"Wheel spreads: X={spreads['x']:.3f}, Y={spreads['y']:.3f}, Z={spreads['z']:.3f}")
+        
+        sorted_axes = sorted(spreads.items(), key=lambda t: t[1], reverse=True)
+        front_rear_axis = sorted_axes[0][0]
+        left_right_axis = sorted_axes[1][0]
+        height_axis = sorted_axes[2][0]
+        
+        log.info(f"Front-to-back axis: {front_rear_axis} (spread={spreads[front_rear_axis]:.3f})")
+        log.info(f"Left-right axis: {left_right_axis} (spread={spreads[left_right_axis]:.3f})")
+        log.info(f"Height axis: {height_axis} (spread={spreads[height_axis]:.3f})")
+        log.info(f"{'='*60}\n")
+        
+        
+        log.info(f"Axis indices: front_rear={fr_idx}, left_right={lr_idx}, height={h_idx}")
+    else:
+        # Fallback to default axes if no wheels detected
+        log.warning("No wheel joints for axis detection, using defaults: fr=2, lr=0, h=1")
+
+        front_rear_axis = 'z'
+        left_right_axis = 'x'
+        height_axis = 'y'
 
     mesh   = trimesh.load(glb_path, force='mesh')
     verts  = np.array(mesh.vertices)
@@ -842,25 +601,25 @@ def joints_from_model(joints_data: dict, glb_path: str):
     brange = bmax - bmin
     brange[brange == 0] = 1.0
 
-    # Fixed axis mapping for Meshy Y-up + side-view camera
-    # mesh axis indices: 0=X (left/right), 1=Y (up), 2=Z (front/rear)
-    LR_IDX = 0   # mesh X  ← Claude z (depth, usually ~0.5)
-    UP_IDX = 1   # mesh Y  ← Claude y (inverted: image top = world top)
-    FR_IDX = 2   # mesh Z  ← Claude x (image horizontal = world front/rear)
+    bounds_min = bmin
+    bounds_max = bmax
+    bounds_range = brange
 
+    # ── Denormalize Claude positions using detected axes ────────────────────────
     name_to_idx = {h['name']: i for i, h in enumerate(hint_objects)}
+
     joints = []
-
     for hint in hint_objects:
-        p      = hint.get('position_normalized', {})
-        norm_x = np.clip(p.get('x', 0.5), 0.0, 1.0)   # image left→right
-        norm_y = np.clip(p.get('y', 0.5), 0.0, 1.0)   # image top→bottom
-        norm_z = np.clip(p.get('z', 0.5), 0.0, 1.0)   # image depth
+        p       = hint.get('position_normalized', {})
+        norm_x  = np.clip(p.get('x', 0.5), 0.0, 1.0)
+        norm_y  = np.clip(p.get('y', 0.5), 0.0, 1.0)
+        norm_z  = np.clip(p.get('z', 0.5), 0.0, 1.0)
 
+        # Build world position using detected axes
         world_pos = np.zeros(3)
-        world_pos[FR_IDX] = bmin[FR_IDX] + norm_x * brange[FR_IDX]          # image-x → mesh-Z
-        world_pos[UP_IDX] = bmin[UP_IDX] + (1.0 - norm_y) * brange[UP_IDX]  # image-y inverted → mesh-Y
-        world_pos[LR_IDX] = bmin[LR_IDX] + norm_z * brange[LR_IDX]          # image-z → mesh-X (≈center)
+        world_pos[lr_idx]  = bounds_min[lr_idx] + norm_x * bounds_range[lr_idx]   # Claude x → left-right axis
+        world_pos[fr_idx]  = bounds_min[fr_idx] + norm_y * bounds_range[fr_idx]   # Claude y → front-rear axis
+        world_pos[h_idx]   = bounds_min[h_idx] + norm_z * bounds_range[h_idx]     # Claude z → height axis
 
         joints.append(tuple(world_pos))
 
@@ -877,51 +636,116 @@ def joints_from_model(joints_data: dict, glb_path: str):
         if p is not None and c is not None:
             hierarchy.append((p, c))
 
-    log.info(f"joints_from_model: {len(joints)} joints, {len(hierarchy)} bones "
-             f"(fixed mapping: img-x→Z, img-y-inv→Y, img-z→X)")
+    log.info(f"Joints from model: {len(joints)} joints, {len(hierarchy)} bones")
+    log.info(f"Axis mapping: x→{left_right_axis}({lr_idx}), y→{front_rear_axis}({fr_idx}), z→{height_axis}({h_idx})")
+    
     return joints, hierarchy, hint_objects
 
-def mirror_wheel_centers(mask_dir, joint_hints):
-    centers_path = os.path.join(mask_dir, 'wheel_centers.json')
-    if not os.path.exists(centers_path):
-        return
-    with open(centers_path) as f:
-        centers = json.load(f)
 
-    updated = False
-    for hint in joint_hints:
-        if not hint.get('mirrored'):
-            continue
-        name        = hint['name']
-        source_name = hint.get('mirrored_from')
-        if not source_name or source_name not in centers or name in centers:
-            continue
+def run_vehicle_pipeline(classify_id: str, glb_path: str,
+                         classify_data: dict, host: str) -> str:
+    seg_dir        = os.path.dirname(os.path.abspath(__file__))
+    vehicle_dir    = os.path.join(seg_dir, 'vehicle')
+    separated_path = os.path.join(RESULTS_DIR, f"{classify_id}_separated.glb")
+    animated_path  = os.path.join(RESULTS_DIR, f"{classify_id}_animated.glb")
+    rigged_path    = os.path.join(RESULTS_DIR, f"{classify_id}_rigged.glb")
+    classify_json  = os.path.join(RESULTS_DIR, f"{classify_id}_classify.json")
+    tire_verts     = os.path.join(RESULTS_DIR, f"{classify_id}_tire_verts.json")
+    texture_path   = os.path.join(RESULTS_DIR, f"{classify_id}_texture.png")
 
-        src  = centers[source_name]
-        img_w = src['img_w']
-        mirrored_cx = img_w - src['mask_cx']
 
-        centers[name] = {
-            'hough_cx': img_w - src['hough_cx'],
-            'hough_cy': src['hough_cy'],
-            'hough_r':  src['hough_r'],
-            'mask_cx':  mirrored_cx,
-            'mask_cy':  src['mask_cy'],
-            'img_w':    img_w,
-            'img_h':    src['img_h'],
-            'norm_cx':  mirrored_cx / img_w,
-            'norm_cy':  src['norm_cy'],
-            'norm_r':   src['norm_r'],
-            'mirrored': True,
-        }
-        updated = True
-        log.info(f"Mirrored center: {source_name}→{name} "
-                 f"cx {src['mask_cx']}→{mirrored_cx}")
+    record      = _store.get(classify_id)
+    joints_data = (record.get('joints') or {}) if record else {}
+    joint_hints = joints_data.get('joint_hints', [])
 
-    if updated:
-        with open(centers_path, 'w') as f:
-            json.dump(centers, f, indent=2)
+    # ADD THIS DEBUG:
+    log.info(f"DEBUG: joints_data from store: {len(joint_hints)} hints")
+    for jh in [j for j in joint_hints if j.get('body_part') == 'wheel']:
+        p = jh.get('position_normalized', {})
+        log.info(f"  {jh['name']}: x={p.get('x')}, y={p.get('y')}, z={p.get('z')}")
 
+    # Only inject wheel joints
+    classify_data['joint_hints'] = [
+        j for j in joint_hints
+        if j.get('body_part') == 'wheel'
+    ]
+
+    log.info(f"DEBUG: classify_data['joint_hints'] about to write: {len(classify_data['joint_hints'])} hints")
+    for jh in classify_data['joint_hints']:
+        p = jh.get('position_normalized', {})
+        log.info(f"  {jh['name']}: x={p.get('x')}, y={p.get('y')}, z={p.get('z')}")
+
+    with open(classify_json, 'w') as f:
+        json.dump(classify_data, f, indent=2)
+    log.info(f"Injected {len(classify_data['joint_hints'])} wheel joints into classify_json")
+    
+    
+    with open(glb_path, 'rb') as f:
+        f.read(12)
+        json_len = struct.unpack('<I', f.read(4))[0]; f.read(4)
+        j        = json.loads(f.read(json_len))
+        bin_len  = struct.unpack('<I', f.read(4))[0]; f.read(4)
+        binary   = f.read(bin_len)
+
+    for img_data in j.get('images', []):
+        bv   = j['bufferViews'][img_data['bufferView']]
+        data = binary[bv['byteOffset']:bv['byteOffset'] + bv['byteLength']]
+        with open(texture_path, 'wb') as tf:
+            tf.write(data)
+        log.info(f"Texture extracted: {texture_path}")
+        break
+
+    for script_name, input_path, out_path, runner in [
+        ('find_tire_verts.py', glb_path,        tire_verts,     'python'),
+        ('classify_wheels.py', glb_path,         separated_path, 'blender'),
+        ('animatesam.py',      separated_path,   animated_path,  'blender'),
+        ('merge_animations.py', animated_path,   rigged_path,    'python'),
+    ]:
+        script = os.path.join(vehicle_dir, script_name)
+        if runner == 'blender':
+            extra = [tire_verts] if script_name == 'classify_wheels.py' else []
+            cmd   = [_blender_bin(), '--background', '--factory-startup',
+                     '--python', script, '--',
+                     input_path, out_path, classify_json] + extra
+        else:
+            args = ([glb_path, classify_json, tire_verts, texture_path]
+                    if script_name == 'find_tire_verts.py'
+                    else [animated_path, rigged_path])
+            cmd  = [sys.executable, script] + args
+
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        log.info(result.stdout[-2000:])
+
+        # After find_tire_verts.py runs, read the saved centroids file
+        # and inject into classify_json for animatesam.py to use as pivots.
+        # This uses find_tire_verts.py's own lf/lr/rf/rr split — consistent
+        # with classify_wheels.py's naming — rather than recomputing here.
+        if script_name == 'find_tire_verts.py' and os.path.exists(tire_verts):
+            try:
+                centroids_path = tire_verts.replace('.json', '_centroids.json')
+                if os.path.exists(centroids_path):
+                    with open(centroids_path) as _f:
+                        _centroids = json.load(_f)
+                    with open(classify_json, 'r') as _f:
+                        _cdata = json.load(_f)
+                    _cdata['wheel_centroids'] = _centroids
+                    with open(classify_json, 'w') as _f:
+                        json.dump(_cdata, _f, indent=2)
+                    log.info(f"Wheel centroids injected from find_tire_verts: {_centroids}")
+                else:
+                    log.warning("Centroids file not found — pivot will use bbox fallback")
+            except Exception as e:
+                log.warning(f"Centroid injection failed (non-fatal): {e}")
+
+        log.info(f"separated_path exists: {os.path.exists(separated_path)} → {separated_path}")
+        log.info(f"classify_wheels returncode: {result.returncode}")
+        log.info(f"classify_wheels stderr: {result.stderr[-300:] if result.stderr else ''}")
+
+        if not os.path.exists(out_path):
+            raise RuntimeError(f"{script_name} failed: {result.stderr[-200:]}")
+
+    log.info(f"Vehicle pipeline complete: {rigged_path}")
+    return rigged_path
     
 def mesh_guided_joint_correction(joints_data: dict, glb_path: str,
                                   rig_type: str) -> dict:
@@ -1118,10 +942,7 @@ def enforce_bilateral_symmetry(joints_data: dict) -> dict:
                     'x': float(np.clip(1.0 - lpos['x'], 0.0, 1.0)),
                     'y': lpos['y'],
                     'z': lpos.get('z', 0.5),
-                },
-                'mirrored':      True,
-                'mirrored_from': left_name,   # ← add this
-            }
+                }}
             hints.append(new_hint)
             hint_map[right_name] = new_hint
             log.info(f"  Symmetry: mirrored {left_name} → {right_name}")
@@ -1148,242 +969,8 @@ def enforce_bilateral_symmetry(joints_data: dict) -> dict:
                 log.info(f"  Symmetry: leveled {left_name}/{right_name} Y → {avg_y:.3f}")
 
     return joints_data
-def run_mechanical_pipeline(classify_id: str, glb_path: str,
-                             classify_data: dict, host: str) -> str:
-    seg_dir       = os.path.dirname(os.path.abspath(__file__))
-    vehicle_dir   = os.path.join(seg_dir, 'vehicle')
-    classify_json = os.path.abspath(os.path.join(RESULTS_DIR, f"{classify_id}_classify.json"))
-    mask_dir      = os.path.abspath(os.path.join(RESULTS_DIR, f"{classify_id}_masks"))
-
-    record      = _store.get(classify_id)
-    joints_data = (record.get('joints') or {}) if record else {}
-    joint_hints = joints_data.get('joint_hints', [])
-    wheel_colors = joints_data.get('wheel_colors_rgb')
-    if wheel_colors:
-        classify_data['wheel_colors_rgb'] = wheel_colors
-        log.info(f"wheel_colors_rgb from joints: {wheel_colors}")
-    classify_data['joint_hints'] = [
-        j for j in joint_hints
-        if j.get('body_part') in ('gear', 'hinge')
-    ]
-
-    gear_hints = [j for j in classify_data['joint_hints'] if j.get('body_part') == 'gear']
-    if gear_hints:
-        classify_data['reference_radius_normalized'] = max(
-            j.get('wheel_radius_normalized', 0.15) for j in gear_hints
-        )
-        log.info(f"Reference radius: {classify_data['reference_radius_normalized']:.3f}")
-
-    if len(gear_hints) >= 2:
-        x_spread = (max(j['position_normalized']['x'] for j in gear_hints) -
-                    min(j['position_normalized']['x'] for j in gear_hints))
-        z_spread = (max(j['position_normalized']['z'] for j in gear_hints) -
-                    min(j['position_normalized']['z'] for j in gear_hints))
-        classify_data['image_view'] = 'side' if x_spread > z_spread else 'front'
-        log.info(f"Image view: {classify_data['image_view']}")
-
-    with open(classify_json, 'w') as f:
-        json.dump(classify_data, f, indent=2)
-    log.info(f"Injected {len(classify_data['joint_hints'])} mechanical joints")
-
-    # ── SAM2 segmentation ─────────────────────────────────────────────────────
-    active_path = record.get('active_image_path') if record else None
-    if active_path and os.path.exists(active_path):
-        try:
-            os.makedirs(mask_dir, exist_ok=True)
-            raw_mask_paths = segment_parts_with_sam2(
-                active_path, classify_data['joint_hints'], classify_id, mask_dir
-            )
-            import shutil
-            for hint_name, src_path in raw_mask_paths.items():
-                dst_path = os.path.join(mask_dir, f"{hint_name}.png")
-                if os.path.exists(dst_path):
-                    os.unlink(dst_path)
-                shutil.copy2(src_path, dst_path)
-                log.info(f"Mask → {dst_path}")
-            with open(classify_json, 'r') as f:
-                _cdata = json.load(f)
-            _cdata['sam2_masks']    = raw_mask_paths
-            _cdata['sam2_mask_dir'] = mask_dir
-            with open(classify_json, 'w') as f:
-                json.dump(_cdata, f, indent=2)
-            log.info(f"SAM2 masks ready: {list(raw_mask_paths.keys())}")
-        except Exception as e:
-            log.warning(f"SAM2 segmentation failed (non-fatal): {e}")
-            mask_dir = None
-    else:
-        log.warning("No active image — SAM2 skipped")
-        mask_dir = None
-
-    # ── Invoke pipeline script ────────────────────────────────────────────────
-    mech_script = os.path.join(seg_dir, 'vehicle', 'mechanical_pipeline.py')
-    cmd = [sys.executable, mech_script,
-           classify_id, glb_path, classify_json,
-           RESULTS_DIR, vehicle_dir]
-    if mask_dir and os.path.isdir(mask_dir):
-        cmd.append(mask_dir)
-
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-    log.info(result.stdout)
-    log.info(result.stderr)
-    if result.returncode != 0:
-        raise RuntimeError(f"Mechanical pipeline failed: {result.stderr[-300:]}")
-
-    rigged_path = os.path.join(RESULTS_DIR, f"{classify_id}_rigged.glb")
-    log.info(f"Mechanical pipeline complete: {rigged_path}")
-    return rigged_path
 
 
-def run_vehicle_pipeline(classify_id: str, glb_path: str,
-                         classify_data: dict, host: str) -> str:
-    seg_dir        = os.path.dirname(os.path.abspath(__file__))
-    vehicle_dir    = os.path.join(seg_dir, 'vehicle')
-    separated_path = os.path.join(RESULTS_DIR, f"{classify_id}_separated.glb")
-    animated_path  = os.path.join(RESULTS_DIR, f"{classify_id}_animated.glb")
-    rigged_path    = os.path.join(RESULTS_DIR, f"{classify_id}_rigged.glb")
-    classify_json  = os.path.join(RESULTS_DIR, f"{classify_id}_classify.json")
-    tire_verts     = os.path.join(RESULTS_DIR, f"{classify_id}_tire_verts.json")
-    texture_path   = os.path.join(RESULTS_DIR, f"{classify_id}_texture.png")
-
-
-    record      = _store.get(classify_id)
-    joints_data = (record.get('joints') or {}) if record else {}
-    joint_hints = joints_data.get('joint_hints', [])
-    object_type = classify_data.get('object_type', '')
-    
-    wheel_colors = joints_data.get('wheel_colors_rgb')
-    if wheel_colors:
-        classify_data['wheel_colors_rgb'] = wheel_colors
-        log.info(f"wheel_colors_rgb from joints: {wheel_colors}")
-
-    with open(classify_json, 'w') as f:
-        json.dump(classify_data, f, indent=2)
-        
-    # ADD THIS DEBUG:
-    log.info(f"DEBUG: joints_data from store: {len(joint_hints)} hints")
-    for jh in [j for j in joint_hints if j.get('body_part') == 'wheel']:
-        p = jh.get('position_normalized', {})
-        log.info(f"  {jh['name']}: x={p.get('x')}, y={p.get('y')}, z={p.get('z')}")
-
-    TWO_WHEEL_KEYWORDS = ['bicycle', 'bike', 'motorcycle', 'motorbike', 'scooter', 'moped']
-    is_two_wheel = any(kw in object_type.lower() for kw in TWO_WHEEL_KEYWORDS)
-
-    if is_two_wheel:
-        wheel_hints = [j for j in joint_hints if j.get('body_part') == 'wheel']
-        if len(wheel_hints) == 4:
-            # Sort by z to find front/rear pairs (z=front/rear in Claude convention)
-            wheel_hints_sorted = sorted(wheel_hints, key=lambda w: w['position_normalized']['z'])
-            front_pair = wheel_hints_sorted[:2]   # lower z = front
-            rear_pair  = wheel_hints_sorted[2:]   # higher z = rear
-
-            collapsed = []
-            if front_pair:
-                avg_z = sum(h['position_normalized']['z'] for h in front_pair) / len(front_pair)
-                avg_y = sum(h['position_normalized']['y'] for h in front_pair) / len(front_pair)
-                r_norm = front_pair[0].get('wheel_radius_normalized', 0.12)
-                collapsed.append({**front_pair[0], 'name': 'wheel_fl',
-                   'position_normalized': {'x': 0.5, 'y': avg_y, 'z': avg_z}})
-            if rear_pair:
-                avg_z = sum(h['position_normalized']['z'] for h in rear_pair) / len(rear_pair)
-                avg_y = sum(h['position_normalized']['y'] for h in rear_pair) / len(rear_pair)
-                collapsed.append({**rear_pair[0], 'name': 'wheel_rl',
-                   'position_normalized': {'x': 0.5, 'y': avg_y, 'z': avg_z}})
-            joint_hints = [j for j in joint_hints if j.get('body_part') != 'wheel'] + collapsed
-            log.info(f"Collapsed 4 wheels to 2 for {object_type}")
-            
-    # Only inject wheel joints
-    classify_data['joint_hints'] = [
-        j for j in joint_hints
-        if j.get('body_part') in ['wheel', 'gear']
-    ]
-
-    log.info(f"DEBUG: classify_data['joint_hints'] about to write: {len(classify_data['joint_hints'])} hints")
-    for jh in classify_data['joint_hints']:
-        p = jh.get('position_normalized', {})
-        log.info(f"  {jh['name']}: x={p.get('x')}, y={p.get('y')}, z={p.get('z')}")
-
-
-    wheel_joints_out = [j for j in classify_data['joint_hints'] if j.get('body_part') == 'wheel']
-    if len(wheel_joints_out) == 2:
-        z_spread = abs(wheel_joints_out[0]['position_normalized']['z'] -
-                       wheel_joints_out[1]['position_normalized']['z'])
-        y_spread = abs(wheel_joints_out[0]['position_normalized']['y'] -
-                       wheel_joints_out[1]['position_normalized']['y'])
-        classify_data['wheel_split_axis'] = 2 if z_spread > y_spread else 1
-        log.info(f"Wheel split axis: {classify_data['wheel_split_axis']}")
-
-    with open(classify_json, 'w') as f:
-        json.dump(classify_data, f, indent=2)
-    log.info(f"Injected {len(classify_data['joint_hints'])} wheel joints into classify_json")
-    
-    
-    with open(glb_path, 'rb') as f:
-        f.read(12)
-        json_len = struct.unpack('<I', f.read(4))[0]; f.read(4)
-        j        = json.loads(f.read(json_len))
-        bin_len  = struct.unpack('<I', f.read(4))[0]; f.read(4)
-        binary   = f.read(bin_len)
-
-    for img_data in j.get('images', []):
-        bv   = j['bufferViews'][img_data['bufferView']]
-        data = binary[bv['byteOffset']:bv['byteOffset'] + bv['byteLength']]
-        with open(texture_path, 'wb') as tf:
-            tf.write(data)
-        log.info(f"Texture extracted: {texture_path}")
-        break
-
-    for script_name, input_path, out_path, runner in [
-        ('find_tire_verts.py', glb_path,        tire_verts,     'python'),
-        ('classify_wheels.py', glb_path,         separated_path, 'blender'),
-        ('animatesam.py',      separated_path,   animated_path,  'blender'),
-        ('merge_animations.py', animated_path,   rigged_path,    'python'),
-    ]:
-        script = os.path.join(vehicle_dir, script_name)
-        if runner == 'blender':
-            extra = [tire_verts] if script_name == 'classify_wheels.py' else []
-            cmd   = [_blender_bin(), '--background', '--factory-startup',
-                     '--python', script, '--',
-                     input_path, out_path, classify_json] + extra
-        else:
-            args = ([glb_path, classify_json, tire_verts, texture_path]
-                    if script_name == 'find_tire_verts.py'
-                    else [animated_path, rigged_path])
-            cmd  = [sys.executable, script] + args
-
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        log.info(result.stdout[-5000:])
-
-
-
-
-        if script_name == 'find_tire_verts.py' and os.path.exists(tire_verts):
-            try:
-                centroids_path = tire_verts.replace('.json', '_centroids.json')
-                if os.path.exists(centroids_path):
-                    with open(centroids_path) as _f:
-                        _centroids = json.load(_f)
-                    with open(classify_json, 'r') as _f:
-                        _cdata = json.load(_f)
-                    _cdata['wheel_centroids'] = _centroids
-                    with open(classify_json, 'w') as _f:
-                        json.dump(_cdata, _f, indent=2)
-                    log.info(f"Wheel centroids injected from find_tire_verts: {_centroids}")
-                else:
-                    log.warning("Centroids file not found — pivot will use bbox fallback")
-            except Exception as e:
-                log.warning(f"Centroid injection failed (non-fatal): {e}")
-
-        log.info(f"separated_path exists: {os.path.exists(separated_path)} → {separated_path}")
-        log.info(f"classify_wheels returncode: {result.returncode}")
-        log.info(f"classify_wheels stderr: {result.stderr[-300:] if result.stderr else ''}")
-
-        if not os.path.exists(out_path):
-            raise RuntimeError(f"{script_name} failed: {result.stderr[-200:]}")
-
-    log.info(f"Vehicle pipeline complete: {rigged_path}")
-    return rigged_path
-    
-    
 # ══════════════════════════════════════════════════════════════════════════════
 # Rig pipeline (Blender only — mesh comes from /mesh)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1416,23 +1003,12 @@ def run_rig_pipeline(task_id: str, classify_id: str, user_id: str, host: str):
         object_type = classify_data.get('object_type', '')
         rigid_parts = classify_data.get('rigid_parts', [])
         tag_words   = set(object_type.lower().split())
-        seg_dir       = os.path.dirname(os.path.abspath(__file__))
-        vehicle_dir   = os.path.join(seg_dir, 'vehicle')
-        classify_json = os.path.join(RESULTS_DIR, f"{classify_id}_classify.json")
-        mask_dir      = os.path.join(RESULTS_DIR, f"{classify_id}_masks")
-        active_path   = record.get('active_image_path', '')
 
         is_vehicle = (
             category == 'vehicle' or
-            (category not in ('animal', 'humanoid', 'other', 'mechanical') and
+            (category not in ('animal', 'humanoid', 'other') and
              bool(tag_words & utils.VEHICLE_KEYWORDS))
         )
-        is_mechanical = (
-            category == 'mechanical' or
-            rig_type == 'mechanical' or
-            bool(tag_words & utils.MECHANICAL_KEYWORDS)
-        )
-
         log.info(f"category='{category}' is_vehicle={is_vehicle} object_type='{object_type}' "
                  f"rigid_parts={rigid_parts}")
 
@@ -1442,10 +1018,8 @@ def run_rig_pipeline(task_id: str, classify_id: str, user_id: str, host: str):
 
         if is_vehicle:
             _rig_tasks[task_id] = {'status': 'rigging', 'progress': 50}
-            rigged_path = run_vehicle_pipeline(classify_id, glb_path, classify_data, host)
-        elif is_mechanical:
-            _rig_tasks[task_id] = {'status': 'rigging', 'progress': 50}
-            rigged_path = run_mechanical_pipeline(classify_id, glb_path, classify_data, host)
+            rigged_path = run_vehicle_pipeline(classify_id, glb_path,
+                                               classify_data, host)
         else:
             # ── Decimate ──────────────────────────────────────────────────────
             decimated_path = os.path.join(RESULTS_DIR, f"{classify_id}_decimated.glb")
@@ -1645,91 +1219,7 @@ def segment():
         log.error(f"/segment error: {e}")
         return jsonify({'error': str(e)}), 500
 
-# ── SAM ───────────────────────────────────────────────────────────────────────
-_sam2_predictor = None
 
-def _get_sam2():
-    global _sam2_predictor
-    if _sam2_predictor is None:
-        import torch
-        from sam2.build_sam import build_sam2
-        from sam2.sam2_image_predictor import SAM2ImagePredictor
-        import sam2 as sam2_pkg
-        sam2_dir    = os.path.dirname(sam2_pkg.__file__)
-        sam2_config = os.environ.get('SAM2_CONFIG',
-            os.path.join(sam2_dir, 'configs/sam2.1/sam2.1_hiera_s.yaml'))
-        sam2_checkpoint = os.environ.get('SAM2_CHECKPOINT',
-            'checkpoints/sam2.1_hiera_small.pt')
-        model           = build_sam2(sam2_config, sam2_checkpoint,
-                                     device='cpu')
-        _sam2_predictor = SAM2ImagePredictor(model)
-        log.info("SAM2 ready (CPU).")
-    return _sam2_predictor
-   
-# ── /segment_parts ────────────────────────────────────────────────────────────
-
-@app.route('/segment_parts', methods=['GET', 'POST'])
-def segment_parts():
-    """
-    Run SAM2 part segmentation on the active image using joint positions as prompts.
-    Requires /classify and /infer_joints to have run first.
-    Saves per-wheel masks to RESULTS_DIR and stores mask_paths in the record.
-    """
-    if request.method == 'GET':
-        return jsonify({'status': 'ok'}), 200
-    try:
-        classify_id = request.args.get('classify_id', '').strip()
-        force       = request.args.get('force', '').lower() in ('1', 'true', 'yes')
-
-        if not classify_id:
-            return jsonify({'error': 'Missing classify_id'}), 400
-
-        record = _store.get(classify_id)
-        if not record:
-            return jsonify({'error': f"classify_id '{classify_id}' not found"}), 404
-
-        # Cache check
-        if not force and record.get('sam2_masks'):
-            log.info(f"SAM2 mask cache hit: {classify_id}")
-            return jsonify({
-                'status':      'ok',
-                'classify_id': classify_id,
-                'mask_paths':  record['sam2_masks'],
-            })
-
-        joints_data = record.get('joints') or {}
-        joint_hints = joints_data.get('joint_hints', [])
-        if not joint_hints:
-            return jsonify({'error': 'No joints found — run /infer_joints first'}), 422
-
-        active_path = record.get('active_image_path')
-        if not active_path or not os.path.exists(active_path):
-            return jsonify({'error': f"Active image not found: '{active_path}'"}), 404
-
-        log.info(f"Running SAM2 segmentation for {classify_id} "
-                 f"({len([h for h in joint_hints if h.get('body_part') in ('wheel','gear')])} wheel/gear hints)")
-
-        mask_paths = segment_parts_with_sam2(active_path, joint_hints, classify_id)
-
-        # Store mask paths in record
-        _store.upsert_classify(classify_id, record.get('tag', ''),
-                               {**record.get('classify', {}),
-                                'sam2_masks': mask_paths})
-
-        return jsonify({
-            'status':      'ok',
-            'classify_id': classify_id,
-            'mask_paths':  mask_paths,
-            'mask_urls':   {name: _local_url(path, request.host)
-                            for name, path in mask_paths.items()},
-        })
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        log.error(f"/segment_parts error: {e}")
-        return jsonify({'error': str(e)}), 500
-   
 # ── /classify ─────────────────────────────────────────────────────────────────
 @app.route('/classify', methods=['GET', 'POST'])
 def classify():
@@ -2083,32 +1573,31 @@ def infer_joints():
             'source_image_path': active_path,
             'model_used':        model_used,
         }
-        log.info(f"GLB processing")
         if glb_path and os.path.exists(glb_path):
             try:
                 joints_data = snap_joints_to_mesh(joints_data, glb_path)
             except Exception as e:
                 log.warning(f"Snapping failed (non-fatal): {e}")
-            log.info(f"Snapped")
+
             try:
                 rig_type = classify_data.get('rig_type', '')
                 joints_data = mesh_guided_joint_correction(
                     joints_data, glb_path, rig_type)
             except Exception as e:
                 log.warning(f"Mesh-guided correction failed (non-fatal): {e}")
-            log.info(f"Mesh correction")
+
             try:
                 joints_data = enforce_bilateral_symmetry(joints_data)
             except Exception as e:
                 log.warning(f"Symmetry enforcement failed (non-fatal): {e}")
-            log.info(f"Mirrored")
+
             try:
                 viz_path = os.path.join(RESULTS_DIR,
                                         f"{classify_id}_joints_normalized_viz.glb")
                 visualize_normalized_joints(joints_data, glb_path, viz_path)
             except Exception as e:
                 log.warning(f"Normalized joints viz failed (non-fatal): {e}")
-            log.info(f"Visualized")
+
         _store.upsert_joints(classify_id, joints_data)
         log.info(f"Joints stored: {classify_id} "
                  f"({len(joints_info['joint_hints'])} hints, model={model_used})")
@@ -2235,14 +1724,7 @@ def visualize_normalized_joints(joints_data: dict, mesh_path: str,
         x     = bmin[0] + p.get('x', 0.5) * brange[0]
         y     = bmin[1] + p.get('y', 0.5) * brange[1]
         z     = bmin[2] + p.get('z', 0.5) * brange[2]
-        log.info(f"initial y {p.get('y', 0.5)} then  {y}")
-        norm_y = p.get('y', 0.5)
-        body_part = hint.get('body_part', '')
-        r_norm = hint.get('wheel_radius_normalized', 0.0)
-        norm_y = 1.0 - p.get('y', 0.5)  # invert image-y to mesh-y
-        y = bmin[1] + norm_y * brange[1]
-        log.info(f"setting {x} {y} {z}")
-        log.info(f"initial y {p.get('y')} r_norm={hint.get('wheel_radius_normalized')} body_part={hint.get('body_part')}")
+
         sphere = trimesh.creation.icosphere(radius=sphere_r)
         sphere.apply_translation([x, y, z])
         sphere.visual.face_colors = get_color(hint['name'])
@@ -2479,7 +1961,6 @@ def convert_glb_to_usdz(glb_path: str, usdz_path: str) -> str:
         [_blender_bin(), '--background', '--python', sf],
         capture_output=True, text=True, timeout=120
     )
-    log.info(result.stdout)
     os.unlink(sf)
     
     if not os.path.exists(usdz_path):
@@ -2552,7 +2033,7 @@ def gallery_data():
         return jsonify([{
             'classify_id':     r.get('classify_id'),
             'label':           r.get('tag', 'model'),
-            'tags':            r.get('tags', 'model'),
+            'tags':            r.get('tags', []),
             'rigged_path':     (r.get('rig')      or {}).get('rigged_glb_path'),
             'segmented_image': (r.get('classify') or {}).get('segmented_image_path'),
             'active_image':    r.get('active_image_path'),
@@ -2560,9 +2041,6 @@ def gallery_data():
             'has_mesh':        bool((r.get('mesh') or {}).get('glb_path')),
             'rig_status':      (r.get('rig') or {}).get('status'),
             'created_at':      (r.get('rig') or {}).get('created_at'),
-            'rigged_path':      _local_url(((r.get('rig') or {}).get('rigged_glb_path')), request.host),
-            'active_path':      _local_url(r.get('glb_path'),request.host),
-            'url':              _local_url(((r.get('rig') or {}).get('rigged_glb_path')), request.host)
         } for r in records])
     except Exception as e:
         log.error(f"/gallery_data error: {e}")
