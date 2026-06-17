@@ -166,28 +166,145 @@ def _now() -> str:
 def _local_url(path: str | None, host: str) -> str | None:
     if not path:
         return None
-    return f"http://{host}/results/{os.path.basename(path)}"
+    # Support both subdir layout (results/id/file) and bare filenames
+    results_dir = os.environ.get('RESULTS_DIR', 'results')
+    try:
+        rel = os.path.relpath(path, results_dir)
+    except ValueError:
+        rel = os.path.basename(path)
+    return f"http://{host}/results/{rel}"
+
+
+def _rdir(classify_id: str) -> str:
+    """Reconstruct the per-classify_id results subdirectory path."""
+    return os.path.join(os.environ.get('RESULTS_DIR', 'results'), classify_id)
+
+
+# Logical active-image keys → filenames within _rdir()
+_ACTIVE_IMAGE_FILES = {
+    'segmented':   'segmented.png',
+    'augmented_a': 'augmented_a.png',
+    'augmented_b': 'augmented_b.png',
+}
+
+def _active_image_path(classify_id: str, key: str | None) -> str | None:
+    """
+    Reconstruct active image path from stored key, handling three layouts:
+      1. results/{id}/segmented.png          (new clean subdir)
+      2. results/{id}/{id}_segmented.png     (subdir, prefixed filename)
+      3. results/{id}_segmented.png          (old flat)
+    Returns the first that exists on disk, falling back to layout 1 as the
+    canonical write target when none exist yet.
+    """
+    if not key or not classify_id:
+        return None
+    filename = _ACTIVE_IMAGE_FILES.get(key, key)
+    rd       = _rdir(classify_id)
+    results  = os.environ.get('RESULTS_DIR', 'results')
+
+    candidates = [
+        os.path.join(rd,      f"{classify_id}_{filename}"),     # 1. subdir prefixed (current)
+        os.path.join(rd,      filename),                        # 2. clean subdir
+        os.path.join(results, f"{classify_id}_{filename}"),     # 3. old flat
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return candidates[0]  # canonical write target
+
+
+def _active_image_key(path: str | None, classify_id: str) -> str | None:
+    """Convert a full path to a logical key for storage."""
+    if not path or not classify_id:
+        return None
+    basename = os.path.basename(path)
+    # Strip classify_id prefix if present (layout 2 and 3)
+    if basename.startswith(f"{classify_id}_"):
+        basename = basename[len(classify_id) + 1:]
+    reverse = {v: k for k, v in _ACTIVE_IMAGE_FILES.items()}
+    return reverse.get(basename, basename)
+
+
+def hydrate(record: dict) -> dict:
+    """
+    Add active_image_path back to a raw store record (in-place + returned).
+    Call this immediately after store.get() in seg_server routes so all
+    downstream code can still use record['active_image_path'] unchanged.
+    """
+    if record is None:
+        return record
+    cid = record.get('classify_id', '')
+    key = record.get('active_image_key')
+    record['active_image_path'] = _active_image_path(cid, key)
+    return record
+
+
+def _resolve_path(classify_id: str, filename: str) -> str:
+    """
+    Resolve a pipeline filename to its actual path, trying all three layouts:
+      1. results/{id}/{id}_filename     (current: subdir with prefixed filename)
+      2. results/{id}/filename          (clean subdir, no prefix)
+      3. results/{id}_filename          (old flat)
+    Returns the first that exists, falling back to layout 1 as the write target.
+    """
+    rd      = _rdir(classify_id)
+    results = os.environ.get('RESULTS_DIR', 'results')
+    candidates = [
+        os.path.join(rd,      f"{classify_id}_{filename}"),   # 1. subdir prefixed (current)
+        os.path.join(rd,      filename),                       # 2. clean subdir
+        os.path.join(results, f"{classify_id}_{filename}"),   # 3. old flat
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return candidates[0]  # canonical write target
 
 
 def _inject_urls(record: dict, host: str) -> dict:
     """
-    Return a shallow copy of record with http:// URLs added for all local paths.
-    CDN urls (glb_url, usdz_url) are preserved unchanged.
+    Return a shallow copy of record with reconstructed local paths and http://
+    URLs for all pipeline files. Paths are derived from classify_id; nothing
+    is read from the stored record. CDN URLs (glb_url, usdz_url) are preserved.
+    All three file layouts are supported — whichever exists on disk wins.
     """
-    r      = dict(record)
+    r   = dict(record)
+    cid = r.get('classify_id', '')
     cls    = dict(r.get('classify') or {})
     joints = dict(r.get('joints')   or {})
     msh    = dict(r.get('mesh')     or {})
     rig    = dict(r.get('rig')      or {})
 
-    r['active_image_url']          = _local_url(r.get('active_image_path'),          host)
-    cls['segmented_url']           = _local_url(cls.get('segmented_image_path'),     host)
-    joints['source_image_url']     = _local_url(joints.get('source_image_path'),     host)
-    msh['glb_local_url']           = _local_url(msh.get('glb_path'),                 host)
-    msh['usdz_local_url']          = _local_url(msh.get('usdz_path'),                host)
-    msh['decimated_local_url']     = _local_url(msh.get('decimated_glb_path'),       host)
-    rig['rigged_url']              = _local_url(rig.get('rigged_glb_path'),          host)
-    rig['viz_url']                 = _local_url(rig.get('viz_glb_path'),             host)
+    # Reconstruct active image path from stored key
+    active_key  = r.get('active_image_key')
+    active_path = _active_image_path(cid, active_key)
+    r['active_image_path'] = active_path
+    r['active_image_url']  = _local_url(active_path, host)
+
+    # classify
+    seg_path = _resolve_path(cid, 'segmented.png') if cid else None
+    cls['segmented_image_path'] = seg_path
+    cls['segmented_url']        = _local_url(seg_path, host)
+
+    # joints
+    joints['source_image_path'] = active_path
+    joints['source_image_url']  = _local_url(active_path, host)
+
+    # mesh — resolve local paths across all layouts
+    if cid:
+        msh['glb_path']           = _resolve_path(cid, 'mesh.glb')
+        msh['usdz_path']          = _resolve_path(cid, 'mesh.usdz')
+        msh['decimated_glb_path'] = _resolve_path(cid, 'decimated.glb')
+    msh['glb_local_url']       = _local_url(msh.get('glb_path'),           host)
+    msh['usdz_local_url']      = _local_url(msh.get('usdz_path'),          host)
+    msh['decimated_local_url'] = _local_url(msh.get('decimated_glb_path'), host)
+
+    # rig — resolve local paths across all layouts
+    if cid:
+        rig['rigged_glb_path']    = _resolve_path(cid, 'rigged.glb')
+        rig['viz_glb_path']       = _resolve_path(cid, 'viz.glb')
+        rig['skeleton_json_path'] = _resolve_path(cid, 'skeleton.json')
+    rig['rigged_url'] = _local_url(rig.get('rigged_glb_path'), host)
+    rig['viz_url']    = _local_url(rig.get('viz_glb_path'),    host)
 
     r['classify'] = cls    or None
     r['joints']   = joints or None
@@ -202,7 +319,7 @@ def _blank_record(classify_id: str, tag: str = '') -> dict:
         'tag':               tag,
         'tags':              [],
         'pipeline_version':  PIPELINE_VERSION,
-        'active_image_path': None,
+        'active_image_key':  None,
         'classify':          None,
         'joints':            None,
         'mesh':              None,
@@ -279,13 +396,13 @@ class JsonStore:
             ]
 
     def get_mesh_by_hash(self, mesh_hash: str) -> dict | None:
-        """Return mesh sub-object if mesh_hash matches and GLB file exists on disk."""
+        """Return mesh sub-object if mesh_hash matches and GLB file exists on disk.
+        glb_path is reconstructed from classify_id since it is not stored."""
         with self._lock:
-            for r in self._data.values():
+            for cid, r in self._data.items():
                 msh = r.get('mesh') or {}
                 if msh.get('mesh_hash') == mesh_hash:
-                    glb = msh.get('glb_path')
-                    if glb and os.path.exists(glb):
+                    if os.path.exists(_resolve_path(cid, 'mesh.glb')):
                         return dict(msh)
             return None
 
@@ -301,65 +418,73 @@ class JsonStore:
 
     def upsert_classify(self, classify_id: str, tag: str, classify_data: dict):
         """
-        Store classify result and set active_image_path to the segmented image.
-        active_image_path is the single path all downstream steps read from.
+        Store classify result. Paths are never written to the store — they are
+        derived from classify_id at read time. Sets active_image_key to
+        'segmented' on first classify; preserves a previously confirmed augment.
         """
         with self._lock:
             record = self._get_or_create(classify_id, tag)
             record['tag']  = tag
             record['tags'] = extract_tags(classify_data, tag)
+            clean = {k: v for k, v in classify_data.items()
+                     if k not in ('segmented_image_path',)}
             record['classify'] = {
-                **classify_data,
+                **clean,
                 'created_at': classify_data.get('created_at') or _now(),
             }
-            # Set active_image_path to segmented image on first classify.
-            # Only overwrite if not already set to an augmented image —
-            # a force re-classify should not lose a previously confirmed augment.
-            if not record.get('active_image_path'):
-                record['active_image_path'] = classify_data.get('segmented_image_path')
+            if not record.get('active_image_key'):
+                record['active_image_key'] = 'segmented'
             self._save()
 
     def set_active_image(self, classify_id: str, image_path: str):
         """
-        Called by /augment_image/confirm to point all downstream steps
-        at the chosen augmented image instead of the segmented original.
+        Called by /augment_image/confirm. Stores a logical key ('augmented_a'
+        or 'augmented_b') derived from the path, not the path itself.
         """
         with self._lock:
             record = self._get_or_create(classify_id)
-            record['active_image_path'] = image_path
+            record['active_image_key'] = _active_image_key(image_path, classify_id)
             self._save()
 
     def upsert_joints(self, classify_id: str, joints_data: dict):
         """
-        Store joint placement result from /joints.
-        Overwrites any previous joints result — /joints is freely repeatable.
-        joints_data should include: joint_hints, skeleton, suggested_joints,
-        source_image_path, model_used.
+        Store joint placement result. source_image_path is stripped — it is
+        reconstructed from active_image_key at read time.
         """
         with self._lock:
             record = self._get_or_create(classify_id)
+            clean = {k: v for k, v in joints_data.items()
+                     if k not in ('source_image_path',)}
             record['joints'] = {
-                **joints_data,
+                **clean,
                 'created_at': joints_data.get('created_at') or _now(),
             }
             self._save()
 
     def upsert_mesh(self, classify_id: str, mesh_data: dict):
+        """Local paths (glb_path, usdz_path, decimated_glb_path) are stripped —
+        they are reconstructed from classify_id at read time."""
         with self._lock:
             record = self._get_or_create(classify_id)
+            clean = {k: v for k, v in mesh_data.items()
+                     if k not in ('glb_path', 'usdz_path', 'decimated_glb_path')}
             record['mesh'] = {
-                **mesh_data,
+                **clean,
                 'created_at': mesh_data.get('created_at') or _now(),
             }
             self._save()
 
     def upsert_rig(self, classify_id: str, rig_data: dict):
+        """Local paths (rigged_glb_path, viz_glb_path, skeleton_json_path) are
+        stripped — they are reconstructed from classify_id at read time."""
         with self._lock:
             record = self._get_or_create(classify_id)
+            clean = {k: v for k, v in rig_data.items()
+                     if k not in ('rigged_glb_path', 'viz_glb_path', 'skeleton_json_path')}
             record['rig'] = {
                 'status':     'ok',
                 'error':      None,
-                **rig_data,
+                **clean,
                 'created_at': rig_data.get('created_at') or _now(),
             }
             self._save()
@@ -438,8 +563,7 @@ class TinyDbStore:
             for r in self._table.all():
                 msh = r.get('mesh') or {}
                 if msh.get('mesh_hash') == mesh_hash:
-                    glb = msh.get('glb_path')
-                    if glb and os.path.exists(glb):
+                    if os.path.exists(_resolve_path(r['classify_id'], 'mesh.glb')):
                         return dict(msh)
             return None
 
@@ -455,6 +579,8 @@ class TinyDbStore:
 
     def upsert_classify(self, classify_id: str, tag: str, classify_data: dict):
         with self._lock:
+            classify_data = {k: v for k, v in classify_data.items()
+                             if k not in ('segmented_image_path',)}
             classify_data.setdefault('created_at', _now())
             existing = self._get_raw(classify_id) or {}
             updates = {
@@ -462,27 +588,34 @@ class TinyDbStore:
                 'tags':     extract_tags(classify_data, tag),
                 'classify': classify_data,
             }
-            # Only set active_image_path if not already pointing at an augmented image
-            if not existing.get('active_image_path'):
-                updates['active_image_path'] = classify_data.get('segmented_image_path')
+            if not existing.get('active_image_key'):
+                updates['active_image_key'] = 'segmented'
             self._upsert(classify_id, updates)
 
     def set_active_image(self, classify_id: str, image_path: str):
         with self._lock:
-            self._upsert(classify_id, {'active_image_path': image_path})
+            self._upsert(classify_id, {
+                'active_image_key': _active_image_key(image_path, classify_id)
+            })
 
     def upsert_joints(self, classify_id: str, joints_data: dict):
         with self._lock:
+            joints_data = {k: v for k, v in joints_data.items()
+                           if k not in ('source_image_path',)}
             joints_data.setdefault('created_at', _now())
             self._upsert(classify_id, {'joints': joints_data})
 
     def upsert_mesh(self, classify_id: str, mesh_data: dict):
         with self._lock:
+            mesh_data = {k: v for k, v in mesh_data.items()
+                         if k not in ('glb_path', 'usdz_path', 'decimated_glb_path')}
             mesh_data.setdefault('created_at', _now())
             self._upsert(classify_id, {'mesh': mesh_data})
 
     def upsert_rig(self, classify_id: str, rig_data: dict):
         with self._lock:
+            rig_data = {k: v for k, v in rig_data.items()
+                        if k not in ('rigged_glb_path', 'viz_glb_path', 'skeleton_json_path')}
             rig_data.setdefault('status', 'ok')
             rig_data.setdefault('error',  None)
             rig_data.setdefault('created_at', _now())
@@ -609,7 +742,10 @@ class CloudDbStore:
         if not record:
             return None
         msh = record.get('mesh') or {}
-        return dict(msh) if msh.get('mesh_hash') == mesh_hash else None
+        if msh.get('mesh_hash') != mesh_hash:
+            return None
+        cid = record.get('classify_id', '')
+        return dict(msh) if cid and os.path.exists(_resolve_path(cid, 'mesh.glb')) else None
 
     def all_tags_for_user(self, user_id: str) -> list[str]:
         tags: set[str] = set()
@@ -624,25 +760,29 @@ class CloudDbStore:
             record = self._load_or_blank(classify_id, tag)
             record['tag']      = tag
             record['tags']     = extract_tags(classify_data, tag)
+            clean = {k: v for k, v in classify_data.items()
+                     if k not in ('segmented_image_path',)}
             record['classify'] = {
-                **classify_data,
+                **clean,
                 'created_at': classify_data.get('created_at') or _now(),
             }
-            if not record.get('active_image_path'):
-                record['active_image_path'] = classify_data.get('segmented_image_path')
+            if not record.get('active_image_key'):
+                record['active_image_key'] = 'segmented'
             self._set(f"pipeline:{classify_id}", record)
 
     def set_active_image(self, classify_id: str, image_path: str):
         with self._lock:
             record = self._load_or_blank(classify_id)
-            record['active_image_path'] = image_path
+            record['active_image_key'] = _active_image_key(image_path, classify_id)
             self._set(f"pipeline:{classify_id}", record)
 
     def upsert_joints(self, classify_id: str, joints_data: dict):
         with self._lock:
             record = self._load_or_blank(classify_id)
+            clean = {k: v for k, v in joints_data.items()
+                     if k not in ('source_image_path',)}
             record['joints'] = {
-                **joints_data,
+                **clean,
                 'created_at': joints_data.get('created_at') or _now(),
             }
             self._set(f"pipeline:{classify_id}", record)
@@ -650,19 +790,23 @@ class CloudDbStore:
     def upsert_mesh(self, classify_id: str, mesh_data: dict):
         with self._lock:
             record = self._load_or_blank(classify_id)
-            mesh_data.setdefault('created_at', _now())
-            record['mesh'] = mesh_data
+            clean = {k: v for k, v in mesh_data.items()
+                     if k not in ('glb_path', 'usdz_path', 'decimated_glb_path')}
+            clean.setdefault('created_at', _now())
+            record['mesh'] = clean
             self._set(f"pipeline:{classify_id}", record)
-            if mesh_data.get('mesh_hash'):
-                self._set(f"mesh_index:{mesh_data['mesh_hash']}", classify_id)
+            if clean.get('mesh_hash'):
+                self._set(f"mesh_index:{clean['mesh_hash']}", classify_id)
 
     def upsert_rig(self, classify_id: str, rig_data: dict):
         with self._lock:
             record = self._load_or_blank(classify_id)
-            rig_data.setdefault('status', 'ok')
-            rig_data.setdefault('error',  None)
-            rig_data.setdefault('created_at', _now())
-            record['rig'] = rig_data
+            clean = {k: v for k, v in rig_data.items()
+                     if k not in ('rigged_glb_path', 'viz_glb_path', 'skeleton_json_path')}
+            clean.setdefault('status', 'ok')
+            clean.setdefault('error',  None)
+            clean.setdefault('created_at', _now())
+            record['rig'] = clean
             self._set(f"pipeline:{classify_id}", record)
             user_id = rig_data.get('user_id', '')
             if user_id:
@@ -736,23 +880,27 @@ if __name__ == '__main__':
     print("=== pipeline_store smoke test ===\n")
 
     with tempfile.TemporaryDirectory() as tmp:
+        os.environ['RESULTS_DIR'] = tmp
         store = JsonStore(os.path.join(tmp, '_pipeline_store.json'))
 
-        seg_path = f'{tmp}/a1b2c3d4_segmented.png'
-        aug_path = f'{tmp}/a1b2c3d4_augmented_a.png'
+        os.makedirs(f'{tmp}/a1b2c3d4', exist_ok=True)
+        seg_path = f'{tmp}/a1b2c3d4/a1b2c3d4_segmented.png'
+        aug_path = f'{tmp}/a1b2c3d4/a1b2c3d4_augmented_a.png'
 
         classify_data = {
             'object_type':        'bronze dog statue (bipedal, no arms)',
             'category':           'animal',
             'needs_augmentation': False,
             'augment_prompt':     '',
-            'segmented_image_path': seg_path,
+            'segmented_image_path': seg_path,  # passed in but should NOT be stored
         }
 
-        # ── classify sets active_image_path to segmented ──────────────────────
+        # ── classify sets active_image_key to 'segmented' ────────────────────
         store.upsert_classify('a1b2c3d4', 'bronze+dog', classify_data)
         r = store.get('a1b2c3d4')
-        assert r['active_image_path'] == seg_path,          "active = segmented initially"
+        assert r['active_image_key'] == 'segmented',         "active_image_key = segmented initially"
+        assert 'active_image_path' not in r,                 "no path in store"
+        assert 'segmented_image_path' not in (r.get('classify') or {}), "no path in classify"
         assert 'dog'    in r['tags'],                        "tag: dog"
         assert 'bronze' in r['tags'],                        "tag: bronze"
         assert 'animal' in r['tags'],                        "tag: category"
@@ -760,25 +908,27 @@ if __name__ == '__main__':
         print(f"tags: {r['tags']}")
         print("upsert_classify: OK")
 
-        # ── force re-classify does not overwrite a confirmed augmented image ──
+        # ── force re-classify does not overwrite a confirmed augmented key ────
         store.set_active_image('a1b2c3d4', aug_path)
-        store.upsert_classify('a1b2c3d4', 'bronze+dog', classify_data)  # force re-classify
         r = store.get('a1b2c3d4')
-        assert r['active_image_path'] == aug_path,           "augmented path preserved on re-classify"
+        assert r['active_image_key'] == 'augmented_a',       "key updated to augmented_a"
+        store.upsert_classify('a1b2c3d4', 'bronze+dog', classify_data)
+        r = store.get('a1b2c3d4')
+        assert r['active_image_key'] == 'augmented_a',       "augmented key preserved on re-classify"
         print("set_active_image / re-classify preservation: OK")
 
         # ── joints ────────────────────────────────────────────────────────────
         store.upsert_joints('a1b2c3d4', {
-            'source_image_path': aug_path,
+            'source_image_path': aug_path,   # should be stripped
             'joint_hints':       [{'name': 'hip'}, {'name': 'shoulder'}],
             'skeleton':          [{'parent': 0, 'child': 1}],
             'suggested_joints':  8,
             'model_used':        'gemini-2.5-flash',
         })
         r = store.get('a1b2c3d4')
-        assert r['joints']['model_used']       == 'gemini-2.5-flash', "model_used stored"
-        assert r['joints']['source_image_path']== aug_path,           "source_image_path stored"
-        assert len(r['joints']['joint_hints']) == 2,                  "joint_hints stored"
+        assert r['joints']['model_used']          == 'gemini-2.5-flash', "model_used stored"
+        assert 'source_image_path' not in r['joints'],                   "source_image_path stripped"
+        assert len(r['joints']['joint_hints'])    == 2,                  "joint_hints stored"
         print("upsert_joints: OK")
 
         # ── joints are overwritable (re-iteration) ────────────────────────────
@@ -790,21 +940,24 @@ if __name__ == '__main__':
             'model_used':        'claude-sonnet-4-6',
         })
         r = store.get('a1b2c3d4')
-        assert len(r['joints']['joint_hints']) == 3,                  "joints overwritten"
+        assert len(r['joints']['joint_hints']) == 3,          "joints overwritten"
         assert r['joints']['model_used']       == 'claude-sonnet-4-6'
         print("joints re-iteration (overwrite): OK")
 
         # ── mesh ──────────────────────────────────────────────────────────────
+        os.makedirs(os.path.join(tmp, 'a1b2c3d4'), exist_ok=True)
         store.upsert_mesh('a1b2c3d4', {
             'mesh_hash':     'abc123456789',
             'meshy_task_id': 'task-xyz',
-            'glb_path':      f'{tmp}/a1b2c3d4_mesh.glb',
+            'glb_path':      f'{tmp}/a1b2c3d4/mesh.glb',     # should be stripped
             'glb_url':       'https://cdn.meshy.ai/a1b2c3d4.glb',
             'usdz_path':     None,
             'usdz_url':      None,
         })
+        msh_raw = store.get('a1b2c3d4')['mesh']
+        assert 'glb_path' not in msh_raw,          "glb_path stripped from store"
         assert store.get_mesh_by_hash('abc123456789') is None, "miss when file absent"
-        open(f'{tmp}/a1b2c3d4_mesh.glb', 'w').close()
+        open(os.path.join(tmp, 'a1b2c3d4', 'a1b2c3d4_mesh.glb'), 'w').close()
         msh = store.get_mesh_by_hash('abc123456789')
         assert msh is not None,                    "hit after file created"
         assert msh['meshy_task_id'] == 'task-xyz'
@@ -812,14 +965,17 @@ if __name__ == '__main__':
 
         # ── rig ───────────────────────────────────────────────────────────────
         store.upsert_rig('a1b2c3d4', {
-            'rigged_glb_path':    f'{tmp}/a1b2c3d4_rigged.glb',
-            'viz_glb_path':       f'{tmp}/a1b2c3d4_viz.glb',
-            'skeleton_json_path': f'{tmp}/a1b2c3d4_skeleton.json',
+            'rigged_glb_path':    f'{tmp}/a1b2c3d4/rigged.glb',   # should be stripped
+            'viz_glb_path':       f'{tmp}/a1b2c3d4/viz.glb',
+            'skeleton_json_path': f'{tmp}/a1b2c3d4/skeleton.json',
             'user_id':            'user_42',
         })
         r = store.get('a1b2c3d4')
         assert r['rig']['status']  == 'ok'
         assert r['rig']['user_id'] == 'user_42'
+        assert 'rigged_glb_path'    not in r['rig'], "rigged_glb_path stripped"
+        assert 'viz_glb_path'       not in r['rig'], "viz_glb_path stripped"
+        assert 'skeleton_json_path' not in r['rig'], "skeleton_json_path stripped"
         print("upsert_rig: OK")
 
         store.set_rig_status('a1b2c3d4', 'error', 'Blender crashed')
@@ -835,13 +991,14 @@ if __name__ == '__main__':
         assert 'dog' in store.all_tags_for_user('user_42'),       "all_tags"
         print("get_by_user / search_by_tag / all_tags_for_user: OK")
 
-        # ── with_urls ─────────────────────────────────────────────────────────
+        # ── with_urls reconstructs everything from classify_id ────────────────
         wu = store.with_urls(store.get('a1b2c3d4'), 'localhost:6000')
-        assert wu['active_image_url']      == f'http://localhost:6000/results/a1b2c3d4_augmented_a.png'
-        assert wu['rig']['rigged_url']     == 'http://localhost:6000/results/a1b2c3d4_rigged.glb'
-        assert wu['mesh']['glb_local_url'] == 'http://localhost:6000/results/a1b2c3d4_mesh.glb'
-        assert wu['mesh']['glb_url']       == 'https://cdn.meshy.ai/a1b2c3d4.glb', "CDN URL preserved"
-        assert wu['joints']['source_image_url'] == f'http://localhost:6000/results/a1b2c3d4_augmented_a.png'
+        assert wu['active_image_path'] == aug_path,               'active_image_path reconstructed'
+        assert wu['active_image_url']  == f'http://localhost:6000/results/a1b2c3d4/a1b2c3d4_augmented_a.png'
+        assert wu['rig']['rigged_url']       == 'http://localhost:6000/results/a1b2c3d4/a1b2c3d4_rigged.glb'
+        assert wu['mesh']['glb_local_url']   == 'http://localhost:6000/results/a1b2c3d4/a1b2c3d4_mesh.glb'
+        assert wu['mesh']['glb_url']         == 'https://cdn.meshy.ai/a1b2c3d4.glb', "CDN URL preserved"
+        assert wu['joints']['source_image_url'] == f'http://localhost:6000/results/a1b2c3d4/a1b2c3d4_augmented_a.png'
         print("with_urls: OK")
 
         # ── disk persistence ──────────────────────────────────────────────────
@@ -849,7 +1006,9 @@ if __name__ == '__main__':
         r2 = store2.get('a1b2c3d4')
         assert r2 is not None
         assert r2['joints']['suggested_joints'] == 10
-        assert r2['active_image_path'] == aug_path
+        assert r2['active_image_key'] == 'augmented_a'
+        assert 'active_image_path' not in r2,   "paths not persisted"
+        assert 'glb_path' not in (r2.get('mesh') or {}), "mesh paths not persisted"
         print("disk persistence: OK")
 
         # ── extract_tags edge cases ───────────────────────────────────────────

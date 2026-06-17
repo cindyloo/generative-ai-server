@@ -88,11 +88,19 @@ from PIL import Image
 
 import utils
 import pipeline_store as ps          # FIX 1: was "import model_store as ms"
-from pipeline_store import _local_url
+from pipeline_store import _local_url, hydrate
 
 # ── App setup ──────────────────────────────────────────────────────────────────
 
 RESULTS_DIR = os.environ.get('RESULTS_DIR', 'results')
+
+
+def _rdir(classify_id: str) -> str:
+    """Return (and create) the per-classify_id results subdirectory."""
+    d = os.path.join(RESULTS_DIR, classify_id)
+    os.makedirs(d, exist_ok=True)
+    return d
+
 
 app = Flask(__name__)
 CORS(app)
@@ -348,7 +356,7 @@ def segment_parts_with_sam2(img_path: str, joint_hints: list,
                  f"box={box.tolist()}")
 
         # ── Step 5: save mask ─────────────────────────────────────────────────
-        mask_path = os.path.join(results_dir, f"{classify_id}_mask_{name}.png")
+        mask_path = os.path.join(results_dir, f"mask_{name}.png")
         PILImage.fromarray((best_mask * 255).astype(np.uint8)).save(mask_path)
         mask_paths[name] = mask_path
 
@@ -373,14 +381,13 @@ def segment_parts_with_sam2(img_path: str, joint_hints: list,
                           px_c + r_dot, py_c + r_dot],
                          fill=color, outline='white', width=1)
 
-        debug_path = os.path.join(results_dir,
-                                  f"{classify_id}_sam2_debug_{name}.png")
+        debug_path = os.path.join(results_dir, f"sam2_debug_{name}.png")
         debug_img.save(debug_path)
         log.info(f"SAM2 debug image → {debug_path}")
 
     # Save wheel_centers.json into mask_dir
 
-    mask_dir = os.path.abspath(os.path.join(RESULTS_DIR, f"{classify_id}_masks"))
+    mask_dir = os.path.abspath(os.path.join(results_dir, 'masks'))
     centers_path = os.path.join(mask_dir, 'wheel_centers.json')
     os.makedirs(mask_dir, exist_ok=True)
     with open(centers_path, 'w') as f:
@@ -1152,10 +1159,11 @@ def run_mechanical_pipeline(classify_id: str, glb_path: str,
                              classify_data: dict, host: str) -> str:
     seg_dir       = os.path.dirname(os.path.abspath(__file__))
     vehicle_dir   = os.path.join(seg_dir, 'vehicle')
-    classify_json = os.path.abspath(os.path.join(RESULTS_DIR, f"{classify_id}_classify.json"))
-    mask_dir      = os.path.abspath(os.path.join(RESULTS_DIR, f"{classify_id}_masks"))
+    _rd           = _rdir(classify_id)
+    classify_json = os.path.abspath(os.path.join(_rd, f"{classify_id}_classify.json"))
+    mask_dir      = os.path.abspath(os.path.join(_rd, f"{classify_id}_masks"))
 
-    record      = _store.get(classify_id)
+    record      = hydrate(_store.get(classify_id))
     joints_data = (record.get('joints') or {}) if record else {}
     joint_hints = joints_data.get('joint_hints', [])
     wheel_colors = joints_data.get('wheel_colors_rgb')
@@ -1219,7 +1227,7 @@ def run_mechanical_pipeline(classify_id: str, glb_path: str,
     mech_script = os.path.join(seg_dir, 'vehicle', 'mechanical_pipeline.py')
     cmd = [sys.executable, mech_script,
            classify_id, glb_path, classify_json,
-           RESULTS_DIR, vehicle_dir]
+           _rd, vehicle_dir]
     if mask_dir and os.path.isdir(mask_dir):
         cmd.append(mask_dir)
 
@@ -1229,7 +1237,7 @@ def run_mechanical_pipeline(classify_id: str, glb_path: str,
     if result.returncode != 0:
         raise RuntimeError(f"Mechanical pipeline failed: {result.stderr[-300:]}")
 
-    rigged_path = os.path.join(RESULTS_DIR, f"{classify_id}_rigged.glb")
+    rigged_path = os.path.join(_rd, f"{classify_id}_rigged.glb")
     log.info(f"Mechanical pipeline complete: {rigged_path}")
     return rigged_path
 
@@ -1238,15 +1246,16 @@ def run_vehicle_pipeline(classify_id: str, glb_path: str,
                          classify_data: dict, host: str) -> str:
     seg_dir        = os.path.dirname(os.path.abspath(__file__))
     vehicle_dir    = os.path.join(seg_dir, 'vehicle')
-    separated_path = os.path.join(RESULTS_DIR, f"{classify_id}_separated.glb")
-    animated_path  = os.path.join(RESULTS_DIR, f"{classify_id}_animated.glb")
-    rigged_path    = os.path.join(RESULTS_DIR, f"{classify_id}_rigged.glb")
-    classify_json  = os.path.join(RESULTS_DIR, f"{classify_id}_classify.json")
-    tire_verts     = os.path.join(RESULTS_DIR, f"{classify_id}_tire_verts.json")
-    texture_path   = os.path.join(RESULTS_DIR, f"{classify_id}_texture.png")
+    _rd            = _rdir(classify_id)
+    separated_path = os.path.join(_rd, f"{classify_id}_separated.glb")
+    animated_path  = os.path.join(_rd, f"{classify_id}_animated.glb")
+    rigged_path    = os.path.join(_rd, f"{classify_id}_rigged.glb")
+    classify_json  = os.path.join(_rd, f"{classify_id}_classify.json")
+    tire_verts     = os.path.join(_rd, f"{classify_id}_tire_verts.json")
+    texture_path   = os.path.join(_rd, f"{classify_id}_texture.png")
 
 
-    record      = _store.get(classify_id)
+    record      = hydrate(_store.get(classify_id))
     joints_data = (record.get('joints') or {}) if record else {}
     joint_hints = joints_data.get('joint_hints', [])
     object_type = classify_data.get('object_type', '')
@@ -1398,15 +1407,15 @@ def run_rig_pipeline(task_id: str, classify_id: str, user_id: str, host: str):
         _rig_tasks[task_id] = {'status': 'rigging', 'progress': 10}
         _store.set_rig_status(classify_id, 'rigging')
 
-        record        = _store.get(classify_id)
+        record        = hydrate(_store.get(classify_id))
         classify_data = record.get('classify') or {}
         mesh_data     = record.get('mesh')     or {}
         joints_data   = record.get('joints')   or {}
         rig_type      = classify_data.get('rig_type', '').lower()
 
         # ── Validate mesh ─────────────────────────────────────────────────────
-        glb_path = mesh_data.get('glb_path')
-        if not glb_path or not os.path.exists(glb_path):
+        glb_path = ps._resolve_path(classify_id, 'mesh.glb')
+        if not os.path.exists(glb_path):
             raise RuntimeError(
                 f"Mesh GLB not found at '{glb_path}' — run /mesh before /rig"
             )
@@ -1418,8 +1427,9 @@ def run_rig_pipeline(task_id: str, classify_id: str, user_id: str, host: str):
         tag_words   = set(object_type.lower().split())
         seg_dir       = os.path.dirname(os.path.abspath(__file__))
         vehicle_dir   = os.path.join(seg_dir, 'vehicle')
-        classify_json = os.path.join(RESULTS_DIR, f"{classify_id}_classify.json")
-        mask_dir      = os.path.join(RESULTS_DIR, f"{classify_id}_masks")
+        _rd           = _rdir(classify_id)
+        classify_json = os.path.join(_rd, f"{classify_id}_classify.json")
+        mask_dir      = os.path.join(_rd, f"{classify_id}_masks")
         active_path   = record.get('active_image_path', '')
 
         is_vehicle = (
@@ -1448,12 +1458,15 @@ def run_rig_pipeline(task_id: str, classify_id: str, user_id: str, host: str):
             rigged_path = run_mechanical_pipeline(classify_id, glb_path, classify_data, host)
         else:
             # ── Decimate ──────────────────────────────────────────────────────
-            decimated_path = os.path.join(RESULTS_DIR, f"{classify_id}_decimated.glb")
-            if not os.path.exists(decimated_path):
+            decimated_path = os.path.join(_rd, f"{classify_id}_decimated.glb")
+            existing_decimated = ps._resolve_path(classify_id, 'decimated.glb')
+            if not os.path.exists(existing_decimated):
                 _rig_tasks[task_id] = {'status': 'decimating', 'progress': 20}
                 _decimate_mesh(glb_path, decimated_path, ratio=0.1)
+            else:
+                decimated_path = existing_decimated
             active_glb  = decimated_path
-            rigged_path = os.path.join(RESULTS_DIR, f"{classify_id}_rigged.glb")
+            rigged_path = os.path.join(_rd, f"{classify_id}_rigged.glb")
 
             _rig_tasks[task_id] = {'status': 'inferring_skeleton', 'progress': 30}
 
@@ -1525,7 +1538,7 @@ def run_rig_pipeline(task_id: str, classify_id: str, user_id: str, host: str):
             
                 _rig_tasks[task_id] = {'status': 'visualizing', 'progress': 50}
                 from rig import visualize_skeleton
-                viz_glb_path = os.path.join(RESULTS_DIR, f"{classify_id}_viz.glb")
+                viz_glb_path = os.path.join(_rd, f"{classify_id}_viz.glb")
                 visualize_skeleton(
                     active_glb,
                     [tuple(j['position']) for j in skel['joints']],
@@ -1541,19 +1554,15 @@ def run_rig_pipeline(task_id: str, classify_id: str, user_id: str, host: str):
             _rig_tasks[task_id] = {'status': 'rigging_blender', 'progress': 60}
             run_blender_rig(active_glb, skeleton_json_path, rigged_path)
 
-        # ── Update mesh record with decimated path ────────────────────────────
+        # ── Update mesh record (paths are not stored — reconstructed at read time)
         if decimated_path:
-            _store.upsert_mesh(classify_id, {**mesh_data,
-                                             'decimated_glb_path': decimated_path})
+            _store.upsert_mesh(classify_id, {**mesh_data})
 
         # ── Persist ───────────────────────────────────────────────────────────
         _rig_tasks[task_id] = {'status': 'finalizing', 'progress': 90}
         _store.upsert_rig(classify_id, {
-            'rigged_glb_path':    rigged_path,
-            'viz_glb_path':       viz_glb_path,
-            'skeleton_json_path': skeleton_json_path,
-            'status':             'ok',
-            'user_id':            user_id,
+            'status':  'ok',
+            'user_id': user_id,
         })
 
         _rig_tasks[task_id] = {
@@ -1582,28 +1591,40 @@ def _run_mesh_task(task_id: str, classify_id: str, img: Image.Image,
         meshy_task_id, glb_url, usdz_url = meshy_reconstruct(img, object_type)
 
         _mesh_tasks[task_id] = {'status': 'downloading', 'progress': 70}
-        glb_path  = os.path.join(RESULTS_DIR, f"{classify_id}_mesh.glb")
+        _rd       = _rdir(classify_id)
+        glb_path  = os.path.join(_rd, f"{classify_id}_mesh.glb")
         usdz_path = None
         download_file(glb_url, glb_path)
         if usdz_url:
-            usdz_path = os.path.join(RESULTS_DIR, f"{classify_id}_mesh.usdz")
+            usdz_path = os.path.join(_rd, f"{classify_id}_mesh.usdz")
             download_file(usdz_url, usdz_path)
 
+        _mesh_tasks[task_id] = {'status': 'decimating', 'progress': 85}
+        decimated_path = os.path.join(_rd, f"{classify_id}_decimated.glb")
+        try:
+            _decimate_mesh(glb_path, decimated_path, ratio=0.1)
+            log.info(f"Decimated mesh: {decimated_path}")
+        except Exception as e:
+            log.warning(f"Decimation failed (non-fatal): {e}")
+            decimated_path = None
+
         _store.upsert_mesh(classify_id, {
-            'mesh_hash':     mesh_hash,
-            'meshy_task_id': meshy_task_id,
-            'glb_path':      glb_path,
-            'glb_url':       glb_url,
-            'usdz_path':     usdz_path,
-            'usdz_url':      usdz_url,
+            'mesh_hash':          mesh_hash,
+            'meshy_task_id':      meshy_task_id,
+            'glb_path':           glb_path,
+            'glb_url':            glb_url,
+            'usdz_path':          usdz_path,
+            'usdz_url':           usdz_url,
+            'decimated_glb_path': decimated_path,
         })
 
         _mesh_tasks[task_id] = {
-            'status':        'ok',
-            'progress':      100,
-            'glb_url':       glb_url,
-            'glb_local_url': _local_url(glb_path, host),
-            'classify_id':   classify_id,
+            'status':              'ok',
+            'progress':            100,
+            'glb_url':             glb_url,
+            'glb_local_url':       _local_url(glb_path, host),
+            'decimated_local_url': _local_url(decimated_path, host) if decimated_path else None,
+            'classify_id':         classify_id,
         }
         log.info(f"Mesh task {task_id} complete: {glb_path}")
 
@@ -1684,7 +1705,7 @@ def segment_parts():
         if not classify_id:
             return jsonify({'error': 'Missing classify_id'}), 400
 
-        record = _store.get(classify_id)
+        record = hydrate(_store.get(classify_id))
         if not record:
             return jsonify({'error': f"classify_id '{classify_id}' not found"}), 404
 
@@ -1709,7 +1730,7 @@ def segment_parts():
         log.info(f"Running SAM2 segmentation for {classify_id} "
                  f"({len([h for h in joint_hints if h.get('body_part') in ('wheel','gear')])} wheel/gear hints)")
 
-        mask_paths = segment_parts_with_sam2(active_path, joint_hints, classify_id)
+        mask_paths = segment_parts_with_sam2(active_path, joint_hints, classify_id, _rdir(classify_id))
 
         # Store mask paths in record
         _store.upsert_classify(classify_id, record.get('tag', ''),
@@ -1753,7 +1774,7 @@ def classify():
         classify_id = hashlib.md5(img_bytes + tag.encode()).hexdigest()[:8]
  
         if not force:
-            record = _store.get(classify_id)
+            record = hydrate(_store.get(classify_id))
             if record and record.get('classify'):
                 log.info(f"classify cache hit: {classify_id}")
                 return jsonify({
@@ -1769,7 +1790,7 @@ def classify():
         log.info(f"Classification: {info.get('object_type', '?')} | "
                  f"needs_augmentation={info.get('needs_augmentation', False)}")
 
-        seg_path = os.path.join(RESULTS_DIR, f"{classify_id}_segmented.png")
+        seg_path = os.path.join(_rdir(classify_id), f"{classify_id}_segmented.png")
         if not os.path.exists(seg_path):
             img = Image.open(io.BytesIO(img_bytes)).convert('RGBA')
             img.save(seg_path, format='PNG')
@@ -1812,7 +1833,7 @@ def augment_image():
         if not classify_id:
             return jsonify({'error': 'Missing classify_id'}), 400
  
-        record = _store.get(classify_id)
+        record = hydrate(_store.get(classify_id))
         if not record or not record.get('classify'):
             return jsonify({'error': f"classify_id '{classify_id}' not found — run /classify first"}), 404
  
@@ -1869,8 +1890,8 @@ def augment_image():
         img        = utils.resize_if_needed(img, max_size=1024)
         img_a, img_b = edit_image_fal(img, prompt)
  
-        path_a = os.path.join(RESULTS_DIR, f"{classify_id}_augmented_a.png")
-        path_b = os.path.join(RESULTS_DIR, f"{classify_id}_augmented_b.png")
+        path_a = os.path.join(_rdir(classify_id), f"{classify_id}_augmented_a.png")
+        path_b = os.path.join(_rdir(classify_id), f"{classify_id}_augmented_b.png")
         img_a.save(path_a)
         img_b.save(path_b)
 
@@ -1904,7 +1925,7 @@ def augment_image_confirm():
         if choice not in ('a', 'b'):
             return jsonify({'error': "choice must be 'a' or 'b'"}), 400
 
-        chosen_path = os.path.join(RESULTS_DIR, f"{classify_id}_augmented_{choice}.png")
+        chosen_path = os.path.join(_rdir(classify_id), f"{classify_id}_augmented_{choice}.png")
         if not os.path.exists(chosen_path):
             return jsonify({'error': "Augmented image not found — run /augment_image first"}), 404
 
@@ -1954,7 +1975,7 @@ def infer_joints():
         if not classify_id:
             return jsonify({'error': 'Missing classify_id'}), 400
 
-        record = _store.get(classify_id)
+        record = hydrate(_store.get(classify_id))
         if not record:
             return jsonify({'error': f"classify_id '{classify_id}' not found — run /classify first"}), 404
 
@@ -1983,7 +2004,10 @@ def infer_joints():
         # ── Extract mesh bounding box if available ────────────────────────────
         mesh_bounds = None
         mesh_data   = record.get('mesh') or {}
-        glb_path    = mesh_data.get('glb_path') or mesh_data.get('decimated_glb_path')
+        # Prefer decimated mesh for bounds extraction; fall back to full mesh
+        _dec = ps._resolve_path(classify_id, 'decimated.glb')
+        _full = ps._resolve_path(classify_id, 'mesh.glb')
+        glb_path = _dec if os.path.exists(_dec) else (_full if os.path.exists(_full) else None)
 
         if glb_path and os.path.exists(glb_path):
             try:
@@ -2034,7 +2058,6 @@ def infer_joints():
 
         # ── Geometric fallback ────────────────────────────────────────────────
         if not joints_info:
-            glb_path = glb_path or (mesh_data.get('glb_path') if mesh_data else None)
             if not glb_path or not os.path.exists(glb_path):
                 return jsonify({
                     'error': ('Vision model unavailable and no mesh for geometric '
@@ -2103,8 +2126,7 @@ def infer_joints():
                 log.warning(f"Symmetry enforcement failed (non-fatal): {e}")
             log.info(f"Mirrored")
             try:
-                viz_path = os.path.join(RESULTS_DIR,
-                                        f"{classify_id}_joints_normalized_viz.glb")
+                viz_path = os.path.join(_rdir(classify_id), f"{classify_id}_joints_normalized_viz.glb")
                 visualize_normalized_joints(joints_data, glb_path, viz_path)
             except Exception as e:
                 log.warning(f"Normalized joints viz failed (non-fatal): {e}")
@@ -2269,7 +2291,7 @@ def mesh():
         if not classify_id:
             return jsonify({'error': 'Missing classify_id'}), 400
 
-        record = _store.get(classify_id)
+        record = hydrate(_store.get(classify_id))
         if not record:
             return jsonify({'error': f"classify_id '{classify_id}' not found — run /classify first"}), 404
 
@@ -2359,13 +2381,13 @@ def rig():
         if not classify_id:
             return jsonify({'error': 'Missing classify_id'}), 400
 
-        record = _store.get(classify_id)
+        record = hydrate(_store.get(classify_id))
         if not record:
             return jsonify({'error': f"classify_id '{classify_id}' not found"}), 404
 
         mesh_data = record.get('mesh') or {}
-        glb_path  = mesh_data.get('glb_path')
-        if not glb_path or not os.path.exists(glb_path):
+        glb_path  = ps._resolve_path(classify_id, 'mesh.glb')
+        if not os.path.exists(glb_path):
             return jsonify({
                 'error':       'No mesh found — run /mesh before /rig',
                 'classify_id': classify_id,
@@ -2373,8 +2395,8 @@ def rig():
 
         rig_data = record.get('rig') or {}
         if not force and rig_data.get('status') == 'ok':
-            rigged_path = rig_data.get('rigged_glb_path')
-            if rigged_path and os.path.exists(rigged_path):
+            rigged_path = ps._resolve_path(classify_id, 'rigged.glb')
+            if os.path.exists(rigged_path):
                 log.info(f"Rig cache hit: {classify_id}")
                 return jsonify({
                     'status':      'ok',
@@ -2436,8 +2458,10 @@ def decimate():
             return jsonify({'error': 'No GLB data'}), 400
 
         uid      = str(uuid.uuid4())[:8]
-        in_path  = os.path.join(RESULTS_DIR, f"{uid}_input.glb")
-        out_path = os.path.join(RESULTS_DIR, f"{uid}_decimated.glb")
+        _ud      = os.path.join(RESULTS_DIR, uid)
+        os.makedirs(_ud, exist_ok=True)
+        in_path  = os.path.join(_ud, "input.glb")
+        out_path = os.path.join(_ud, "decimated.glb")
         with open(in_path, 'wb') as f:
             f.write(glb_bytes)
         _decimate_mesh(in_path, out_path, ratio=ratio)
@@ -2499,8 +2523,10 @@ def convert_to_usdz():
         resp = requests.get(glb_url, verify=False, timeout=60)
         resp.raise_for_status()
         uid       = str(uuid.uuid4())[:8]
-        glb_path  = os.path.join(RESULTS_DIR, f"{uid}_temp.glb")
-        usdz_path = os.path.join(RESULTS_DIR, f"{uid}_converted.usdz")
+        _ud       = os.path.join(RESULTS_DIR, uid)
+        os.makedirs(_ud, exist_ok=True)
+        glb_path  = os.path.join(_ud, "temp.glb")
+        usdz_path = os.path.join(_ud, "converted.usdz")
         with open(glb_path, 'wb') as f:
             f.write(resp.content)
         convert_glb_to_usdz(glb_path, usdz_path)
@@ -2514,9 +2540,12 @@ def convert_to_usdz():
 
 # ── Static / gallery ──────────────────────────────────────────────────────────
 
-@app.route('/results/<filename>')
+@app.route('/results/<path:filename>')
 def serve_result(filename):
-    return send_file(os.path.join(RESULTS_DIR, filename))
+    full = os.path.join(RESULTS_DIR, filename)
+    if not os.path.abspath(full).startswith(os.path.abspath(RESULTS_DIR)):
+        return jsonify({'error': 'forbidden'}), 403
+    return send_file(full)
 
 
 @app.route('/gallery_page')
@@ -2553,16 +2582,15 @@ def gallery_data():
             'classify_id':     r.get('classify_id'),
             'label':           r.get('tag', 'model'),
             'tags':            r.get('tags', 'model'),
-            'rigged_path':     (r.get('rig')      or {}).get('rigged_glb_path'),
-            'segmented_image': (r.get('classify') or {}).get('segmented_image_path'),
-            'active_image':    r.get('active_image_path'),
+            'segmented_image': _local_url(ps._resolve_path(r['classify_id'], 'segmented.png'), request.host),
+            'active_image':    _local_url(hydrate(r).get('active_image_path'), request.host),
             'has_joints':      bool(r.get('joints')),
-            'has_mesh':        bool((r.get('mesh') or {}).get('glb_path')),
+            'has_mesh':        os.path.exists(ps._resolve_path(r['classify_id'], 'mesh.glb')),
             'rig_status':      (r.get('rig') or {}).get('status'),
             'created_at':      (r.get('rig') or {}).get('created_at'),
-            'rigged_path':      _local_url(((r.get('rig') or {}).get('rigged_glb_path')), request.host),
-            'active_path':      _local_url(r.get('glb_path'),request.host),
-            'url':              _local_url(((r.get('rig') or {}).get('rigged_glb_path')), request.host)
+            'rigged_path':     _local_url(ps._resolve_path(r['classify_id'], 'rigged.glb'), request.host),
+            'active_path':     _local_url(ps._resolve_path(r['classify_id'], 'mesh.glb'), request.host),
+            'url':             _local_url(ps._resolve_path(r['classify_id'], 'rigged.glb'), request.host),
         } for r in records])
     except Exception as e:
         log.error(f"/gallery_data error: {e}")
