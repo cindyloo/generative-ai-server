@@ -1657,6 +1657,7 @@ def segment():
         img    = utils.resize_if_needed(img, max_size=1024)
         output = remove(img, session=rembg_session)
         buf    = io.BytesIO()
+        log.info(f"/segment file: {output}")
         output.save(buf, format='PNG')
         buf.seek(0)
         return send_file(buf, mimetype='image/png')
@@ -1994,8 +1995,28 @@ def infer_joints():
             return jsonify({'error': f"Active image not found: '{active_path}'"}), 404
 
         with open(active_path, 'rb') as f:
-            img_bytes = f.read()
-
+                    img_bytes = f.read()
+         
+        # Crop to alpha bounding box before sending to vision model.
+        # The segmented PNG has black padding around the object — Claude's
+        # normalized coordinates must be relative to the object bounds, not
+        # the full padded image, so they map correctly onto mesh space.
+        try:
+            _img = Image.open(io.BytesIO(img_bytes)).convert('RGBA')
+            _alpha = _img.split()[3]
+            _bbox = _alpha.getbbox()   # (left, top, right, bottom)
+            if _bbox:
+                _img_cropped = _img.crop(_bbox)
+                _buf = io.BytesIO()
+                _img_cropped.save(_buf, format='PNG')
+                img_bytes = _buf.getvalue()
+                log.info(f"Cropped image to alpha bbox {_bbox} "
+                         f"({_img.size} → {_img_cropped.size})")
+            else:
+                log.warning("Alpha bbox empty — using full image")
+        except Exception as e:
+            log.warning(f"Alpha crop failed (non-fatal): {e}")
+ 
         mime_type   = 'image/png' if img_bytes[:4] == b'\x89PNG' else 'image/jpeg'
         object_type = classify_data.get('object_type', '')
         category    = classify_data.get('category', '')
