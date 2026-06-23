@@ -88,10 +88,11 @@ if os.path.exists(centroids_path):
         radius = v.get('radius', 0.2) if isinstance(v, dict) else 0.2
         axis   = v.get('axis', [0, 1, 0]) if isinstance(v, dict) else [0, 1, 0]
 
-        # trimesh: [X, Y, Z] = [lr, height, depth]
-        # Blender: [X, Y, Z] = [lr, depth,  height]  ← Y/Z SWAP
+        # trimesh: X=front/rear, Y=height, Z=axle(left/right)
+        # Blender: X=front/rear, Y=axle(left/right), Z=height
+        # Blender X = trimesh X, Blender Y = trimesh Z, Blender Z = trimesh Y
         true_centroids[name] = {
-            'centroid':   np.array([pos[0], pos[2], pos[1]]),   # ← Y/Z SWAP
+            'centroid':   np.array([pos[0], pos[2], pos[1]]),   # X unchanged, Y↔Z swap
             'radius':     radius,
             'axis':       axis,
             'half_thick': v.get('half_thick', 0) if isinstance(v, dict) else 0,
@@ -221,77 +222,84 @@ except Exception as e:
 # Every vertex in the tire-vertex pool is assigned to its nearest Taubin centre.
 # The "tire-vertex pool" is: color-filtered verts (if available) OR all verts.
 # ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# PER-WHEEL VERTEX ASSIGNMENT
+# Right-side wheels (positive centroid X): use color filter — synthesized texture
+#   gives clean color matches on the right/non-photo side of the mesh.
+# Left-side wheels (negative centroid X): use ALL mesh verts — the visible/photo
+#   side has noisy texture that doesn't match the color palette reliably.
+# Both sides use the asymmetric X gate:
+#   outward: full radius (tread extent)
+#   inward:  half_thick (chassis exclusion)
+#   radial:  radius in Y/Z plane
+# ══════════════════════════════════════════════════════════════════════════════
+print(f"\nPer-wheel vertex assignment:")
+
 centroid_list = [(name, d['centroid'], d['radius'], d.get('half_thick', 0))
                  for name, d in true_centroids.items()
                  if d['centroid'] is not None]
 
-# Precompute centroid positions as a (K, 3) array for vectorised distances
-k            = len(centroid_list)
-c_names      = [t[0] for t in centroid_list]
-c_pos        = np.array([t[1] for t in centroid_list])    # (K, 3)
-c_radii      = np.array([t[2] for t in centroid_list])    # (K,)
-c_half_thick = np.array([t[3] for t in centroid_list])    # (K,)
+wheel_vert_groups_raw = {}
 
-print(f"\nVoronoi assignment over {k} centroids:")
-for nm, pos, r, ht in centroid_list:
-    print(f"  {nm}: ({pos[0]:.3f},{pos[1]:.3f},{pos[2]:.3f}) r={r:.3f} half_thick={ht:.3f}")
+for name, pos, radius, half_thick in centroid_list:
+    pivot    = np.array(pos)
+    is_left  = pivot[1] < 0   # Blender Y < 0 = left side (toward user)
 
-# Build the tire-vertex candidate pool
-if color_filter_on and color_mask is not None:
-    pool_indices = np.where(color_mask)[0]
-else:
-    pool_indices = np.arange(len(verts))
+    # Choose vertex pool: ALL verts for both left and right wheels.
+    # Color filter applied within the box gate for all wheels.
+    pool_idx   = np.arange(len(verts))
+    pool_v     = verts
+    pool_label = "all verts"
 
-pool_verts = verts[pool_indices]   # (P, 3)
+    # Blender X = trimesh X = front/rear     → ± radius (wheel circle)
+    # Blender Y = trimesh Z = axle (thin)    → ± half_thick asymmetric
+    # Blender Z = trimesh Y = height         → ± radius (wheel circle)
+    #
+    # Right wheels: Blender Y > 0 (away from user, positive trimesh Z)
+    # Left wheels:  Blender Y < 0 (toward user, negative trimesh Z)
+    is_left  = pivot[1] < 0   # Blender Y < 0 = left side
 
-# Nearest-centroid for every vertex in the pool  →  assignment array (P,)
-# Using broadcasting to avoid an explicit loop
-dists_to_centroids = np.linalg.norm(
-    pool_verts[:, np.newaxis, :] - c_pos[np.newaxis, :, :], axis=2
-)   # (P, K)
-nearest = np.argmin(dists_to_centroids, axis=1)   # (P,)
+    xz_dist   = np.sqrt((pool_v[:, 0] - pivot[0])**2 +
+                        (pool_v[:, 2] - pivot[2])**2)
+    y_rel     = pool_v[:, 1] - pivot[1]
+    outward_y = np.where(pivot[1] < 0, -y_rel, y_rel)   # outward = away from centre
 
+    box_gate = (
+        (xz_dist   <= radius     * 1.1) &
+        (outward_y >= -(half_thick * 1.5)) &   # inward chassis exclusion
+        (outward_y <=  (radius    * 1.1))       # outward tread extent
+    )
 
-# ── Tyre cylinder gate ────────────────────────────────────────────────────────
-# The tyre is a cylinder whose axis runs along X (left/right, the axle direction).
-# Blender: X=left/right, Y=depth(front/rear), Z=height
-#
-# The outer tyre face is a disc at X = centroid_x ± half_thick.
-# The full tyre circle spans radius in both Y and Z from the centroid.
-#
-# So the correct gate is:
-#   X ± half_thick  — tyre axial width (thin dimension, excludes chassis inward)
-#   Y ± radius      — full circular extent front/rear
-#   Z ± radius      — full circular extent height
-#
-# Previously Y used half_thick which was clipping the outer tyre face disc
-# since that disc spans the full radius in Y, not just half_thick.
-assigned_r  = c_radii[nearest]
-assigned_ht = c_half_thick[nearest]
-assigned_c  = c_pos[nearest]   # (P, 3)
+    # Color filter within box — excludes non-wheel colored geometry
+    # (blue cab, body panels) that falls inside the spatial box.
+    # Fallback to box-only if color filter removes too many verts.
+    if color_filter_on and color_mask is not None:
+        color_in_box   = box_gate & color_mask
+        box_count      = int(box_gate.sum())
+        color_count    = int(color_in_box.sum())
+        if color_count >= box_count * 0.1 and color_count > 20:
+            gate = color_in_box
+            print(f"    box={box_count} color_in_box={color_count}")
+        else:
+            gate = box_gate
+            print(f"    color too aggressive ({color_count}/{box_count}) — box only")
+    else:
+        gate = box_gate
+        print(f"    box={int(box_gate.sum())} verts (no color filter)")
 
-# Blender convention: car faces Y, so tyre face normal points along X (left/right).
-# X is the thin axis (half_thick), Y and Z span the full tyre circle (radius).
-# Voronoi gate: simple sphere of radius around each centroid.
-# The tread wraps the full circumference — its axial projection spans the full
-# radius in the thin direction, NOT just half_thick. Using half_thick here
-# cuts the front/rear tread portions. Use radius for both axial and radial.
-# Post-separation slice handles chassis exclusion using half_thick.
-in_gate = np.linalg.norm(pool_verts - assigned_c, axis=1) <= assigned_r * 1.1
-print(f"  Tyre sphere gate (radius): {in_gate.sum()} / {len(pool_indices)} verts")
-
-
-# Build per-wheel vertex index lists
-wheel_vert_groups_raw = {nm: [] for nm in c_names}
-for pi, (ki, gate) in enumerate(zip(nearest, in_gate)):
-    if gate:
-        wheel_vert_groups_raw[c_names[ki]].append(int(pool_indices[pi]))
+    indices = pool_idx[gate].tolist()
+    wheel_vert_groups_raw[name] = indices
+    print(f"  {name}: {len(indices)} verts ({pool_label}, "
+          f"cx={pivot[0]:.3f} r={radius:.3f} ht={half_thick:.3f})")
 
 for nm, idxs in wheel_vert_groups_raw.items():
     print(f"  {nm}: {len(idxs)} verts assigned")
 
 # Outer-face Y correction removed — animatesam snaps pivot X to outer face
 # from the clean separated mesh verts, which is more accurate.
+
+for nm, idxs in wheel_vert_groups_raw.items():
+    print(f"  {nm}: {len(idxs)} verts assigned")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SAM2 MASKS  (kept for future use — loaded but not used in Voronoi path)
@@ -395,64 +403,6 @@ for obj in all_meshes:
     bpy.ops.object.mode_set(mode='EDIT')
     bpy.ops.mesh.select_all(action='DESELECT')
     bpy.ops.mesh.select_loose()
-    bpy.ops.mesh.delete(type='VERT')
-    bpy.ops.object.mode_set(mode='OBJECT')
-
-    # Y-axis slice — remove chassis verts outside the tyre's axial thickness.
-    # Blender Y = depth (front/rear) = thin axis for a side-facing vehicle.
-    # Keep only verts within ± half_thick of the wheel centroid Y.
-    # Fallback: ± radius * 0.45 if half_thick not available.
-    centroid_data = true_centroids.get(obj.name)
-    if centroid_data:
-        cx         = float(centroid_data['centroid'][0])
-        cy         = float(centroid_data['centroid'][1])
-        cz         = float(centroid_data['centroid'][2])
-        half_thick = float(centroid_data.get('half_thick', 0))
-        radius     = float(centroid_data.get('radius', 0.4))
-    else:
-        wx_all = np.array([float((obj.matrix_world @ v.co).x) for v in obj.data.vertices])
-        cx     = float(wx_all.mean())
-        cy     = 0.0; cz = 0.0; half_thick = 0; radius = 0.4
-
-    # Slice on thin axis only (Y for a car facing left in Blender).
-    # Uses Taubin axis so it works regardless of car orientation in the GLB.
-    # Only removes verts outside ±half_thick along the axle direction.
-    # Voronoi already handled radial assignment so no radial cut needed here.
-    axis_raw = centroid_data.get('axis', [0, 1, 0]) if centroid_data else [0, 1, 0]
-    import mathutils
-    thin_axis   = mathutils.Vector(axis_raw).normalized()
-    centroid_pt = mathutils.Vector([cx, cy, cz])
-    axial_margin = (half_thick * 1.1) if half_thick > 0 else (radius * 0.3)
-    print(f"  {obj.name}: thin-axis slice ±{axial_margin:.3f} (axis {[round(float(x),3) for x in thin_axis]})")
-
-    bpy.context.view_layer.objects.active = obj
-    obj.select_set(True)
-    bpy.ops.object.mode_set(mode='EDIT')
-    bpy.ops.mesh.select_all(action='DESELECT')
-    bpy.ops.object.mode_set(mode='OBJECT')
-
-    # Cut inward chassis verts using world X.
-    # Compute the inner face X from the wheel's own vert distribution:
-    # the 98th/2nd percentile on the inward side gives the inner tyre face.
-    wx_all = np.array([float((obj.matrix_world @ v.co).x) for v in obj.data.vertices])
-    if cx < 0:
-        # left wheel: inner face = most-positive X (closest to chassis)
-        x_inner = float(np.percentile(wx_all, 95))   # 85th pct = inner face
-    else:
-        # right wheel: inner face = most-negative X (closest to chassis)
-        x_inner = float(np.percentile(wx_all, 05))
-
-    print(f"  {obj.name}: X inner face at {x_inner:.3f} (cx={cx:.3f})")
-
-    for v in obj.data.vertices:
-        co = obj.matrix_world @ v.co
-        wx = float(co.x)
-        if cx < 0:
-            v.select = bool(wx > x_inner)
-        else:
-            v.select = bool(wx < x_inner)
-
-    bpy.ops.object.mode_set(mode='EDIT')
     bpy.ops.mesh.delete(type='VERT')
     bpy.ops.object.mode_set(mode='OBJECT')
 

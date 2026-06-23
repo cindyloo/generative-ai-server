@@ -100,83 +100,52 @@ print(f"Tire radius: {tire_radius:.3f}")
 
 def taubin_pivot(verts_3d):
     """
-    Given a 3D point cloud believed to be one wheel, return
-    (precise_pivot, rotation_axis, radius) using PCA + Taubin circle fit.
-
-    PCA finds the wheel plane (smallest-eigenvalue axis = axle direction).
-    Taubin fits a circle in the projected 2D plane.
-    Falls back to (mean, None, percentile_radius) on failure.
+    Fit a circle to a wheel point cloud in the Y/Z plane.
+    Wheels always face the user on a side-view vehicle so the axle is
+    always X. Fit Taubin directly in Y/Z — no PCA needed.
+    Returns (pivot, axis, radius, half_thick).
     """
     if len(verts_3d) < 10:
-        return verts_3d.mean(axis=0), None, 0.0, 0.0
+        mean = verts_3d.mean(axis=0)
+        return mean, np.array([1.0, 0.0, 0.0]), 0.0, 0.0
 
-    mean     = verts_3d.mean(axis=0)
-    centered = verts_3d - mean
-    cov      = np.cov(centered.T)
-    eigenvalues, eigenvectors = np.linalg.eigh(cov)
-
-    # Smallest eigenvalue → axle direction (normal to wheel plane)
-    rotation_axis = eigenvectors[:, np.argmin(eigenvalues)]
-    u_axis        = eigenvectors[:, np.argmax(eigenvalues)]
-    v_axis        = np.cross(rotation_axis, u_axis)
-
-    # Axial thickness cut — removes undercarriage / axle bleed
-    depths    = np.dot(centered, rotation_axis)
-    depth_std = np.std(depths)
-    axial_mask = np.abs(depths) < (depth_std * 2.0)
-    verts_3d  = verts_3d[axial_mask]
-    mean      = verts_3d.mean(axis=0)
-    centered  = verts_3d - mean
-
-    pts_2d = np.column_stack((np.dot(centered, u_axis),
-                               np.dot(centered, v_axis)))
+    Y = verts_3d[:, 1]
+    Z = verts_3d[:, 2]
 
     try:
-        X, Y = pts_2d[:, 0], pts_2d[:, 1]
-        Z_t  = X**2 + Y**2
-        M_z  = np.column_stack((Z_t, X, Y, np.ones(len(X))))
-        M    = np.dot(M_z.T, M_z) / len(X)
+        y_mean, z_mean = Y.mean(), Z.mean()
+        Yc, Zc = Y - y_mean, Z - z_mean
+        Z_t  = Yc**2 + Zc**2
+        M_z  = np.column_stack((Z_t, Yc, Zc, np.ones(len(Yc))))
+        M    = np.dot(M_z.T, M_z) / len(Yc)
         w, v = np.linalg.eig(M)
         imin  = np.argmin(np.abs(w))
         A, B, C, D = v[:, imin]
+        center_y = -B / (2 * A) + y_mean
+        center_z = -C / (2 * A) + z_mean
+    except Exception:
+        center_y, center_z = Y.mean(), Z.mean()
 
-        center_u = -B / (2 * A)
-        center_v = -C / (2 * A)
-        pivot    = mean + (center_u * u_axis) + (center_v * v_axis)
+    rad_dists  = np.sqrt((Y - center_y)**2 + (Z - center_z)**2)
+    radius     = float(np.percentile(rad_dists, 99))
 
-        # Cylindrical re-filter
-        rel       = verts_3d - pivot
-        ax_d      = np.dot(rel, rotation_axis)
-        rad_dists = np.linalg.norm(rel - np.outer(ax_d, rotation_axis), axis=1)
-        radius    = float(np.percentile(rad_dists, 99))
+    tight_mask = rad_dists <= radius * 1.05
+    if tight_mask.sum() >= 10:
+        verts_3d   = verts_3d[tight_mask]
+        Y, Z       = verts_3d[:, 1], verts_3d[:, 2]
+        rad_dists  = np.sqrt((Y - center_y)**2 + (Z - center_z)**2)
+        radius     = float(np.percentile(rad_dists, 99))
 
-        # Tight cylinder pass
-        tight = ((rad_dists <= radius * 1.05) &
-                 (np.abs(ax_d) <= radius * 0.6))
-        verts_3d = verts_3d[tight]
-        rel       = verts_3d - pivot
-        ax_d      = np.dot(rel, rotation_axis)
-        rad_dists = np.linalg.norm(rel - np.outer(ax_d, rotation_axis), axis=1)
-        radius    = float(np.percentile(rad_dists, 99))
+    pivot_x    = float((np.percentile(verts_3d[:, 0], 2) +
+                        np.percentile(verts_3d[:, 0], 98)) / 2)
+    ax_dists   = np.abs(verts_3d[:, 0] - pivot_x)
+    half_thick = float(np.percentile(ax_dists, 95))
+    if half_thick < radius * 0.05:
+        half_thick = radius * 0.3
+    half_thick = min(half_thick, radius * 0.6)
 
-        # Compute half_thick: 95th percentile of axial depths on final clean verts
-        rel        = verts_3d - pivot
-        ax_d       = np.dot(rel, rotation_axis)
-        half_thick = float(np.percentile(np.abs(ax_d), 95))
-        if half_thick < radius * 0.05:   # unreliable — fall back
-            half_thick = radius * 0.5
-        # Cap: tyre width should not exceed 60% of radius (physical constraint)
-        half_thick = min(half_thick, radius * 0.6)
-
-        return pivot, rotation_axis, radius, half_thick
-
-    except Exception as e:
-        print(f"    Taubin fit failed ({e}) — using mean")
-        rel        = verts_3d - mean
-        ax_d       = np.dot(rel, rotation_axis)
-        rad_dists  = np.linalg.norm(rel - np.outer(ax_d, rotation_axis), axis=1)
-        half_thick = float(np.percentile(np.abs(ax_d), 95))
-        return mean, rotation_axis, float(np.percentile(rad_dists, 99)), half_thick
+    pivot = np.array([pivot_x, center_y, center_z])
+    return pivot, np.array([1.0, 0.0, 0.0]), radius, half_thick
 
 
 output_centroids = {}
@@ -186,14 +155,20 @@ if wheel_joints:
     y_min, y_max = positions[:, 1].min(), positions[:, 1].max()
     z_min, z_max = positions[:, 2].min(), positions[:, 2].max()
 
-    # Gemini convention: x=left/right, y=height (0=top), z=depth (0=front)
-    # trimesh convention: X=left/right, Y=height, Z=depth
-    # Gemini y is image-space (0=top), so height maps as 1-y
+    # Coordinate mapping:
+    # trimesh X = front/rear (truck length, widest axis)
+    # trimesh Y = height
+    # trimesh Z = axle left/right (thin axis)
+    #
+    # Claude convention (image space, truck facing left):
+    #   x = left/right in image  → trimesh Z (axle)
+    #   y = top/bottom in image  → trimesh Y (height, inverted)
+    #   z = front/rear in image  → trimesh X (truck length)
     wheel_world_positions = np.array([
         [
-            x_min + jh['position_normalized']['x'] * (x_max - x_min),          # lr
-            y_min + (1.0 - jh['position_normalized']['y']) * (y_max - y_min),   # height (flipped)
-            z_min + jh['position_normalized']['z'] * (z_max - z_min),           # depth
+            x_min + jh['position_normalized']['z'] * (x_max - x_min),          # Claude z → trimesh X (front/rear)
+            y_min + (1.0 - jh['position_normalized']['y']) * (y_max - y_min),   # Claude y → trimesh Y (height, flipped)
+            z_min + jh['position_normalized']['x'] * (z_max - z_min),           # Claude x → trimesh Z (axle)
         ]
         for jh in wheel_joints
         if jh.get('position_normalized')
@@ -223,69 +198,6 @@ if wheel_joints:
     print("Pass 1 (initial search radius):")
     wheel_vert_counts, wheel_vert_clusters = build_clusters()
 
-    # ── Pass 1 Taubin on left wheels ─────────────────────────────────────────
-    # Fit each left wheel with the initial (possibly contaminated) clusters.
-    # The cleanest wheel is the one with the fewest verts — least chassis bleed.
-    # Use its Taubin result (pivot, axis, radius, half_thick) as the template
-    # for Pass 2 cylindrical filtering on ALL left wheels.
-    pass1_results = {}   # name → (pivot, axis, radius, half_thick)
-    for wj in wheel_joints:
-        name = wj['name']
-        p    = wj.get('position_normalized', {})
-        if p.get('x', 0.5) >= 0.5:
-            continue   # left wheels only
-        cluster = wheel_vert_clusters.get(name, np.empty((0, 3)))
-        if len(cluster) < 10:
-            continue
-        pivot, axis, radius, half_thick = taubin_pivot(cluster)
-        pass1_results[name] = (pivot, axis, radius, half_thick, len(cluster))
-        print(f"  Pass 1 {name}: radius={radius:.4f}  half_thick={half_thick:.4f}  verts={len(cluster)}")
-
-    # ── Identify the cleanest left wheel (fewest verts = least contamination) ─
-    if pass1_results:
-        cleanest = min(pass1_results.keys(), key=lambda n: pass1_results[n][4])
-        clean_pivot, clean_axis, clean_radius, clean_half_thick, _ = pass1_results[cleanest]
-        # Cap clean_half_thick: if contamination inflated it, use radius*0.3 as ceiling
-        # (a tyre's axial half-thickness is typically 25-35% of its rolling radius)
-        clean_half_thick = min(clean_half_thick, clean_radius * 0.3)
-        print(f"  Cleanest wheel: {cleanest} (radius={clean_radius:.4f} half_thick={clean_half_thick:.4f} capped)")
-
-        # ── Pass 2: cylindrical filter per left wheel using clean template ────
-        # For each left wheel, start from the Pass 1 cluster and remove any
-        # vert that lies outside the cylinder defined by:
-        #   - axial depth along thin axis: |depth| <= clean_half_thick * 1.1
-        #   - radial distance from pivot:  rad    <= clean_radius * 1.1
-        # This removes chassis verts that don't lie on the wheel's circular ring.
-        print("Pass 2 (cylindrical filter using cleanest wheel geometry):")
-        for wj in wheel_joints:
-            name = wj['name']
-            p    = wj.get('position_normalized', {})
-            if p.get('x', 0.5) >= 0.5:
-                continue
-            if name not in pass1_results:
-                continue
-
-            pivot, axis, radius, half_thick, _ = pass1_results[name]
-            cluster = wheel_vert_clusters[name]
-
-            # Project onto thin axis — keep only verts within clean_half_thick
-            rel        = cluster - pivot
-            ax_depths  = np.dot(rel, clean_axis)
-            rad_vecs   = rel - np.outer(ax_depths, clean_axis)
-            rad_dists  = np.linalg.norm(rad_vecs, axis=1)
-
-            axial_mask = np.abs(ax_depths) <= clean_half_thick * 1.1
-            radial_mask = rad_dists <= clean_radius * 1.1
-            clean_mask  = axial_mask & radial_mask
-
-            wheel_vert_clusters[name] = cluster[clean_mask]
-            wheel_vert_counts[name]   = clean_mask.sum()
-            print(f"  {name}: {len(cluster)} → {clean_mask.sum()} verts "
-                  f"(axial kept={axial_mask.sum()} radial kept={radial_mask.sum()})")
-    else:
-        print("Pass 2 skipped — no Pass 1 results available")
-
-    # Mirror any wheels that got 0 verts from their opposite side
     def mirror_wheel_name(name):
         replacements = [
             ('front_right', 'front_left'), ('front_left',  'front_right'),
@@ -298,115 +210,97 @@ if wheel_joints:
                 return name.replace(src, dst)
         return None
 
+    # ── Pass 1 Taubin on right-side wheels ───────────────────────────────────
+    # In trimesh space: X=front/rear, Y=height, Z=left/right (axle).
+    # Right-side wheels have Z > 0 (Claude x=0.85 maps to positive trimesh Z).
+    # The cab is at negative X (front of truck facing left).
+    # Contaminating cab trim verts are at more negative X than the wheel center.
+    # Filter: exclude verts more than one wheel_radius forward (negative X) of
+    # Claude's hint X position — these are cab geometry, not wheel geometry.
+
+    pass1_results = {}   # name → (pivot, axis, radius, half_thick)
     for wj, wp in zip(wheel_joints, wheel_world_positions):
-        if wheel_vert_counts.get(wj['name'], 0) == 0:
-            mirror_name  = mirror_wheel_name(wj['name'])
-            mirror_count = wheel_vert_counts.get(mirror_name, 0)
-            if mirror_name and mirror_count > 0:
-                for wj2, wp2 in zip(wheel_joints, wheel_world_positions):
-                    if wj2['name'] == mirror_name:
-                        mirrored_wp   = np.array([-wp2[0], wp2[1], wp2[2]])
-                        search_radius = mesh_size * wj.get('wheel_radius_normalized', 0.12) * 0.5
-                        dists         = np.linalg.norm(positions - mirrored_wp, axis=1)
-                        near_wheel    = dists < search_radius
-                        added_mask    = tire_color_mask_centroid & near_wheel
-                        wheel_vert_clusters[wj['name']] = positions[added_mask]
-                        wheel_vert_counts[wj['name']]   = added_mask.sum()
-                        print(f"  Mirrored {wj['name']} from {mirror_name}: {added_mask.sum()} verts")
-                        break
-
-    # ── Taubin fit per wheel ──────────────────────────────────────────────────
-    # Strategy:
-    #   1. Run Taubin on left wheels (x < 0) — these are visible and have clean geometry.
-    #   2. Mirror the result to the corresponding right wheel (flip X of pivot).
-    #      The axis and radius are the same; only the pivot X sign changes.
-    #   3. Use the PCA thin axis (rotation_axis from taubin_pivot) to compute
-    #      the axial half-thickness for the chassis slice in classify_wheels.
-    #      If the thin axis is unreliable, fall back to radius * 0.5.
-
-    print(f"\nTaubin fits:")
-
-    left_results  = {}   # name → (pivot, axis, radius) for left wheels
-    right_results = {}   # name → corresponding left wheel name
-
-    # Separate left and right wheel names
-    for wj in wheel_joints:
         name = wj['name']
         p    = wj.get('position_normalized', {})
         if p.get('x', 0.5) < 0.5:
-            left_results[name] = None   # to be filled by Taubin
-        else:
-            # Map right → left mirror name
-            mirror = mirror_wheel_name(name)
-            right_results[name] = mirror
-
-    # Run Taubin on left wheels
-    for wj in wheel_joints:
-        name    = wj['name']
-        if name not in left_results:
-            continue
+            continue   # right wheels only (Claude x > 0.5 → positive trimesh Z)
         cluster = wheel_vert_clusters.get(name, np.empty((0, 3)))
         if len(cluster) < 10:
-            print(f"  {name}: too few verts ({len(cluster)}) — skipping")
             continue
+
+        r_normalized       = wj.get('wheel_radius_normalized', 0.12)
+        y_range_mesh       = positions[:, 1].max() - positions[:, 1].min()
+        wheel_radius_world = r_normalized * y_range_mesh
+
+        # X band: exclude verts more than one radius forward OR rear of wheel center.
+        # The wheel is a circle — it cannot extend more than radius in either direction.
+        # This excludes cab trim (forward) and chassis (between wheels) contamination.
+        x_forward_limit = wp[0] - wheel_radius_world
+        x_rear_limit    = wp[0] + wheel_radius_world
+        x_mask          = (cluster[:, 0] >= x_forward_limit) & \
+                          (cluster[:, 0] <= x_rear_limit)
+        x_cluster       = cluster[x_mask]
+        if len(x_cluster) >= 10:
+            cluster = x_cluster
+            print(f"  {name}: X band filter kept {len(cluster)} verts "
+                  f"(X in [{x_forward_limit:.3f}, {x_rear_limit:.3f}], "
+                  f"wheel center X={wp[0]:.3f})")
+        else:
+            print(f"  {name}: X band filter too aggressive — skipping")
 
         pivot, axis, radius, half_thick = taubin_pivot(cluster)
 
-        # Compute axial half-thickness from thin axis projection
-        rel        = cluster - pivot
-        ax_depths  = np.dot(rel, axis)
-        half_thick = float(np.percentile(np.abs(ax_depths), 95))
-        if half_thick < radius * 0.1:   # unreliable — fall back
-            half_thick = radius * 0.5
+        # Axis-aligned box filter:
+        # trimesh X = front/rear → ± radius (wheel circle extent)
+        # trimesh Y = height     → ± radius (wheel circle extent)
+        # trimesh Z = axle       → ± half_thick (thin axis)
+        x_mask     = np.abs(cluster[:, 0] - pivot[0]) <= radius     * 1.1
+        y_mask     = np.abs(cluster[:, 1] - pivot[1]) <= radius     * 1.1
+        z_mask     = np.abs(cluster[:, 2] - pivot[2]) <= half_thick * 1.5
+        clean_mask = x_mask & y_mask & z_mask
+        clean_cluster = cluster[clean_mask]
 
-        print(f"  {name}: pivot={np.round(pivot,4).tolist()}  "
+        if len(clean_cluster) >= 10:
+            cluster = clean_cluster
+            pivot, axis, radius, half_thick = taubin_pivot(cluster)
+
+        pass1_results[name] = (pivot, axis, radius, half_thick, len(cluster))
+        print(f"  Pass 1 {name}: pivot={np.round(pivot,4).tolist()} "
               f"radius={radius:.4f}  half_thick={half_thick:.4f}  verts={len(cluster)}")
 
-        # Recenter pivot X to the midpoint of the cluster's X extent.
-        # Taubin fits a circle in the Y-Z plane (axle runs along Y), so its
-        # X coordinate drifts based on vert density asymmetry.
-        # The true axle center in X is simply the midpoint of the tyre's X span.
-        cluster_x = wheel_vert_clusters[name][:, 0]
-        pivot_x   = float((np.percentile(cluster_x, 2) + np.percentile(cluster_x, 98)) / 2)
-        pivot     = np.array([pivot_x, pivot[1], pivot[2]])
-
-        left_results[name] = (pivot, axis, radius, half_thick)
-        output_centroids[name] = {
-            'centroid':   [float(x) for x in pivot],
-            'radius':     float(radius),
-            'half_thick': float(half_thick),
-            'name':       name,
-            'axis':       [float(x) for x in axis] if axis is not None else [1.0, 0.0, 0.0],
-        }
-
-    # Mirror left results onto right wheels
+    # ── Mirror right results to left wheels ──────────────────────────────────
+    print("\nTaubin fits (right-side, mirrored to left):")
     for wj in wheel_joints:
-        name        = wj['name']
-        mirror_name = right_results.get(name)
-        if mirror_name is None:
-            continue   # this is a left wheel, already handled
+        name = wj['name']
+        p    = wj.get('position_normalized', {})
+        is_left = p.get('x', 0.5) < 0.5
 
-        src = left_results.get(mirror_name)
-        if src is None:
-            print(f"  {name}: mirror source {mirror_name} not available — skipping")
-            continue
-
-        pivot, axis, radius, half_thick = src
-
-        # Mirror: flip X of pivot, flip X component of axis
-        mirrored_pivot = np.array([-pivot[0],  pivot[1],  pivot[2]])
-        mirrored_axis  = np.array([-axis[0],   axis[1],   axis[2]])
-
-        print(f"  {name}: mirrored from {mirror_name}  "
-              f"pivot={np.round(mirrored_pivot,4).tolist()}  radius={radius:.4f}")
-
-        output_centroids[name] = {
-            'centroid':   [float(x) for x in mirrored_pivot],
-            'radius':     float(radius),
-            'half_thick': float(half_thick),
-            'name':       name,
-            'axis':       [float(x) for x in mirrored_axis],
-        }
+        if not is_left:
+            if name in pass1_results:
+                pivot, axis, radius, half_thick, _ = pass1_results[name]
+                print(f"  {name}: pivot={np.round(pivot,4).tolist()} radius={radius:.4f}")
+                output_centroids[name] = {
+                    'centroid':   [float(x) for x in pivot],
+                    'radius':     float(radius),
+                    'half_thick': float(half_thick),
+                    'name':       name,
+                    'axis':       [1.0, 0.0, 0.0],
+                }
+        else:
+            mirror_name = mirror_wheel_name(name)
+            if mirror_name and mirror_name in pass1_results:
+                pivot, axis, radius, half_thick, _ = pass1_results[mirror_name]
+                # Mirror: negate trimesh Z (axle) — X (front/rear) and Y (height) unchanged
+                mirrored_pivot = np.array([pivot[0], pivot[1], -pivot[2]])
+                print(f"  {name}: mirrored from {mirror_name} "
+                      f"pivot={np.round(mirrored_pivot,4).tolist()} radius={radius:.4f}")
+                output_centroids[name] = {
+                    'centroid':   [float(x) for x in mirrored_pivot],
+                    'radius':     float(radius),
+                    'half_thick': float(half_thick),
+                    'name':       name,
+                    'axis':       [1.0, 0.0, 0.0],
+                }
 
 else:
     # No wheel joints — fall back to quadrant split + Taubin
