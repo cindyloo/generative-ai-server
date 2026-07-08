@@ -3,7 +3,9 @@ You need to set these exports in your environment:
 FAL_KEY
 CLAUDE_API_KEY
 MESHY_API_KEY
+
 And if using cloud db (advanced, otherwise we are just storing in server/results pipeline_store.json)
+
 MODEL_STORE_BACKEND=clouddb
 CLOUDDB_URL=https://clouddb.appinventor.mit.edu
 CLOUDDB_TOKEN=your_token
