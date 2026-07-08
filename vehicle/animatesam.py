@@ -171,10 +171,18 @@ for i, wheel in enumerate(wheel_objects):
             pivot_entry = blender_wheel_centroids[best_name]
             print(f"  name mismatch: matched {wheel.name} → {best_name} (dist={best_dist:.3f})")
 
-    cx = float(actual_center[0])
-    cy = float(actual_center[1])
-    cz = float(actual_center[2])
-    print(f"  using mesh mean")
+    if pivot_entry is not None:
+        cpos = pivot_entry['centroid'] if isinstance(pivot_entry, dict) else pivot_entry
+        cx, cy, cz = float(cpos[0]), float(cpos[1]), float(cpos[2])
+        print(f"  using Taubin pivot")
+    else:
+        # No centroid resolved — fall back to mesh mean. Note: if the mesh
+        # is missing exterior verts the mean is biased and the wheel will
+        # wobble; the Taubin pivot is preferred whenever available.
+        cx = float(actual_center[0])
+        cy = float(actual_center[1])
+        cz = float(actual_center[2])
+        print(f"  using mesh mean (no centroid match)")
 
     print(f"  pivot: ({cx:.4f}, {cy:.4f}, {cz:.4f})")
 
