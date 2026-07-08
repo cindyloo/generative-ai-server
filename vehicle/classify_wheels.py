@@ -244,6 +244,16 @@ centroid_list = [(name, d['centroid'], d['radius'], d.get('half_thick', 0),
 
 wheel_vert_groups_raw = {}
 
+# Gate selection (computed once):
+# Paired vehicle (car/truck): asymmetric Y gate — outward full radius,
+#   inward half_thick only (excludes chassis geometry)
+# Everything else (bike/gear/mechanical): the wheel/gear FACES the user —
+#   the thin Blender-Y axis is the shared axle, so each gear owns the FULL
+#   depth (front and back mesh shells together). No axial constraint.
+is_paired_vehicle = classify_data.get('category', '') == 'vehicle' and \
+                    any('fr' in n or 'rr' in n or 'right' in n
+                        for n in true_centroids.keys())
+
 for name, pos, radius, half_thick, capture_r in centroid_list:
     pivot    = np.array(pos)
     is_left  = pivot[1] < 0   # Blender Y < 0 = left side (toward user)
@@ -253,15 +263,6 @@ for name, pos, radius, half_thick, capture_r in centroid_list:
     pool_idx   = np.arange(len(verts))
     pool_v     = verts
     pool_label = "all verts"
-
-    # Gate selection:
-    # Paired vehicle (car/truck): asymmetric Y gate — outward full radius,
-    #   inward half_thick only (excludes chassis geometry)
-    # Everything else (bike/gear/mechanical): simple radial gate — full
-    #   sphere around pivot, no inward/outward distinction
-    is_paired_vehicle = classify_data.get('category', '') == 'vehicle' and \
-                        any('fr' in n or 'rr' in n or 'right' in n
-                            for n in true_centroids.keys())
 
     xz_dist = np.sqrt((pool_v[:, 0] - pivot[0])**2 +
                       (pool_v[:, 2] - pivot[2])**2)
@@ -275,19 +276,15 @@ for name, pos, radius, half_thick, capture_r in centroid_list:
             (outward_y <=  (radius    * 1.1))
         )
     else:
-        # Unpaired gear / bike wheel: full CYLINDER around the axle
-        # (Blender Y), not a sphere. A sphere of the Taubin radius clips
-        # exactly the rim exterior: a tooth tip at radial distance ≈ r,
-        # axially offset by half the gear thickness, sits at Euclidean
-        # distance sqrt(r² + t²) > r.
+        # Unpaired gear / bike wheel facing the user: radial cylinder
+        # through the ENTIRE mesh depth. The photogrammetry mesh is a
+        # front shell + back shell along the thin Blender-Y axis, and a
+        # facing gear owns both. An axial band here splits a gear into
+        # front/back halves whenever the hint's depth coordinate is off.
         #   radial: capture_radius (max cluster extent incl. tooth tips —
         #           the Taubin fit is a 99th-pct pitch-circle estimate)
-        #   axial:  measured half-thickness both sides → whole gear,
-        #           both faces, exterior included
-        ht       = half_thick if half_thick > 1e-6 else radius
-        axial    = np.abs(pool_v[:, 1] - pivot[1])
-        box_gate = (xz_dist <= max(capture_r, radius * 1.1)) & \
-                   (axial   <= ht * 1.25)
+        #   axial:  unconstrained — full depth
+        box_gate = xz_dist <= max(capture_r, radius * 1.1)
 
     # Color filter within box — excludes non-wheel colored geometry
     # (blue cab, body panels) that falls inside the spatial box.
@@ -313,11 +310,17 @@ for name, pos, radius, half_thick, capture_r in centroid_list:
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ENFORCE DISJOINT ASSIGNMENT (true Voronoi)
-# Overlapping gates (e.g. stacked/coaxial gears) previously put the same
-# vertex into multiple groups; mesh.separate then ran sequentially, so the
-# first wheel separated stole shared verts from every later one (gear_yellow:
-# 7707 assigned → 365 separated). Assign each vertex exclusively to the wheel
-# whose normalized cylinder it sits deepest inside.
+# Overlapping gates previously put the same vertex into multiple groups;
+# mesh.separate then ran sequentially, so the first wheel separated stole
+# shared verts from every later one. Assign each vertex exclusively to the
+# nearest wheel.
+#
+# Distance metric:
+#   Paired vehicle: normalized in-plane radial + axial (fl vs fr share the
+#     same in-plane circle and are distinguished ONLY along the axle).
+#   Unpaired (facing gears / bike): IN-PLANE ONLY. Facing gears are
+#     coplanar; scoring depth would carve each gear into front/back halves
+#     assigned to different objects.
 # ══════════════════════════════════════════════════════════════════════════════
 pivot_params = {}
 for name, pos, radius, half_thick, capture_r in centroid_list:
@@ -333,8 +336,11 @@ for name, idxs in wheel_vert_groups_raw.items():
     P, R, HT = pivot_params[name]
     vv     = verts[np.array(idxs)]
     radial = np.hypot(vv[:, 0] - P[0], vv[:, 2] - P[2]) / R
-    ax     = np.abs(vv[:, 1] - P[1]) / HT
-    scores = radial**2 + ax**2
+    if is_paired_vehicle:
+        ax     = np.abs(vv[:, 1] - P[1]) / HT
+        scores = radial**2 + ax**2
+    else:
+        scores = radial**2
     for vi, sc in zip(idxs, scores):
         prev = vert_owner.get(vi)
         if prev is None or sc < prev[1]:
