@@ -55,7 +55,9 @@ if classify_json and os.path.exists(classify_json):
     wheel_joints        = [j for j in classify_data.get('joint_hints', [])
                            if j.get('body_part') in ['wheel', 'gear']]
     joint_hints_by_name = {j['name']: j for j in classify_data.get('joint_hints', [])}
-    is_mechanical       = classify_data.get('is_mechanical', False)
+    is_mechanical       = (classify_data.get('is_mechanical', False) or
+                       classify_data.get('category', '') == 'mechanical' or
+                       classify_data.get('rig_type', '') == 'mechanical')
     reference_radius    = classify_data.get('reference_radius_normalized', None)
 
     # Keep full dict (centroid + radius) so animatesam can use radius for pivot
@@ -169,14 +171,10 @@ for i, wheel in enumerate(wheel_objects):
             pivot_entry = blender_wheel_centroids[best_name]
             print(f"  name mismatch: matched {wheel.name} → {best_name} (dist={best_dist:.3f})")
 
-    if pivot_entry is not None:
-        pos = pivot_entry['centroid'] if isinstance(pivot_entry, dict) else pivot_entry
-        cx, cy, cz = float(pos[0]), float(pos[1]), float(pos[2])
-    else:
-        cx = float(actual_center[lr_idx])
-        cy = float(actual_center[fr_idx])
-        cz = float(actual_center[h_idx])
-        print(f"  no centroid found — using mesh mean")
+    cx = float(actual_center[0])
+    cy = float(actual_center[1])
+    cz = float(actual_center[2])
+    print(f"  using mesh mean")
 
     print(f"  pivot: ({cx:.4f}, {cy:.4f}, {cz:.4f})")
 

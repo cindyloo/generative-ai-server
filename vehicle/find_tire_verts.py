@@ -85,7 +85,7 @@ mesh_size = np.linalg.norm(positions.max(axis=0) - positions.min(axis=0))
 # Get wheel joints from Gemini
 wheel_joints = [
     jh for jh in classify_data.get('joint_hints', [])
-    if jh.get('body_part') == 'wheel'
+    if jh.get('body_part') in ('wheel', 'gear')
 ]
 
 # Compute tire radius from Gemini
@@ -98,54 +98,61 @@ else:
 print(f"Tire radius: {tire_radius:.3f}")
 
 
-def taubin_pivot(verts_3d):
+def taubin_pivot(verts_3d, hint_x=None):
     """
-    Fit a circle to a wheel point cloud in the Y/Z plane.
-    Wheels always face the user on a side-view vehicle so the axle is
-    always X. Fit Taubin directly in Y/Z — no PCA needed.
-    Returns (pivot, axis, radius, half_thick).
+    Fit a circle to a wheel point cloud in the X/Y plane
+    (trimesh: X=front/rear, Y=height).
+
+    The wheel faces the user who looks along trimesh Z (axle direction),
+    so the wheel circle lies in the X/Y plane. Taubin fits directly in X/Y,
+    giving accurate center_x (front/rear) and center_y (height) from geometry.
+
+    pivot_z = cluster Z midpoint (axle position, ± half_thick).
+    hint_x: unused, kept for API compatibility.
     """
     if len(verts_3d) < 10:
         mean = verts_3d.mean(axis=0)
-        return mean, np.array([1.0, 0.0, 0.0]), 0.0, 0.0
+        return mean, np.array([0.0, 0.0, 1.0]), 0.0, 0.0
 
+    X = verts_3d[:, 0]
     Y = verts_3d[:, 1]
-    Z = verts_3d[:, 2]
 
+    # Taubin circle fit in X/Y plane
     try:
-        y_mean, z_mean = Y.mean(), Z.mean()
-        Yc, Zc = Y - y_mean, Z - z_mean
-        Z_t  = Yc**2 + Zc**2
-        M_z  = np.column_stack((Z_t, Yc, Zc, np.ones(len(Yc))))
-        M    = np.dot(M_z.T, M_z) / len(Yc)
+        x_mean, y_mean = X.mean(), Y.mean()
+        Xc, Yc = X - x_mean, Y - y_mean
+        Z_t  = Xc**2 + Yc**2
+        M_z  = np.column_stack((Z_t, Xc, Yc, np.ones(len(Xc))))
+        M    = np.dot(M_z.T, M_z) / len(Xc)
         w, v = np.linalg.eig(M)
         imin  = np.argmin(np.abs(w))
         A, B, C, D = v[:, imin]
-        center_y = -B / (2 * A) + y_mean
-        center_z = -C / (2 * A) + z_mean
+        center_x = -B / (2 * A) + x_mean
+        center_y = -C / (2 * A) + y_mean
     except Exception:
-        center_y, center_z = Y.mean(), Z.mean()
+        center_x, center_y = X.mean(), Y.mean()
 
-    rad_dists  = np.sqrt((Y - center_y)**2 + (Z - center_z)**2)
+    rad_dists  = np.sqrt((X - center_x)**2 + (Y - center_y)**2)
     radius     = float(np.percentile(rad_dists, 99))
 
     tight_mask = rad_dists <= radius * 1.05
     if tight_mask.sum() >= 10:
         verts_3d   = verts_3d[tight_mask]
-        Y, Z       = verts_3d[:, 1], verts_3d[:, 2]
-        rad_dists  = np.sqrt((Y - center_y)**2 + (Z - center_z)**2)
+        X, Y       = verts_3d[:, 0], verts_3d[:, 1]
+        rad_dists  = np.sqrt((X - center_x)**2 + (Y - center_y)**2)
         radius     = float(np.percentile(rad_dists, 99))
 
-    pivot_x    = float((np.percentile(verts_3d[:, 0], 2) +
-                        np.percentile(verts_3d[:, 0], 98)) / 2)
-    ax_dists   = np.abs(verts_3d[:, 0] - pivot_x)
+    # Pivot Z = midpoint of cluster Z extent (axle position)
+    pivot_z    = float((np.percentile(verts_3d[:, 2], 2) +
+                        np.percentile(verts_3d[:, 2], 98)) / 2)
+    ax_dists   = np.abs(verts_3d[:, 2] - pivot_z)
     half_thick = float(np.percentile(ax_dists, 95))
     if half_thick < radius * 0.05:
         half_thick = radius * 0.3
     half_thick = min(half_thick, radius * 0.6)
 
-    pivot = np.array([pivot_x, center_y, center_z])
-    return pivot, np.array([1.0, 0.0, 0.0]), radius, half_thick
+    pivot = np.array([center_x, center_y, pivot_z])
+    return pivot, np.array([0.0, 0.0, 1.0]), radius, half_thick
 
 
 output_centroids = {}
@@ -210,31 +217,56 @@ if wheel_joints:
                 return name.replace(src, dst)
         return None
 
-    # ── Pass 1 Taubin on right-side wheels ───────────────────────────────────
-    # In trimesh space: X=front/rear, Y=height, Z=left/right (axle).
-    # Right-side wheels have Z > 0 (Claude x=0.85 maps to positive trimesh Z).
-    # The cab is at negative X (front of truck facing left).
-    # Contaminating cab trim verts are at more negative X than the wheel center.
-    # Filter: exclude verts more than one wheel_radius forward (negative X) of
-    # Claude's hint X position — these are cab geometry, not wheel geometry.
+    # ── Detect vehicle type for mirroring strategy ────────────────────────────
+    # Car/truck: wheels come in left/right pairs (fl+fr, rl+rr) — Taubin on
+    #   right wheels only, mirror Z to left wheels.
+    # Everything else (bike, mechanical, gears): run Taubin on all joints
+    #   independently. If any joint has too few verts, borrow geometry from
+    #   the cleanest one (most verts). No mirroring.
 
-    pass1_results = {}   # name → (pivot, axis, radius, half_thick)
+    is_mechanical_obj = classify_data.get('category', '') == 'mechanical' or \
+                        classify_data.get('rig_type', '') == 'mechanical'
+    wheel_names = [wj['name'] for wj in wheel_joints]
+    has_right   = any('fr' in n or 'right' in n or 'rr' in n for n in wheel_names)
+    has_left    = any('fl' in n or 'left'  in n or 'rl' in n for n in wheel_names)
+    is_paired   = has_right and has_left and not is_mechanical_obj
+
+    if is_paired:
+        print(f"  Paired vehicle (car/truck) — Taubin on right wheels, mirror Z")
+    else:
+        print(f"  Independent joints (bike/mechanical) — Taubin on all, no mirroring")
+
+    # ── Pass 1 Taubin ─────────────────────────────────────────────────────────
+    pass1_results = {}   # name → (pivot, axis, radius, half_thick, n_verts)
+    pass1_capture = {}   # name → capture radius (max radial extent incl. teeth)
+
     for wj, wp in zip(wheel_joints, wheel_world_positions):
         name = wj['name']
         p    = wj.get('position_normalized', {})
-        if p.get('x', 0.5) < 0.5:
-            continue   # right wheels only (Claude x > 0.5 → positive trimesh Z)
+
+        if is_paired and not ('fr' in name or 'right' in name or 'rr' in name):
+            continue   # car/truck: right wheels only
+
         cluster = wheel_vert_clusters.get(name, np.empty((0, 3)))
         if len(cluster) < 10:
             continue
 
+        # Z band filter: keep only verts near this gear's Z position.
+        # For gears/bikes at same X/Y but different Z, this separates clusters
+        # before Taubin runs so each gets its own clean set of verts.
         r_normalized       = wj.get('wheel_radius_normalized', 0.12)
         y_range_mesh       = positions[:, 1].max() - positions[:, 1].min()
         wheel_radius_world = r_normalized * y_range_mesh
 
-        # X band: exclude verts more than one radius forward OR rear of wheel center.
-        # The wheel is a circle — it cannot extend more than radius in either direction.
-        # This excludes cab trim (forward) and chassis (between wheels) contamination.
+        z_dist = np.abs(cluster[:, 2] - wp[2])
+        z_cluster = cluster[z_dist <= wheel_radius_world]
+        if len(z_cluster) >= 10:
+            cluster = z_cluster
+            print(f"  {name}: Z band filter kept {len(cluster)} verts "
+                  f"(Z in [{wp[2]-wheel_radius_world:.3f}, {wp[2]+wheel_radius_world:.3f}], "
+                  f"gear center Z={wp[2]:.3f})")
+        else:
+            print(f"  {name}: Z band filter too aggressive — skipping")
         x_forward_limit = wp[0] - wheel_radius_world
         x_rear_limit    = wp[0] + wheel_radius_world
         x_mask          = (cluster[:, 0] >= x_forward_limit) & \
@@ -248,59 +280,104 @@ if wheel_joints:
         else:
             print(f"  {name}: X band filter too aggressive — skipping")
 
-        pivot, axis, radius, half_thick = taubin_pivot(cluster)
+        pivot, axis, radius, half_thick = taubin_pivot(cluster, hint_x=wp[0])
+        pivot = np.array([pivot[0], pivot[1], wp[2]])  # use Claude's Z directly
 
-        # Axis-aligned box filter:
-        # trimesh X = front/rear → ± radius (wheel circle extent)
-        # trimesh Y = height     → ± radius (wheel circle extent)
-        # trimesh Z = axle       → ± half_thick (thin axis)
-        x_mask     = np.abs(cluster[:, 0] - pivot[0]) <= radius     * 1.1
-        y_mask     = np.abs(cluster[:, 1] - pivot[1]) <= radius     * 1.1
-        z_mask     = np.abs(cluster[:, 2] - pivot[2]) <= half_thick * 1.5
-        clean_mask = x_mask & y_mask & z_mask
+        # Axis-aligned box filter — X/Y radius, Z from Claude hint
+        x_mask     = np.abs(cluster[:, 0] - pivot[0]) <= radius * 1.1
+        y_mask     = np.abs(cluster[:, 1] - pivot[1]) <= radius * 1.1
+        clean_mask = x_mask & y_mask
         clean_cluster = cluster[clean_mask]
 
         if len(clean_cluster) >= 10:
             cluster = clean_cluster
-            pivot, axis, radius, half_thick = taubin_pivot(cluster)
+            pivot, axis, radius, half_thick = taubin_pivot(cluster, hint_x=wp[0])
+            pivot = np.array([pivot[0], pivot[1], wp[2]])  # use Claude's Z directly
 
         pass1_results[name] = (pivot, axis, radius, half_thick, len(cluster))
+
+        # Capture radius: max radial extent of the cluster (tooth tips sit
+        # beyond the Taubin pitch-circle fit, which is a 99th-pct estimate).
+        # Used downstream by classify_wheels as the vertex-capture gate;
+        # the Taubin radius stays authoritative for gear speed ratios.
+        rad_xy = np.sqrt((cluster[:, 0] - pivot[0])**2 +
+                         (cluster[:, 1] - pivot[1])**2)
+        pass1_capture[name] = float(rad_xy.max() * 1.02)
+
         print(f"  Pass 1 {name}: pivot={np.round(pivot,4).tolist()} "
-              f"radius={radius:.4f}  half_thick={half_thick:.4f}  verts={len(cluster)}")
+              f"radius={radius:.4f}  half_thick={half_thick:.4f}  "
+              f"capture={pass1_capture[name]:.4f}  verts={len(cluster)}")
 
-    # ── Mirror right results to left wheels ──────────────────────────────────
-    print("\nTaubin fits (right-side, mirrored to left):")
-    for wj in wheel_joints:
-        name = wj['name']
-        p    = wj.get('position_normalized', {})
-        is_left = p.get('x', 0.5) < 0.5
+    # ── Output centroids ──────────────────────────────────────────────────────
+    print("\nTaubin fits:")
 
-        if not is_left:
+    # For non-paired: find cleanest joint as fallback geometry source
+    if not is_paired and pass1_results:
+        cleanest_name = max(pass1_results.keys(), key=lambda n: pass1_results[n][4])
+
+    for wj, wp in zip(wheel_joints, wheel_world_positions):
+        name    = wj['name']
+
+        if is_paired:
+            is_right = 'fr' in name or 'right' in name or 'rr' in name
+            if is_right:
+                # Car/truck right wheel — use own Taubin result
+                if name in pass1_results:
+                    pivot, axis, radius, half_thick, _ = pass1_results[name]
+                    print(f"  {name}: pivot={np.round(pivot,4).tolist()} radius={radius:.4f}")
+                    output_centroids[name] = {
+                        'centroid':       [float(x) for x in pivot],
+                        'radius':         float(radius),
+                        'half_thick':     float(half_thick),
+                        'capture_radius': pass1_capture.get(name, radius * 1.15),
+                        'name':           name,
+                        'axis':           [1.0, 0.0, 0.0],
+                    }
+            else:
+                # Car/truck left wheel — mirror Z from right counterpart
+                mirror_name = mirror_wheel_name(name)
+                if mirror_name and mirror_name in pass1_results:
+                    pivot, axis, radius, half_thick, _ = pass1_results[mirror_name]
+                    mirrored_pivot = np.array([pivot[0], pivot[1], -pivot[2]])
+                    print(f"  {name}: mirrored from {mirror_name} "
+                          f"pivot={np.round(mirrored_pivot,4).tolist()} radius={radius:.4f}")
+                    output_centroids[name] = {
+                        'centroid':       [float(x) for x in mirrored_pivot],
+                        'radius':         float(radius),
+                        'half_thick':     float(half_thick),
+                        'capture_radius': pass1_capture.get(mirror_name, radius * 1.15),
+                        'name':           name,
+                        'axis':           [1.0, 0.0, 0.0],
+                    }
+        else:
+            # Bike/mechanical: each joint uses its own Taubin result.
+            # Z position always comes from Claude's hint (wp[2]).
             if name in pass1_results:
                 pivot, axis, radius, half_thick, _ = pass1_results[name]
-                print(f"  {name}: pivot={np.round(pivot,4).tolist()} radius={radius:.4f}")
-                output_centroids[name] = {
-                    'centroid':   [float(x) for x in pivot],
-                    'radius':     float(radius),
-                    'half_thick': float(half_thick),
-                    'name':       name,
-                    'axis':       [1.0, 0.0, 0.0],
-                }
-        else:
-            mirror_name = mirror_wheel_name(name)
-            if mirror_name and mirror_name in pass1_results:
-                pivot, axis, radius, half_thick, _ = pass1_results[mirror_name]
-                # Mirror: negate trimesh Z (axle) — X (front/rear) and Y (height) unchanged
-                mirrored_pivot = np.array([pivot[0], pivot[1], -pivot[2]])
-                print(f"  {name}: mirrored from {mirror_name} "
-                      f"pivot={np.round(mirrored_pivot,4).tolist()} radius={radius:.4f}")
-                output_centroids[name] = {
-                    'centroid':   [float(x) for x in mirrored_pivot],
-                    'radius':     float(radius),
-                    'half_thick': float(half_thick),
-                    'name':       name,
-                    'axis':       [1.0, 0.0, 0.0],
-                }
+            elif pass1_results:
+                pivot, axis, radius, half_thick, _ = pass1_results[cleanest_name]
+                pivot = np.array([wp[0], pivot[1], wp[2]])
+                print(f"  {name}: geometry from {cleanest_name}, X/Z from hint")
+            else:
+                continue
+
+            # Ensure pivot Z = Claude's hint Z
+            # Keep the MEASURED half_thick: stacked/coaxial gears (e.g. watch
+            # movements) are distinguished only by their axial band. Setting
+            # half_thick = radius made every gear's capture volume swallow
+            # its coaxial neighbours, so the first gear separated stole most
+            # of the others' vertices.
+            final_pivot = np.array([pivot[0], pivot[1], wp[2]])
+            print(f"  {name}: pivot={np.round(final_pivot,4).tolist()} "
+                  f"radius={radius:.4f} half_thick={half_thick:.4f}")
+            output_centroids[name] = {
+                'centroid':       [float(x) for x in final_pivot],
+                'radius':         float(radius),
+                'half_thick':     float(half_thick),
+                'capture_radius': pass1_capture.get(name, radius * 1.15),
+                'name':           name,
+                'axis':           [1.0, 0.0, 0.0],
+            }
 
 else:
     # No wheel joints — fall back to quadrant split + Taubin
