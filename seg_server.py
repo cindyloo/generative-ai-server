@@ -76,6 +76,8 @@ import tempfile
 import textwrap
 import threading
 import struct
+import shutil
+import stat
 
 import numpy as np
 import requests
@@ -92,8 +94,16 @@ from pipeline_store import _local_url, hydrate
 
 # ── App setup ──────────────────────────────────────────────────────────────────
 
-RESULTS_DIR = os.environ.get('RESULTS_DIR', 'results')
+RESULTS_DIR = os.environ.get("RESULTS_DIR") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "results"
+)
+_MAC_BLENDER = "/Applications/Blender.app/Contents/MacOS/Blender"
 
+BLENDER_BIN = (
+    os.environ.get("BLENDER_BIN")
+    or shutil.which("blender")
+    or (_MAC_BLENDER if os.path.isfile(_MAC_BLENDER) else "blender")
+ )
 
 def _rdir(classify_id: str) -> str:
     """Return (and create) the per-classify_id results subdirectory."""
@@ -134,6 +144,48 @@ log.info("rembg ready.")
 
 
 
+def _validate_environment():
+    """Fail fast with a clear message instead of an opaque PermissionError."""
+    # Blender binary must exist and be an executable *file*, not a directory.
+    resolved = shutil.which(BLENDER_BIN) or BLENDER_BIN
+    if os.path.isdir(resolved):
+        raise RuntimeError(
+            f"BLENDER_BIN points to a directory ({resolved}). On macOS use "
+            f"{resolved}/Contents/MacOS/Blender"
+        )
+    if not os.path.isfile(resolved):
+        raise RuntimeError(f"Blender executable not found at {resolved!r}")
+    if not os.access(resolved, os.X_OK):
+        # Try to make it executable; otherwise tell the user exactly what to do.
+        try:
+            os.chmod(resolved, os.stat(resolved).st_mode | stat.S_IXUSR)
+        except OSError:
+            raise RuntimeError(
+                f"{resolved} is not executable. Run: chmod +x {resolved}"
+            )
+ 
+    # Results directory must exist and be writable by *this* process.
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    if not os.access(RESULTS_DIR, os.W_OK):
+        raise RuntimeError(
+            f"RESULTS_DIR ({RESULTS_DIR}) is not writable by the current user. "
+            f"Either chown/chmod it, or set the RESULTS_DIR env var to a "
+            f"writable path."
+        )
+ 
+    return resolved
+ 
+ 
+BLENDER_BIN = _validate_environment()
+ 
+ 
+def _make_workspace():
+    """Create a unique, guaranteed-writable working directory."""
+    uid = str(uuid.uuid4())[:8]
+    ws = os.path.join(RESULTS_DIR, uid)
+    os.makedirs(ws, exist_ok=True)
+    return ws
+ 
 # ══════════════════════════════════════════════════════════════════════════════
 # SAM2 segmentation
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1657,7 +1709,6 @@ def segment():
         img    = utils.resize_if_needed(img, max_size=1024)
         output = remove(img, session=rembg_session)
         buf    = io.BytesIO()
-        log.info(f"/segment file: {output}")
         output.save(buf, format='PNG')
         buf.seek(0)
         return send_file(buf, mimetype='image/png')
@@ -2457,48 +2508,166 @@ def rig_status(task_id: str):
     return jsonify(task)
 
 
-# ── /decimate ─────────────────────────────────────────────────────────────────
+ 
+def _run_blender(script_source, workspace):
+    """
+    Run Blender headless with a script written to disk.
+ 
+    Fixes vs. the original:
+    - Script is written to a file and passed via --python (no shell-quoting /
+      --python-expr edge cases with paths containing quotes or spaces).
+    """
+    script_path = os.path.join(workspace, "blender_job.py")
+    with open(script_path, "w") as f:
+        f.write(script_source)
+ 
+    env = os.environ.copy()
+    env.update({
+        "TMPDIR": workspace,
+        "TEMP": workspace,
+        "TMP": workspace,
+        "HOME": env.get("HOME") or workspace,
+        "XDG_CACHE_HOME": os.path.join(workspace, ".cache"),
+    })
+ 
+    cmd = [
+        BLENDER_BIN,
+        "--background",
+        "--factory-startup",
+        "-noaudio",
+        "--python-exit-code", "1",   # ← add this
+        "--python", script_path,
+    ]
+    result = subprocess.run(
+        cmd,
+        cwd=workspace,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=600,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Blender exited with code {result.returncode}: "
+            f"{result.stderr or result.stdout}"
+        )
+ 
+ 
+def _decimate_script(in_path, out_path, ratio, fmt):
+    """Build the Blender-side script for GLB or USDZ decimation."""
+    if fmt == "usdz":
+        import_line = (
+            f"bpy.ops.wm.usd_import(filepath={in_path!r}, import_materials=True)"
+        )
+        export_line = (
+            f"bpy.ops.wm.usd_export(filepath={out_path!r}, "
+            f"export_materials=True, export_textures=True)"
+        )
+    else:  # glb
+        import_line = f"bpy.ops.import_scene.gltf(filepath={in_path!r})"
+        export_line = (
+            f"bpy.ops.export_scene.gltf(filepath={out_path!r}, "
+            f"export_format='GLB')"
+        )
+ 
+    return f"""
+import bpy
 
-@app.route('/decimate', methods=['GET', 'POST'])
+bpy.ops.wm.read_factory_settings(use_empty=True)
+{import_line}
+
+meshes = [o for o in bpy.context.scene.objects if o.type == 'MESH']
+if not meshes:
+    raise RuntimeError("Import produced no mesh objects - check the input file")
+
+for obj in meshes:
+    mod = obj.modifiers.new(name="AutoDecimate", type='DECIMATE')
+    mod.decimate_type = 'COLLAPSE'
+    mod.ratio = {ratio}
+    if hasattr(mod, "use_collapse_triangulate"):
+        mod.use_collapse_triangulate = True
+    with bpy.context.temp_override(object=obj, active_object=obj, selected_objects=[obj]):
+        bpy.ops.object.modifier_apply(modifier=mod.name)
+
+{export_line}
+"""
+ 
+ 
+def _fetch_or_read_payload(url_param):
+    """Get mesh bytes either from a URL query param or the request body."""
+    url = request.args.get(url_param, "").strip()
+    if url:
+        # NOTE: verify=False disables TLS validation — keep only if you truly
+        # need to hit self-signed internal hosts; prefer verify=True.
+        resp = requests.get(url, verify=False, timeout=60)
+        resp.raise_for_status()
+        return resp.content
+    return request.get_data()
+ 
+ 
+def _handle_decimate(fmt):
+    ratio = max(0.01, min(1.0, float(request.args.get("ratio", "0.1"))))
+    payload = _fetch_or_read_payload(f"{fmt}_url")
+    if not payload:
+        return jsonify({"error": f"No {fmt.upper()} data received"}), 400
+ 
+    ws = _make_workspace()
+    in_path = os.path.abspath(os.path.join(ws, f"input.{fmt}"))
+    out_path = os.path.abspath(os.path.join(ws, f"decimated.{fmt}"))
+ 
+    with open(in_path, "wb") as f:
+        f.write(payload)
+ 
+    _run_blender(_decimate_script(in_path, out_path, ratio, fmt), ws)
+ 
+    if not os.path.exists(out_path):
+        raise FileNotFoundError(
+            "Blender ran but did not produce an output file. For USDZ export "
+            "you need Blender 4.x — earlier versions cannot write .usdz."
+        )
+ 
+    # Best-effort cleanup; never let cleanup crash the request.
+    try:
+        os.unlink(in_path)
+    except OSError:
+        pass
+ 
+    return jsonify({
+        "status": "ok",
+        "url": _local_url(out_path, request.host),  # noqa: F821 (defined elsewhere)
+        "ratio": ratio,
+    })
+ 
+ 
+@app.route("/decimate_glb", methods=["GET", "POST"])  # noqa: F821
 def decimate():
     """Decimate a GLB mesh. Accepts raw bytes or ?glb_url=..."""
-    if request.method == 'GET':
-        return jsonify({'status': 'ok'}), 200
+    if request.method == "GET":
+        return jsonify({"status": "ok"}), 200
     try:
-        ratio   = max(0.01, min(1.0, float(request.args.get('ratio', '0.1'))))
-        glb_url = request.args.get('glb_url', '').strip()
-
-        if glb_url:
-            resp      = requests.get(glb_url, verify=False, timeout=60)
-            resp.raise_for_status()
-            glb_bytes = resp.content
-        else:
-            glb_bytes = request.stream.read()
-
-        if not glb_bytes:
-            return jsonify({'error': 'No GLB data'}), 400
-
-        uid      = str(uuid.uuid4())[:8]
-        _ud      = os.path.join(RESULTS_DIR, uid)
-        os.makedirs(_ud, exist_ok=True)
-        in_path  = os.path.join(_ud, "input.glb")
-        out_path = os.path.join(_ud, "decimated.glb")
-        with open(in_path, 'wb') as f:
-            f.write(glb_bytes)
-        _decimate_mesh(in_path, out_path, ratio=ratio)
-        os.unlink(in_path)
-
-        return jsonify({'status': 'ok',
-                        'url':    _local_url(out_path, request.host),
-                        'ratio':  ratio})
+        return _handle_decimate("glb")
     except HTTPException:
         raise
     except Exception as e:
-        log.error(f"/decimate error: {e}")
-        return jsonify({'error': str(e)}), 500
+        log.error(f"/decimate_glb error: {e}")  # noqa: F821
+        return jsonify({"error": str(e)}), 500
+ 
+ 
+@app.route("/decimate_usdz", methods=["GET", "POST"])  # noqa: F821
+def decimate_usdz():
+    """Decimate a USDZ mesh. Accepts raw bytes or ?usdz_url=..."""
+    if request.method == "GET":
+        return jsonify({"status": "ok"}), 200
+    try:
+        return _handle_decimate("usdz")
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error(f"/decimate_usdz error: {e}")  # noqa: F821
+        return jsonify({"error": str(e)}), 500
 
-
-# ── /convert_to_usdz ──────────────────────────────────────────────────────────
+#── /convert_to_usdz ──────────────────────────────────────────────────────────
 
 def convert_glb_to_usdz(glb_path: str, usdz_path: str) -> str:
     """Convert GLB to USDZ using Blender's USD exporter."""
