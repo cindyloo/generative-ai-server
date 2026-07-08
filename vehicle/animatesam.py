@@ -216,7 +216,14 @@ for i, wheel in enumerate(wheel_objects):
 
     elif body_part == 'gear' and is_mechanical and ref_r_mesh is not None:
         r_norm      = hint.get('wheel_radius_normalized', 0.15)
-        rot_dir     = hint.get('rotation_direction', 1)
+        # Get rotation direction from animations keyframes if available
+        rot_dir = hint.get('rotation_direction', 1)
+        animations = hint.get('animations', [])
+        if animations:
+            kf = animations[0].get('keyframes', [])
+            if len(kf) >= 2:
+                final_angle = kf[-1][1]
+                rot_dir = -1 if final_angle < 0 else 1
         this_r_mesh = r_norm * mesh_brange.max()
         speed_ratio = ref_r_mesh / max(this_r_mesh, 1e-6)
         total_angle = math.pi * 2 * speed_ratio * rot_dir
