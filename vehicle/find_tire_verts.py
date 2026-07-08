@@ -162,24 +162,49 @@ if wheel_joints:
     y_min, y_max = positions[:, 1].min(), positions[:, 1].max()
     z_min, z_max = positions[:, 2].min(), positions[:, 2].max()
 
-    # Coordinate mapping:
-    # trimesh X = front/rear (truck length, widest axis)
-    # trimesh Y = height
-    # trimesh Z = axle left/right (thin axis)
+    # Coordinate mapping depends on how the object faces the camera.
     #
-    # Claude convention (image space, truck facing left):
-    #   x = left/right in image  → trimesh Z (axle)
-    #   y = top/bottom in image  → trimesh Y (height, inverted)
-    #   z = front/rear in image  → trimesh X (truck length)
-    wheel_world_positions = np.array([
-        [
-            x_min + jh['position_normalized']['z'] * (x_max - x_min),          # Claude z → trimesh X (front/rear)
-            y_min + (1.0 - jh['position_normalized']['y']) * (y_max - y_min),   # Claude y → trimesh Y (height, flipped)
-            z_min + jh['position_normalized']['x'] * (z_max - z_min),           # Claude x → trimesh Z (axle)
-        ]
-        for jh in wheel_joints
-        if jh.get('position_normalized')
-    ])
+    # Side-view vehicle (truck/car):
+    #   trimesh X = front/rear (vehicle length, widest axis)
+    #   trimesh Y = height
+    #   trimesh Z = axle left/right (thin axis)
+    #   Claude x (image left/right) → trimesh Z (axle)
+    #   Claude z (front/rear)       → trimesh X
+    #
+    # Camera-facing mechanical object (gears face the user, like a bike
+    # wheel's face): the image plane IS the trimesh X/Y plane and the thin
+    # trimesh Z axis is the shared axle (depth). Gemini's z coordinate is
+    # meaningless for a flat facing object (it reports ~0.5 for everything),
+    # so mapping Claude x → trimesh Z squashes the gears' horizontal layout
+    # onto the 0.1-thick depth axis and coplanar gears end up with
+    # identical in-plane centers. For mechanical:
+    #   Claude x → trimesh X (width), Claude y → trimesh Y (height, flipped)
+    #   axle Z   → mesh Z midpoint (facing gears are coplanar in depth)
+    is_mechanical_obj = classify_data.get('category', '') == 'mechanical' or \
+                        classify_data.get('rig_type', '') == 'mechanical'
+
+    if is_mechanical_obj:
+        z_mid = (z_min + z_max) / 2.0
+        wheel_world_positions = np.array([
+            [
+                x_min + jh['position_normalized']['x'] * (x_max - x_min),           # Claude x → trimesh X (width)
+                y_min + (1.0 - jh['position_normalized']['y']) * (y_max - y_min),   # Claude y → trimesh Y (height, flipped)
+                z_mid,                                                              # coplanar: axle = depth midpoint
+            ]
+            for jh in wheel_joints
+            if jh.get('position_normalized')
+        ])
+        print(f"  Mechanical (camera-facing): Claude x→X, y→Y, axle Z=mesh mid ({z_mid:.3f})")
+    else:
+        wheel_world_positions = np.array([
+            [
+                x_min + jh['position_normalized']['z'] * (x_max - x_min),           # Claude z → trimesh X (front/rear)
+                y_min + (1.0 - jh['position_normalized']['y']) * (y_max - y_min),   # Claude y → trimesh Y (height, flipped)
+                z_min + jh['position_normalized']['x'] * (z_max - z_min),           # Claude x → trimesh Z (axle)
+            ]
+            for jh in wheel_joints
+            if jh.get('position_normalized')
+        ])
 
     print(f"Wheel positions from Gemini: {len(wheel_world_positions)}")
     for i, wp in enumerate(wheel_world_positions):
@@ -223,9 +248,7 @@ if wheel_joints:
     # Everything else (bike, mechanical, gears): run Taubin on all joints
     #   independently. If any joint has too few verts, borrow geometry from
     #   the cleanest one (most verts). No mirroring.
-
-    is_mechanical_obj = classify_data.get('category', '') == 'mechanical' or \
-                        classify_data.get('rig_type', '') == 'mechanical'
+    # (is_mechanical_obj is defined above, before the coordinate mapping.)
     wheel_names = [wj['name'] for wj in wheel_joints]
     has_right   = any('fr' in n or 'right' in n or 'rr' in n for n in wheel_names)
     has_left    = any('fl' in n or 'left'  in n or 'rl' in n for n in wheel_names)
