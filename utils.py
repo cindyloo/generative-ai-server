@@ -41,9 +41,9 @@ HUMANOID_KEYWORDS = {'human', 'person', 'character', 'humanoid', 'man',
                      'woman', 'boy', 'girl', 'robot', 'alien', 'zombie',
                      'totoro', 'creature', 'figure', 'monster'}
                      
-ANIMAL_KEYWORDS = {'dog', 'cat', 'bird', 'fish', 'shark', 'whale', 'wolf', 'animal','bug', 'insect', 'butterfly'}
+ANIMAL_KEYWORDS = {'dog', 'cat', 'bird', 'fish', 'shark', 'whale', 'wolf', 'animal','bug', 'insect', 'butterfly', 'bee'}
 
-MECHANICAL_KEYWORDS = {'gear', 'mechanical', 'toy', 'hinged', 'lever', 'gadget', 'tool'}
+MECHANICAL_KEYWORDS = {'gear', 'mechanical', 'hinged', 'lever', 'gadget', 'tool'}
 # ── Image helpers ─────────────────────────────────────────────────────────────
 
 def resize_if_needed(img: Image.Image, max_size: int = 1024) -> Image.Image:
@@ -95,9 +95,9 @@ WALK_KEYFRAMES = {
     "hip":       ("x",  1,  0.45),
     "leg":       ("x",  1,  0.60),
     "foot":      ("x",  1,  0.20),
-    "wing_base": ("z",  1,  0.45),  # ±26° — meaningful flap from spread pose
-    "wing_mid":  ("z",  1,  0.30),  # trails base — tip-wave effect
-    "wing_tip":  ("z",  1,  0.18),  # trails most
+    "wing_base": ("x",  1,  0.45),  # ±26° — meaningful flap from spread pose
+    "wing_mid":  ("x",  1,  0.30),  # trails base — tip-wave effect
+    "wing_tip":  ("x",  1,  0.18),  # trails most
     "axle":      None,
     "body":      None,
 }
@@ -403,7 +403,7 @@ def inject_keyframes(skel: dict) -> dict:
         # Idle — root bob and head nod only
         animations += build_idle_keyframes(body_part, name)
 
-        # Wave — left arm/wing only
+        # Wave — left arm only or both wings
         animations += build_wave_keyframes(body_part, name)
 
         if joint.get('hint') is None:
@@ -1017,39 +1017,127 @@ RULES FOR MECHANICAL OBJECTS:
 - Name parts descriptively: gear_red, gear_large, hinge_jaw, hinge_lid etc.
 """
  
- 
+
 _VEHICLE_EXAMPLE_JSON = """\
 Return JSON in exactly this structure (adapt joint positions to match the image):
  
 {
+  "object_type": "lego monster truck",
+  "category": "vehicle",
+  "needs_augmentation": false,
+  "augment_prompt": "",
+  "wheel_colors_rgb": [[13, 13, 13], [180, 180, 180]],
+  "suggested_joints": 7,
   "joint_hints": [
-{"name": "gear",     "body_part": "gear",  "deforms_mesh": true,  "position_normalized": {"x": 0.5,  "y": 0.06, "z": 0.15}, "wheel_radius_normalized": 0.06},
-{"name": "wheel_fl", "body_part": "wheel", "deforms_mesh": true,  "position_normalized": {"x": 0.15, "y": 0.35, "z": 0.15}, "wheel_radius_normalized": 0.35},
-{"name": "wheel_fr", "body_part": "wheel", "deforms_mesh": true,  "position_normalized": {"x": 0.85, "y": 0.35, "z": 0.15}, "wheel_radius_normalized": 0.35},
-{"name": "wheel_rl", "body_part": "wheel", "deforms_mesh": true,  "position_normalized": {"x": 0.15, "y": 0.35, "z": 0.75}, "wheel_radius_normalized": 0.35},
-{"name": "wheel_rr", "body_part": "wheel", "deforms_mesh": true,  "position_normalized": {"x": 0.85, "y": 0.35, "z": 0.75}, "wheel_radius_normalized": 0.35}
+    {"name": "body",     "body_part": "body",  "deforms_mesh": false, "position_normalized": {"x": 0.5,  "y": 0.35, "z": 0.5},  "wheel_radius_normalized": 0.0,  "animations": []},
+    {"name": "axle_f",   "body_part": "axle",  "deforms_mesh": false, "position_normalized": {"x": 0.5,  "y": "MEASURE_FROM_IMAGE", "z": 0.25}, "wheel_radius_normalized": 0.0,  "animations": []},
+    {"name": "axle_r",   "body_part": "axle",  "deforms_mesh": false, "position_normalized": {"x": 0.5,  "y": "MEASURE_FROM_IMAGE", "z": 0.75}, "wheel_radius_normalized": 0.0,  "animations": []},
+    {"name": "wheel_fl", "body_part": "wheel", "deforms_mesh": true,  "position_normalized": {"x": 0.15, "y": "MEASURE_FROM_IMAGE", "z": 0.25}, "wheel_radius_normalized": "MEASURE_FROM_IMAGE", "animations": [{"clip": "drive", "property": "rotation_euler", "axis": "x", "keyframes": [[0,0.0],[30,3.14159],[60,6.28318]], "loop": true}]},
+    {"name": "wheel_fr", "body_part": "wheel", "deforms_mesh": true,  "position_normalized": {"x": 0.85, "y": "MEASURE_FROM_IMAGE", "z": 0.25}, "wheel_radius_normalized": "MEASURE_FROM_IMAGE", "animations": [{"clip": "drive", "property": "rotation_euler", "axis": "x", "keyframes": [[0,0.0],[30,3.14159],[60,6.28318]], "loop": true}]},
+    {"name": "wheel_rl", "body_part": "wheel", "deforms_mesh": true,  "position_normalized": {"x": 0.15, "y": "MEASURE_FROM_IMAGE", "z": 0.75}, "wheel_radius_normalized": "MEASURE_FROM_IMAGE", "animations": [{"clip": "drive", "property": "rotation_euler", "axis": "x", "keyframes": [[0,0.0],[30,3.14159],[60,6.28318]], "loop": true}]},
+    {"name": "wheel_rr", "body_part": "wheel", "deforms_mesh": true,  "position_normalized": {"x": 0.85, "y": "MEASURE_FROM_IMAGE", "z": 0.75}, "wheel_radius_normalized": "MEASURE_FROM_IMAGE", "animations": [{"clip": "drive", "property": "rotation_euler", "axis": "x", "keyframes": [[0,0.0],[30,3.14159],[60,6.28318]], "loop": true}]}
   ],
   "skeleton": [
-    {"parent": "body",       "child": "front_axle"},
-    {"parent": "body",       "child": "rear_axle"},
-    {"parent": "body",       "child": "gear"},
-    {"parent": "front_axle", "child": "wheel_fl"},
-    {"parent": "front_axle", "child": "wheel_fr"},
-    {"parent": "rear_axle",  "child": "wheel_rl"},
-    {"parent": "rear_axle",  "child": "wheel_rr"}
-  ],
-  "suggested_joints": 7,
-  "gear" — a rotating disc/wheel that is driven by the drivetrain (chainring, sprocket, cog).
-          deforms_mesh: true, includes drive animation.
-  "wheel_radius_normalized" — measure from hub center to tire edge in pixels, divide by image height.
-          Wheels on a bicycle are typically 0.30–0.40. Gears/chainrings are typically 0.06–0.10.
- 
-  Left wheels x<0.4, right wheels x>0.6.
-  front_axle y must match front wheel y, rear_axle y must match rear wheel y.
-  body and axles: deforms_mesh=false. wheels: deforms_mesh=true.
+    {"parent": "body", "child": "axle_f"},
+    {"parent": "body", "child": "axle_r"},
+    {"parent": "axle_f", "child": "wheel_fl"},
+    {"parent": "axle_f", "child": "wheel_fr"},
+    {"parent": "axle_r", "child": "wheel_rl"},
+    {"parent": "axle_r", "child": "wheel_rr"}
+  ]
 }
+
+Replace all "MEASURE_FROM_IMAGE" placeholders with values measured from the actual image.
 """
+
+
+def _build_vehicle_prompt(object_type: str, category: str,
+                          n_joints: int | None = None,
+                          mesh_bounds: dict | None = None,
+                          rig_type: str = '') -> str:
+
+    joints_instruction = (
+        f"\nAim for approximately {n_joints} joints total, covering the FULL object from top to bottom."
+    )
+
+    rt = (rig_type or category or '').lower()
+    if rt == 'vehicle':
+        example_json = _VEHICLE_EXAMPLE_JSON
+    else:
+        example_json = _MECHANICAL_EXAMPLE_JSON
+
+    if mesh_bounds:
+        w = mesh_bounds['width']
+        h = mesh_bounds['height']
+        hw = h / w
+        mesh_context = f"MESH: width={w:.3f} height={h:.3f} ratio={hw:.2f}"
+    else:
+        mesh_context = ""
+
+    header = f"""Analyze this vehicle image for 3D rigging. Return ONLY valid JSON.
+ rig_type: {rt or 'unknown'} for 3D rigging. Return ONLY valid JSON.
+{joints_instruction}
+{mesh_context}
+COORDINATE CONVENTION:
+  x = left/right (0=left,  1=right)
+  y = top/bottom (0=top,   1=bottom) — standard image pixel convention, y=0 is TOP
+  z = front/rear (0=front, 1=rear)
  
+STEP 1 — Identify vehicle type:
+  - Bicycle / motorcycle → 2 wheels (wheel_fl=front, wheel_rl=rear) + any visible gears
+  - Car / truck / bus   → 4 wheels (wheel_fl, wheel_fr, wheel_rl, wheel_rr)
+    Include all 4 wheels even if only 2 are visible — mirror hidden ones.
+ 
+STEP 2 — Identify rotating parts:
+  body_part values:
+    "body"  — chassis, no animation
+    "axle"  — axle rod, no animation
+    "wheel" — tire that contacts the ground, animates
+    "gear"  — chainring, sprocket, cog — does NOT touch ground, animates
+ 
+STEP 3 — MEASURE wheel positions directly from the image pixels:
+  For each visible wheel, find the circle in the image and measure:
+    x = horizontal pixel position of wheel center / total image width
+    y = vertical pixel position of wheel center / total image height
+    wheel_radius_normalized = wheel radius in pixels / total image height
+
+  Do NOT estimate or guess y from typical values.
+  Do NOT anchor to example y values — every vehicle is different.
+  The wheel center y depends on how large the wheels are and where they sit
+  relative to the vehicle body — measure it from what you actually see.
+
+  Sanity check: the bottom of the wheel should be near y=1.0 (bottom of image).
+  So wheel_center_y ≈ 1.0 - wheel_radius_normalized.
+  If your measured y is much smaller than this, re-measure.
+
+STEP 4 — Mirror hidden wheels:
+FOR 4-WHEEL VEHICLES (side view):
+  Only 2 wheels are visible. The hidden wheels mirror in x only — same y and z as their visible pair.
+  wheel_fl: x=0.15, z=<front z>   wheel_fr: x=0.85, z=<same front z>
+  wheel_rl: x=0.15, z=<rear z>    wheel_rr: x=0.85, z=<same rear z>
+  fl and fr MUST have the same y value. rl and rr MUST have the same y value.
+  fl and fr MUST have different x values. rl and rr MUST have different x values.
+
+"""
+
+    example = example_json
+
+    rules = """RULES:
+  - wheel_colors_rgb: inspect EACH ZONE of the wheel separately:
+      ZONE 1: tire rubber (outermost ring) — almost always black or dark gray
+      ZONE 2: rim/spoke area — often colored or silver
+      ZONE 3: hub center — often gray or white
+    List ALL zones with distinct colors as separate RGB entries (0-255 integers).
+    Do NOT include frame/body colors.
+  - body/axle: deforms_mesh false, animations []
+  - wheel/gear: deforms_mesh true, include drive animation
+  - wheel_radius_normalized: measure from hub center to OUTER TIRE EDGE in pixels,
+    divide by total image height.
+  - front and rear wheels MUST have different z values
+  - left and right wheels MUST have different x values (left≈0.15, right≈0.85)
+"""
+
+    return header + example + rules
  
 def _build_vehicle_classify_prompt(tag_ctx: str = '') -> str:
 
@@ -1122,114 +1210,3 @@ Rules:
 """
     return header + rules
 
-
-def _build_vehicle_prompt(object_type: str, category: str,
-                          n_joints: int | None = None,
-                          mesh_bounds: dict | None = None,
-                          rig_type: str = '') -> str:
-
-    MIN_JOINTS, MAX_JOINTS = 2, 16
-   
-    joints_instruction = (
-        f"\nAim for approximately {n_joints} joints total, covering the FULL object from top to bottom."
-    )
-
-    # Select example skeleton based on rig_type (how it moves),
-    # falling back to category if rig_type is absent (old records)
-    rt = (rig_type or category or '').lower()
-    if rt == 'vehicle':
-        example_json = _VEHICLE_EXAMPLE_JSON
-    else: #rt == 'mechanical':
-        example_json = _MECHANICAL_EXAMPLE_JSON
-
-
-    if mesh_bounds:
-        w = mesh_bounds['width']
-        h = mesh_bounds['height']
-        hw = h / w
-
-    mesh_context = "MESH: width={w:.3f} height={h:.3f} ratio={hw:.2f}"
-    header = """Analyze this vehicle image for 3D rigging. Return ONLY valid JSON.
- rig_type: {rig_type or 'unknown'} for 3D rigging. Return ONLY valid JSON.
-{joints_instruction}
-{mesh_context}
-COORDINATE CONVENTION:
-  x = left/right (0=left,  1=right)
-  y = top/bottom (0=top,   1=bottom) — standard image pixel convention, y=0 is TOP
-  z = front/rear (0=front, 1=rear)
- 
-STEP 1 — Identify vehicle type:
-  - Bicycle / motorcycle → 2 wheels (wheel_fl=front, wheel_rl=rear) + any visible gears
-  - Car / truck / bus   → 4 wheels (wheel_fl, wheel_fr, wheel_rl, wheel_rr)
-    Include all 4 wheels even if only 2 are visible — mirror hidden ones.
- 
-STEP 2 — Identify rotating parts:
-  body_part values:
-    "body"  — chassis, no animation
-    "axle"  — axle rod, no animation
-    "wheel" — tire that contacts the ground, animates
-    "gear"  — chainring, sprocket, cog — does NOT touch ground, animates
- 
-STEP 3 — CRITICAL Place joints at the visual center of each wheel/gear circle:
-  x and y = pixel perfect center of the wheel/gear as seen in the image.
-  y=0 is the TOP of the image, y=1 is the BOTTOM — measure where the hub center actually is.
-  Front:  z≈0.20–0.30
-  Rear:   z≈0.70–0.80
-  Left wheels:  x≈0.15 (x < 0.4)
-  Right wheels: x≈0.85 (x > 0.6)
-  Bicycle wheels: x≈0.5 (centered, only separated by z)
- 
-FOR 4-WHEEL VEHICLES (side view):
-  Only 2 wheels are visible. The hidden wheels mirror in x only — same z as their visible pair.
-  wheel_fl: x=0.15, z=<front z>   wheel_fr: x=0.85, z=<same front z>
-  wheel_rl: x=0.15, z=<rear z>    wheel_rr: x=0.85, z=<same rear z>
-  fl and fr MUST have different x values. rl and rr MUST have different x values.
- 
-"""
- 
-    example = """EXAMPLE OUTPUT (adapt all values to match the actual image):
-{
-  "object_type": "lego monster truck",
-  "category": "vehicle",
-  "needs_augmentation": false,
-  "augment_prompt": "",
-  "wheel_colors_rgb": [[13, 13, 13], [180, 180, 180]],
-  "suggested_joints": 7,
-  "joint_hints": [
-    {"name": "body",     "body_part": "body",  "deforms_mesh": false, "position_normalized": {"x": 0.5,  "y": 0.35, "z": 0.5},  "wheel_radius_normalized": 0.0,  "animations": []},
-    {"name": "axle_f",   "body_part": "axle",  "deforms_mesh": false, "position_normalized": {"x": 0.5,  "y": 0.65, "z": 0.25}, "wheel_radius_normalized": 0.0,  "animations": []},
-    {"name": "axle_r",   "body_part": "axle",  "deforms_mesh": false, "position_normalized": {"x": 0.5,  "y": 0.65, "z": 0.75}, "wheel_radius_normalized": 0.0,  "animations": []},
-    {"name": "wheel_fl", "body_part": "wheel", "deforms_mesh": true,  "position_normalized": {"x": 0.15, "y": 0.65, "z": 0.25}, "wheel_radius_normalized": 0.38, "animations": [{"clip": "drive", "property": "rotation_euler", "axis": "x", "keyframes": [[0,0.0],[30,3.14159],[60,6.28318]], "loop": true}]},
-    {"name": "wheel_fr", "body_part": "wheel", "deforms_mesh": true,  "position_normalized": {"x": 0.85, "y": 0.65, "z": 0.25}, "wheel_radius_normalized": 0.38, "animations": [{"clip": "drive", "property": "rotation_euler", "axis": "x", "keyframes": [[0,0.0],[30,3.14159],[60,6.28318]], "loop": true}]},
-    {"name": "wheel_rl", "body_part": "wheel", "deforms_mesh": true,  "position_normalized": {"x": 0.15, "y": 0.65, "z": 0.75}, "wheel_radius_normalized": 0.38, "animations": [{"clip": "drive", "property": "rotation_euler", "axis": "x", "keyframes": [[0,0.0],[30,3.14159],[60,6.28318]], "loop": true}]},
-    {"name": "wheel_rr", "body_part": "wheel", "deforms_mesh": true,  "position_normalized": {"x": 0.85, "y": 0.65, "z": 0.75}, "wheel_radius_normalized": 0.38, "animations": [{"clip": "drive", "property": "rotation_euler", "axis": "x", "keyframes": [[0,0.0],[30,3.14159],[60,6.28318]], "loop": true}]}
-  ],
-  "skeleton": [
-    {"parent": "body", "child": "axle_f"},
-    {"parent": "body", "child": "axle_r"},
-    {"parent": "axle_f", "child": "wheel_fl"},
-    {"parent": "axle_f", "child": "wheel_fr"},
-    {"parent": "axle_r", "child": "wheel_rl"},
-    {"parent": "axle_r", "child": "wheel_rr"}
-  ]
-}
- 
-"""
- 
-    rules = """RULES:
-  - wheel_colors_rgb: inspect EACH ZONE of the wheel separately:
-      ZONE 1: tire rubber (outermost ring) — almost always black or dark gray
-      ZONE 2: rim/spoke area — often colored or silver
-      ZONE 3: hub center — often gray or white
-    List ALL zones with distinct colors as separate RGB entries (0-255 integers).
-    Do NOT include frame/body colors.
-  - body/axle: deforms_mesh false, animations []
-  - wheel/gear: deforms_mesh true, include drive animation
-  - wheel_radius_normalized: measure from hub center to OUTER TIRE EDGE in pixels,
-    divide by total image height. For large monster truck wheels this may be 0.35-0.45, for gears,
-    gear CENTER to the TIP OF THE OUTERMOST TOOTH in pixels, divide by image height. Do NOT measure to the inner ring — include the full tooth height.
-  - front and rear wheels MUST have different z values
-  - left and right wheels MUST have different x values (left≈0.15, right≈0.85)
-"""
- 
-    return header + example + rules
