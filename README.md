@@ -19,7 +19,7 @@ SEGMENT
 Segmentd that picture
 
 CLASSIFY
-`curl -s -X POST \\n  <server>:6000:6000/classify?tag=a+lego+car&force=true" \\n  --data-binary @assets/lego_car_segmented.png`
+`curl -s -X POST \\n  <server>:6000/classify?tag=a+lego+car&force=true" \\n  --data-binary @assets/lego_car_segmented.png`
 
 returns
 {"active_image_path":"results/7b83d28d/7b83d28d_segmented.png","augment_prompt":"","category":"vehicle","classify_id":"7b83d28d","needs_augmentation":false,"object_type":"lego truck","rig_type":"vehicle","rigid_parts":["body","axle"],"segmented_image_path":"results/7b83d28d/7b83d28d_segmented.png","style":"physical LEGO toy, plastic brick construction, bright primary colors, hard-edged geometric shapes, studio white background photograph"}
