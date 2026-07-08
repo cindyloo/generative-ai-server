@@ -13,6 +13,8 @@ CLOUDDB_PROJECT=your_project_id
 
 PIPELINE
 Begin with an image of something you want to animate
+
+
 /segment
 SEGMENT
 `curl -s -X POST  <server>:6000/segment" --data-binary @assets/lego_truck.jpg -H "Content-Type: application/octet-stream" --output assets/lego_truck_segmented.png`
