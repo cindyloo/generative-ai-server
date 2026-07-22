@@ -1,4 +1,4 @@
-##How to animate anything!
+###How to animate anything!
 
 #API Instructions: 
 You need obtain and set these exports in your environment:
