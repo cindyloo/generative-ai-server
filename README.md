@@ -1,4 +1,4 @@
-###How to animate anything!
+<b>How to animate anything!</b>
 
 #API Instructions: 
 You need obtain and set these exports in your environment:
@@ -24,11 +24,11 @@ Begin with an image of something you want to animate
 
 
 
-#SEGMENT
+<b>SEGMENT</b>
 `curl -s -X POST  <server>:6000/segment" --data-binary @assets/lego_truck.jpg -H "Content-Type: application/octet-stream" --output assets/lego_truck_segmented.png`
 Segmentd that picture
 
-#CLASSIFY
+<b>CLASSIFY</b>
 `curl -s -X POST \\n  <server>:6000/classify?tag=a+lego+car&force=true" \\n  --data-binary @assets/lego_car_segmented.png`
 
 returns
@@ -41,7 +41,7 @@ A lego car
 A two-legged dog statue
 A bird
 
-#AUGMENT (optional, included as part of classification)
+<b>AUGMENT</b> (optional, included as part of classification)
 `curl -s -X POST <server>:6000/augment_image?classify_id=7b83d28d"`
 POST /augment_image?classify_id=    generate two augmented variants via fal.ai
 POST /augment_image/confirm?classify_id=&choice=a|b  lock in chosen variant
@@ -52,7 +52,7 @@ As a vehicle (side)
 As something mechanical (front)
 
 
-#CREATE MESH
+<b>CREATE MESH</b>
 `curl -s -X POST <server>:6000/mesh?classify_id=7b83d28d&joints=4&force=true"`
 This will take several minutes
 You should see something like
@@ -66,14 +66,14 @@ INFO:seg_server:Decimated mesh: results/7b83d28d/7b83d28d_decimated.glb
 INFO:seg_server:Mesh task f2e1b50b complete: results/7b83d28d/7b83d28d_mesh.glb
 
 
-#INFER JOINTS
+<b>INFER JOINTS</b>
 `curl -s -X POST "<server>:6000/infer_joints?classify_id=1da7d94d&joints=4&force=true"`
 
 You should see a response like   
 {"active_image_path":"results/7b83d28d/7b83d28d_segmented.png","augment_prompt":"","category":"vehicle","classify_id":"7b83d28d","joint_hints":[{...}] …}
 
 
-#CREATE RIGGED MESH
+<b>CREATE RIGGED MESH</b>
  `curl -s -X POST <server>:6000/rig?classify_id=1da7d94d&force=true"`
 {"classify_id":"7b83d28d","status":"processing","task_id":"1d99d40e"}
 
