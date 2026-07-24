@@ -1,12 +1,17 @@
 <b>How to animate anything!</b>
 
-#API Instructions: 
-You need obtain and set these exports in your environment:
-FAL_KEY,
-CLAUDE_API_KEY,
-MESHY_API_KEY
+This api gives you an ability to start up a Flask server and create 3d animated models from one picture. <br/>
 
-create a virtual env</br>
+The picture must clearly represent the object in full frame. Humans or humanoid objects need to be represented head to toe, ideally in a T or A pose. Animals and vehicles need to be in full frame facing to either side (not facing the camera).<br/>
+<br/>
+to run the server:
+<br/>
+You need obtain and set these exports in your environment:<br/>
+FAL_KEY,<br/>
+CLAUDE_API_KEY,<br/>
+MESHY_API_KEY<br/>
+<br/>
+Create a virtual env</br>
 `source venv/bin/activate`</br>
 install required libs (there may be a few more you need to add)</br>
 `pip install -r requirements.txt`</br>
