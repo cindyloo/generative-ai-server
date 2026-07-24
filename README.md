@@ -1,8 +1,14 @@
-<b>How to animate anything!</b>
+<b>How to animate anything!</b> 
+<p><img width="300" height="200" alt="broccoli" src="https://github.com/user-attachments/assets/d4cc8a00-df4b-425d-996d-a2bf53978c59" />
+ <img width="300" height="200" alt="Screenshot 2026-07-23 at 8 13 43 PM" src="https://github.com/user-attachments/assets/5f74de0b-6653-4d12-9b75-d5b6f9412e9b" />
+<img width="300" height="200" alt="happy_broccoli_walking" src="https://github.com/user-attachments/assets/8edd0e55-a014-4bc1-a21c-0537c948b246" />
+</p>
 
 This api gives you an ability to start up a Flask server and create 3d animated models from one picture. <br/>
 
-The picture must clearly represent the object in full frame. Humans or humanoid objects need to be represented head to toe, ideally in a T or A pose. Animals and vehicles need to be in full frame facing to either side (not facing the camera).<br/>
+The picture you provide must clearly represent the object in full frame. Humans or humanoid objects need to be represented head to toe, ideally in a T or A pose, or facing "forward". Animals and vehicles need to be in full frame facing to either side (not facing the camera).<br/>
+
+
 <br/>
 to run the server:
 <br/>
@@ -25,7 +31,7 @@ CLOUDDB_PROJECT=your_project_id
 
 
 ***THE PIPELINE!***</br>
-Begin with an image of something you want to animate. Create an assets folder and drop it there
+Begin with an image (as specified above) of something you want to animate. Create an assets folder and drop it there
 
 
 <server> denotes where you have set up the server. 
