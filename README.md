@@ -1,4 +1,4 @@
-<b>How to animate anything!</b> 
+<b>How to animate anything!</b>  More background here: <a href="https://medium.com/@csbishopfilm/endeavoring-animation-bebe0b16b085?sharedUserId=csbishopfilm">here</a>
 <p><img width="300" height="200" alt="broccoli" src="https://github.com/user-attachments/assets/d4cc8a00-df4b-425d-996d-a2bf53978c59" />
  <img width="300" height="200" alt="Screenshot 2026-07-23 at 8 13 43 PM" src="https://github.com/user-attachments/assets/5f74de0b-6653-4d12-9b75-d5b6f9412e9b" />
 <img width="300" height="200" alt="happy_broccoli_walking" src="https://github.com/user-attachments/assets/8edd0e55-a014-4bc1-a21c-0537c948b246" />
