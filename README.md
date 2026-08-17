@@ -19,8 +19,16 @@ MESHY_API_KEY<br/>
 <br/>
 <br/>
 
-Create a virtual env</br>
-`source venv/bin/activate`
+Install the virtual environment tool (if not already installed)<br/>
+`pip install virtualenv`
+or `brew install virtualenv`
+<br/>
+Create a virtual environment named "myenv"<br/>
+`virtualenv myenv`
+
+Activate the environment<br/>
+`source myenv/bin/activate`
+<br/>
 install required libs (there may be a few more you need to add)</br>
 `pip install -r requirements.txt`
 <br/>
