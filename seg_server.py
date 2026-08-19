@@ -917,9 +917,11 @@ def joints_from_model(joints_data: dict, glb_path: str):
         norm_z = np.clip(p.get('z', 0.5), 0.0, 1.0)   # image depth
 
         world_pos = np.zeros(3)
-        world_pos[FR_IDX] = bmin[FR_IDX] + norm_x * brange[FR_IDX]          # image-x → mesh-Z
-        world_pos[UP_IDX] = bmin[UP_IDX] + (1.0 - norm_y) * brange[UP_IDX]  # image-y inverted → mesh-Y
-        world_pos[LR_IDX] = bmin[LR_IDX] + norm_z * brange[LR_IDX]          # image-z → mesh-X (≈center)
+        world_pos[0] = bmin[0] + np.clip(p.get('x', 0.5), 0.0, 1.0) * brange[0]  # Claude x → Blender X
+        world_pos[1] = bmin[1] + np.clip(p.get('z', 0.5), 0.0, 1.0) * brange[1]  # Claude z → Blender Y
+        world_pos[2] = bmin[2] + np.clip(p.get('y', 0.5), 0.0, 1.0) * brange[2]  # Claude y → Blender Z
+
+
 
         joints.append(tuple(world_pos))
 
@@ -935,9 +937,9 @@ def joints_from_model(joints_data: dict, glb_path: str):
         c = name_to_idx.get(child_ref)
         if p is not None and c is not None:
             hierarchy.append((p, c))
-
     log.info(f"joints_from_model: {len(joints)} joints, {len(hierarchy)} bones "
-             f"(fixed mapping: img-x→Z, img-y-inv→Y, img-z→X)")
+         f"(Claude x→X, z→Y, y→Z)")
+
     return joints, hierarchy, hint_objects
 
 def mirror_wheel_centers(mask_dir, joint_hints):
@@ -2325,20 +2327,18 @@ def visualize_normalized_joints(joints_data: dict, mesh_path: str,
             return [50,  220, 50,  220]   # green — end
 
     for hint in hints:
-        p     = hint.get('position_normalized', {})
-        x     = bmin[0] + p.get('x', 0.5) * brange[0]
-        y     = bmin[1] + p.get('y', 0.5) * brange[1]
-        z     = bmin[2] + p.get('z', 0.5) * brange[2]
-        log.info(f"initial y {p.get('y', 0.5)} then  {y}")
-        norm_y = p.get('y', 0.5)
-        body_part = hint.get('body_part', '')
-        r_norm = hint.get('wheel_radius_normalized', 0.0)
-        norm_y = 1.0 - p.get('y', 0.5)  # invert image-y to mesh-y
-        y = bmin[1] + norm_y * brange[1]
-        log.info(f"setting {x} {y} {z}")
-        log.info(f"initial y {p.get('y')} r_norm={hint.get('wheel_radius_normalized')} body_part={hint.get('body_part')}")
+        p = hint.get('position_normalized', {})
+
+        world_x = bmin[0] + p.get('x', 0.5) * brange[0]
+        world_y = bmin[1] + p.get('y', 0.5) * brange[1]
+        world_z = bmin[2] + p.get('z', 0.5) * brange[2]
+
+        log.info(f"viz joint {hint['name']}: "
+                 f"claude=({p.get('x'):.2f},{p.get('y'):.2f},{p.get('z'):.2f}) "
+                 f"→ blender=({world_x:.3f},{world_y:.3f},{world_z:.3f})")
+
         sphere = trimesh.creation.icosphere(radius=sphere_r)
-        sphere.apply_translation([x, y, z])
+        sphere.apply_translation([world_x, world_y, world_z])
         sphere.visual.face_colors = get_color(hint['name'])
         scene.add_geometry(sphere, node_name=hint['name'])
 

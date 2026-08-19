@@ -280,10 +280,15 @@ def create_animations_from_hints(armature_obj, joint_hints: list):
                 print(f"  Unknown property '{prop}' on '{bone_name}', skipping")
                 continue
 
+            #coord_remap = {
+            #    'x': (2,  1.0),  # image-x → Blender Z (forward/rear)
+             #   'y': (1,  1.0),  # image-y → Blender Y (up, no inversion needed for rotation)
+             #   'z': (0,  1.0),  # image-z → Blender X (left/right)
+            #}
             coord_remap = {
-                'x': (0,  1.0),  # X → X, unchanged
-                'y': (2,  1.0),  # Y → Z (Gemini up = Blender Z)
-                'z': (1, -1.0),  # Z → -Y (Gemini depth = Blender -Y)
+                'x': (0, 1.0),   # x → X (leg swing axis for Z-up bones)
+                'y': (2, 1.0),   # y → Z
+                'z': (1, 1.0),   # z → Y
             }
             axis_str = str(anim['axis']).lower()
             blender_axis, sign = coord_remap.get(axis_str, (0, 1.0))
