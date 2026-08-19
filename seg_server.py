@@ -82,7 +82,7 @@ import stat
 import numpy as np
 import requests
 import urllib3
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_file, make_response
 from flask_cors import CORS
 from werkzeug.exceptions import HTTPException, RequestEntityTooLarge
 from rembg import remove, new_session
@@ -97,6 +97,10 @@ from pipeline_store import _local_url, hydrate
 RESULTS_DIR = os.environ.get("RESULTS_DIR") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "results"
 )
+EXAMPLES_DIR = os.environ.get("EXAMPLES_DIR") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "examples"
+)
+
 _MAC_BLENDER = "/Applications/Blender.app/Contents/MacOS/Blender"
 
 BLENDER_BIN = (
@@ -114,6 +118,15 @@ def _rdir(classify_id: str) -> str:
 
 app = Flask(__name__)
 CORS(app)
+
+@app.after_request
+def add_ngrok_and_cors_headers(response):
+    # Bypass the ngrok browser warning screen
+    response.headers["ngrok-skip-browser-warning"] = "true"
+    # Ensure browsers allow model-viewer to send the custom ngrok header
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, ngrok-skip-browser-warning"
+    return response
+
 app.config['MAX_CONTENT_LENGTH'] = 64 * 1024 * 1024
 logging.basicConfig(level=logging.INFO)
 log = app.logger
@@ -2735,8 +2748,39 @@ def serve_result(filename):
     full = os.path.join(RESULTS_DIR, filename)
     if not os.path.abspath(full).startswith(os.path.abspath(RESULTS_DIR)):
         return jsonify({'error': 'forbidden'}), 403
-    return send_file(full)
+    if not os.path.exists(full):
+        return jsonify({'error': 'not found'}), 404
+    response = make_response(send_file(full))
+    response.headers['ngrok-skip-browser-warning'] = 'true'
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    return response
 
+@app.route('/examples', methods=['GET'])
+def list_assets():
+    """List all GLB files in the examples directory."""
+    glbs = []
+    for root, _, files in os.walk(EXAMPLES_DIR):
+        for f in files:
+            if f.endswith(('.glb', '.usdz', '.gltf')):
+                rel = os.path.relpath(os.path.join(root, f), EXAMPLES_DIR)
+                glbs.append({
+                    'filename': rel,
+                    'url': _local_url(os.path.join(ASSETS_DIR, rel), request.host),
+                    'size_kb': round(os.path.getsize(os.path.join(root, f)) / 1024, 1),
+                })
+    return jsonify(glbs)
+
+@app.route('/examples/<path:filename>')
+def serve_asset(filename):
+    """Serve a file from the assets directory."""
+    full = os.path.abspath(os.path.join(EXAMPLES_DIR, filename))
+    if not full.startswith(os.path.abspath(EXAMPLES_DIR)):
+        return jsonify({'error': 'forbidden'}), 403
+    if not os.path.exists(full):
+        return jsonify({'error': 'not found'}), 404
+    mime = 'model/gltf-binary' if filename.endswith('.glb') else \
+           'model/vnd.usdz+zip' if filename.endswith('.usdz') else None
+    return send_file(full, mimetype=mime)
 
 @app.route('/gallery_page')
 def gallery_page():
@@ -2762,31 +2806,99 @@ def gallery():
         log.error(f"/gallery error: {e}")
         return jsonify({'error': str(e)}), 500
 
-
 @app.route('/gallery_data', methods=['GET'])
 def gallery_data():
     user_id = request.args.get('user_id', '').strip() or dummy_user_id
+    base = request.host_url.rstrip('/')
     try:
+        # ── Store records (indexed by classify_id) ────────────────────────
         records = _store.get_by_user(user_id)
-        return jsonify([{
-            'classify_id':     r.get('classify_id'),
-            'label':           r.get('tag', 'model'),
-            'tags':            r.get('tags', 'model'),
-            'segmented_image': _local_url(ps._resolve_path(r['classify_id'], 'segmented.png'), request.host),
-            'active_image':    _local_url(hydrate(r).get('active_image_path'), request.host),
-            'has_joints':      bool(r.get('joints')),
-            'has_mesh':        os.path.exists(ps._resolve_path(r['classify_id'], 'mesh.glb')),
-            'rig_status':      (r.get('rig') or {}).get('status'),
-            'created_at':      (r.get('rig') or {}).get('created_at'),
-            'rigged_path':     _local_url(ps._resolve_path(r['classify_id'], 'rigged.glb'), request.host),
-            'active_path':     _local_url(ps._resolve_path(r['classify_id'], 'mesh.glb'), request.host),
-            'url':             _local_url(ps._resolve_path(r['classify_id'], 'rigged.glb'), request.host),
-        } for r in records])
+        store_map = {r['classify_id']: r for r in records}
+
+        # ── Scan results dir for all folders with GLBs ────────────────────
+        seen = set()
+        items = []
+
+        def make_item(cid, r=None):
+            rigged_disk = ps._resolve_path(cid, 'rigged.glb')
+            mesh_disk   = ps._resolve_path(cid, 'mesh.glb')
+            folder      = os.path.join(RESULTS_DIR, cid)
+
+            # All GLBs in folder, excluding utility files
+            all_glbs = []
+            if os.path.isdir(folder):
+                all_glbs = sorted([
+                    f for f in os.listdir(folder)
+                    if f.endswith('.glb')
+                    and not any(x in f for x in ('_viz', '_decimated', '_skeleton', '_armature'))
+                ])
+
+            has_rig  = os.path.exists(rigged_disk)
+            has_mesh = os.path.exists(mesh_disk)
+
+            rig_ok     = has_rig and (r is None or (r.get('rig') or {}).get('status') == 'ok')
+            rigged_url = f"{base}/results/{cid}/{cid}_rigged.glb" if rig_ok  else None
+            mesh_url   = f"{base}/results/{cid}/{cid}_mesh.glb"   if has_mesh else None
+
+            # Fallback: use any GLB found in the folder
+            if not rigged_url and not mesh_url and all_glbs:
+                mesh_url = f"{base}/results/{cid}/{all_glbs[0]}"
+
+            # Extra GLBs beyond the standard pair
+            standard = {f"{cid}_rigged.glb", f"{cid}_mesh.glb"}
+            extra_glbs = [
+                f"{base}/results/{cid}/{f}" for f in all_glbs
+                if f not in standard
+            ]
+
+            rig_data      = (r.get('rig')      or {}) if r else {}
+            classify_data = (r.get('classify') or {}) if r else {}
+            label = (r.get('tag') or classify_data.get('object_type') or cid) if r else cid
+            tags  = [label] if label else [cid]
+
+            return {
+                'classify_id': cid,
+                'label':       label,
+                'tags':        tags,
+                'has_joints':  bool(r.get('joints')) if r else False,
+                'has_mesh':    has_mesh or bool(all_glbs),
+                'rig_status':  rig_data.get('status'),
+                'created_at':  rig_data.get('created_at'),
+                'rigged_path': rigged_url,
+                'active_path': mesh_url,
+                'extra_glbs':  extra_glbs,
+                'url':         rigged_url or mesh_url,
+                'in_store':    r is not None,
+            }
+
+        # ── Walk results dir ──────────────────────────────────────────────
+        if os.path.isdir(RESULTS_DIR):
+            for cid in sorted(os.listdir(RESULTS_DIR), reverse=True):
+                folder = os.path.join(RESULTS_DIR, cid)
+                if not os.path.isdir(folder):
+                    continue
+                has_any_glb = any(f.endswith('.glb') for f in os.listdir(folder))
+                if not has_any_glb:
+                    continue
+                seen.add(cid)
+                r = store_map.get(cid)
+                items.append(make_item(cid, r))
+
+        # ── Add store records whose folder may have been deleted ──────────
+        for cid, r in store_map.items():
+            if cid not in seen:
+                items.append(make_item(cid, r))
+
+        # ── Sort: store records with rigs first, then by created_at ───────
+        items.sort(key=lambda x: (
+            not x['in_store'],
+            x.get('created_at') or '',
+        ), reverse=True)
+
+        return jsonify(items)
     except Exception as e:
         log.error(f"/gallery_data error: {e}")
         return jsonify({'error': str(e)}), 500
-
-
 # ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == '__main__':
