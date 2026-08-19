@@ -128,16 +128,24 @@ def build_walk_keyframes(body_part: str, joint_name: str,
     if not params:
         return []
 
+    
     axis, phase, base_amp = params
     is_right = "right" in joint_name.lower()
     if is_right and body_part_lower in RIGHT_SIDE_FLIP:
         phase *= -1
 
-    amp = base_amp
-    if bone_length is not None:
+    amp = base_amp    
+        
+    print(f"  walk keyframe: {joint_name} body_part={body_part} is_right={is_right} phase={phase} amp={amp}")
+
+   
+    
+    if bone_length is not None and bone_length > 1e-6:
         REFERENCE_BONE = 0.4
         amp = base_amp * min(1.5, max(0.5, REFERENCE_BONE / bone_length))
-
+    else:
+        amp = base_amp
+        
     kf = [
         [1,  0.0],
         [15, round( phase * amp, 4)],
