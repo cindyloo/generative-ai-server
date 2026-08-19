@@ -897,9 +897,6 @@ def joints_from_model(joints_data: dict, glb_path: str):
       Claude image-z (depth hint, usually 0.5)
           → mesh X  (left-right in world space, i.e. into/out of the photo)
 
-    This is a FIXED mapping, not detected at runtime. The old wheel-spread
-    heuristic misidentifies axes when only 2 wheels are present and the
-    spread is entirely along image-X.
     """
     import trimesh
 
@@ -2311,6 +2308,12 @@ def visualize_normalized_joints(joints_data: dict, mesh_path: str,
                                  output_path: str):
     """
     Create GLB showing Claude's normalized joint positions overlaid on mesh.
+    
+    Axis mapping (fixed):
+      Claude x (left/right) → Blender X [0]
+      Claude z (depth)      → Blender Y [1]  (always ~0.5 = center)
+      Claude y (up/down)    → Blender Z [2]
+    
     Color coded: red = base joints (hip/shoulder/wing_base),
                  yellow = middle joints (knee/elbow/wing_mid),
                  green = end joints (hand/foot/head/wing_tip).
@@ -2446,7 +2449,109 @@ def mesh_status(task_id: str):
         return jsonify({'error': 'Task not found'}), 404
     return jsonify(task)
 
+def _run_meshy_rig_task(task_id: str, classify_id: str, user_id: str, host: str):
+    try:
+        _rig_tasks[task_id] = {'status': 'rigging', 'progress': 10}
+        _store.set_rig_status(classify_id, 'rigging')
 
+        record    = hydrate(_store.get(classify_id))
+        mesh_data = record.get('mesh') or {}
+        glb_url   = mesh_data.get('glb_url')
+
+        # ── Validate ──────────────────────────────────────────────────────────
+        glb_path = ps._resolve_path(classify_id, 'mesh.glb')
+        if not os.path.exists(glb_path):
+            raise RuntimeError("Mesh GLB not found — run /mesh before /rig")
+
+        meshy_task_id = mesh_data.get('meshy_task_id')
+        if not meshy_task_id:
+            raise RuntimeError(
+                "should_autorig requires a meshy_task_id on the mesh record — "
+                "ensure /mesh completed successfully via Meshy"
+            )
+
+        # ── Submit rig task ───────────────────────────────────────────────────
+        _rig_tasks[task_id] = {'status': 'meshy', 'progress': 20}
+        meshy_rig_task_id, rigged_glb_url, rigged_fbx_url = meshy_rig(meshy_task_id)
+
+        # ── Download ──────────────────────────────────────────────────────────
+        _rig_tasks[task_id] = {'status': 'downloading', 'progress': 70}
+        _rd         = _rdir(classify_id)
+        rigged_path = os.path.join(_rd, f"{classify_id}_rigged.glb")
+        download_file(rigged_glb_url, rigged_path)
+
+        # ── Persist ───────────────────────────────────────────────────────────
+        _rig_tasks[task_id] = {'status': 'finalizing', 'progress': 90}
+        _store.upsert_rig(classify_id, {
+            'status':             'ok',
+            'user_id':            user_id,
+            'meshy_rig_task_id':  meshy_rig_task_id,
+            'rigged_glb_url':     rigged_glb_url,
+            'rigged_fbx_url':     rigged_fbx_url,
+        })
+
+        _rig_tasks[task_id] = {
+            'status':      'ok',
+            'progress':    100,
+            'rigged_url':  _local_url(rigged_path, host),
+            'glb_url':     glb_url,
+            'classify_id': classify_id,
+        }
+        log.info(f"Meshy rig task {task_id} complete: {rigged_path}")
+
+    except Exception as e:
+        log.error(f"Meshy rig task {task_id} failed: {e}")
+        _rig_tasks[task_id] = {'status': 'error', 'error': str(e)}
+        _store.set_rig_status(classify_id, 'error', str(e))
+        
+def meshy_rig(meshy_task_id: str) -> tuple[str, str, str]:
+    """
+    Submit a Meshy rigging task and poll until done.
+    Returns (rig_task_id, rigged_glb_url, rigged_fbx_url).
+    Mirrors meshy_reconstruct's submit-then-poll pattern.
+    """
+    meshy_key = os.environ.get('MESHY_API_KEY')
+    headers = {
+        'Authorization': f'Bearer {meshy_key}',
+        'Content-Type':  'application/json',
+    }
+
+    # Submit
+    MESHY_API_BASE = 'https://api.meshy.ai/openapi/v1'
+    resp = requests.post(
+        f'{MESHY_API_BASE}/rigging',
+        headers=headers,
+        json={'input_task_id': meshy_task_id},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    rig_task_id = resp.json()['result']
+    log.info(f"Meshy rig task submitted: {rig_task_id}")
+
+    # Poll
+    while True:
+        poll = requests.get(
+            f'{MESHY_API_BASE}/rigging/{rig_task_id}',
+            headers=headers,
+            timeout=30,
+        )
+        poll.raise_for_status()
+        data   = poll.json()
+        status = data.get('status')
+        log.info(f"Meshy rig {rig_task_id}: {status} {data.get('progress', 0)}%")
+
+        if status == 'SUCCEEDED':
+            result = data['result']
+            return (
+                rig_task_id,
+                result['rigged_character_glb_url'],
+                result['rigged_character_fbx_url'],
+            )
+        if status == 'FAILED':
+            msg = data.get('task_error', {}).get('message', 'unknown error')
+            raise RuntimeError(f"Meshy rig failed: {msg}")
+
+        import time; time.sleep(5)
 # ── /rig ──────────────────────────────────────────────────────────────────────
 
 @app.route('/rig', methods=['GET', 'POST'])
@@ -2462,6 +2567,7 @@ def rig():
         classify_id = request.args.get('classify_id', '').strip()
         user_id     = request.args.get('user_id', '').strip() or dummy_user_id
         force       = request.args.get('force', '').lower() in ('1', 'true', 'yes')
+        should_autorig       = request.args.get('should_autorig', '').lower() in ('1', 'true', 'yes')
 
         if not classify_id:
             return jsonify({'error': 'Missing classify_id'}), 400
@@ -2491,19 +2597,26 @@ def rig():
                     'classify_id': classify_id,
                 })
 
-        if not record.get('joints'):
-            log.warning(f"No joints for {classify_id} — geometric fallback will be used")
-
         task_id = str(uuid.uuid4())[:8]
         _rig_tasks[task_id] = {'status': 'started', 'progress': 0}
         _store.set_rig_status(classify_id, 'started')
 
         log.info(f"Starting rig task {task_id} for {classify_id}")
-        threading.Thread(
-            target=run_rig_pipeline,
-            args=(task_id, classify_id, user_id, request.host),
-            daemon=True,
-        ).start()
+        if should_autorig:
+            threading.Thread(
+                target=_run_meshy_rig_task,
+                args=(task_id, classify_id, user_id, request.host),
+                daemon=True,
+            ).start()
+        else:
+            if not record.get('joints'):
+                log.warning(f"No joints for {classify_id} — geometric fallback will be used")
+            threading.Thread(
+                target=run_rig_pipeline,
+                args=(task_id, classify_id, user_id, request.host),
+                daemon=True,
+            ).start()
+
 
         return jsonify({'status': 'processing', 'task_id': task_id,
                         'classify_id': classify_id})
