@@ -33,3 +33,8 @@ tinydb==4.8.0
 meshio==5.3.4
 
 pyransac3d
+
+torch==2.11.0
+torchvision==0.26.0
+opencv-python-headless==4.13.0.92
+sam2==1.1.0

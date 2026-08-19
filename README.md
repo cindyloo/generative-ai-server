@@ -25,6 +25,13 @@ install required libs (there may be a few more you need to add)</br>
 `pip install -r requirements.txt`
 <br/>
 
+**Blender is a separate, required install — not pip-installable.**</br>
+The rigging/decimation steps shell out to a real Blender install (`_blender_bin()` in seg_server.py) rather than `import bpy` in-process, so `pip install -r requirements.txt` alone will never satisfy this dependency. Install Blender.app and either leave it at the macOS default path (`/Applications/Blender.app/Contents/MacOS/blender`) or point `BLENDER_PATH` at your install.
+<br/>
+
+**`vehicle/sam2.py` depends on `segment_anything` (SAM v1), which is not installed and not in requirements.txt.** The rest of the pipeline (`vehicle/animatesam.py`, seg_server.py) uses the newer `sam2` package instead, which *is* installed — `vehicle/sam2.py` may be legacy/dead code. If you need it, install SAM v1 separately, e.g. `pip install git+https://github.com/facebookresearch/segment-anything.git`.
+<br/>
+
 Run the server (python 3.9 or higher)</br>
 `python seg_server.py`
 </br>
