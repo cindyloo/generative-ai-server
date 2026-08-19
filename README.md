@@ -45,6 +45,8 @@ CLOUDDB_PROJECT=your_project_id </p>
 
 
 ***THE PIPELINE!***</br>
+```segment->classify->(augment)->mesh->infer_joints->rig```
+</br>
 Begin with an image (as specified above) of something you want to animate. Create an assets folder (at the same level as vehicle and results) and drop it there
 
 
