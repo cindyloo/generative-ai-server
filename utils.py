@@ -590,6 +590,39 @@ def _build_joints_prompt(object_type: str, category: str,
             neck_y   = 0.72; chest_y  = 0.60
             pelvis_y = 0.45; spine_y  = 0.53
 
+        # Shoulders are siblings of the neck off joint_chest in the skeleton
+        # hierarchy (both attach at the same point on the spine), so they
+        # belong at the same height as the neck — not left to "estimate from
+        # the image" below, which is what let them drift down to chest
+        # height in practice. Only applies to rig types whose arms use
+        # "shoulder" body parts (humanoid, and the animal-fallback "other");
+        # biped has no arms, and quadruped/flying use "shoulder"/"wing_base"
+        # for a front-leg or wing attachment near chest height instead.
+        shoulder_y = neck_y if rt in ('humanoid', 'other') else None
+        shoulder_y_line = (f"  shoulder: y ≈ {shoulder_y:.2f}  (same height as "
+                           f"neck — they attach at the same point)\n"
+                           if shoulder_y is not None else "")
+
+        # Shoulder X must be measured from the TRUNK width, not a fixed
+        # fraction of the full mesh width — in a T-pose, the full mesh width
+        # is dominated by the outstretched arm span (fingertip to fingertip),
+        # so a fraction like 0.20 that would be reasonable for an arms-down
+        # pose instead lands way out on the arm. trunk_x_left/right are
+        # measured directly from the mesh at waist height, below where the
+        # arms reach at any pose.
+        trunk_x_left  = mesh_bounds.get('trunk_x_left')
+        trunk_x_right = mesh_bounds.get('trunk_x_right')
+        if shoulder_y is not None and trunk_x_left is not None and trunk_x_right is not None:
+            shoulder_x_line = (
+                f"  shoulder: x ≈ {trunk_x_left:.2f} (left) / {trunk_x_right:.2f} "
+                f"(right)  — measured from the TRUNK width (waist height), "
+                f"NOT a fraction of the full image. In a T-pose the full "
+                f"image width includes the outstretched arms, so a naive "
+                f"fraction would land on the arm instead of the torso.\n"
+            )
+        else:
+            shoulder_x_line = ""
+
         mesh_context = f"""
 MESH: width={w:.3f} height={h:.3f} ratio={hw:.2f}
 y=0.0 = bottom of mesh (feet on ground), y=1.0 = top of mesh (top of head).
@@ -602,7 +635,7 @@ These values are computed from the actual 3D mesh proportions:
   chest:  y ≈ {chest_y:.2f}
   spine:  y ≈ {spine_y:.2f}
   pelvis: y ≈ {pelvis_y:.2f}
-
+{shoulder_y_line}{shoulder_x_line}
 LIMB JOINTS — estimate X and Y from the image:
   Look at where the legs/arms actually attach and articulate in this specific image.
   The hip x must be at the outer surface of the leg where it meets the pelvis.
@@ -681,12 +714,12 @@ Return JSON in exactly this structure (adapt joint positions to match the image)
     {"name": "joint_chest",          "body_part": "chest",    "deforms_mesh": false, "position_normalized": {"x": 0.5,  "y": 0.65, "z": 0.5}},
     {"name": "joint_neck",           "body_part": "neck",     "deforms_mesh": false, "position_normalized": {"x": 0.5,  "y": 0.75, "z": 0.5}},
     {"name": "joint_head",           "body_part": "head",     "deforms_mesh": false, "position_normalized": {"x": 0.5,  "y": 0.88, "z": 0.5}},
-    {"name": "joint_shoulder_left",  "body_part": "shoulder", "deforms_mesh": true,  "position_normalized": {"x": 0.15, "y": 0.62, "z": 0.5}},
-    {"name": "joint_shoulder_right", "body_part": "shoulder", "deforms_mesh": true,  "position_normalized": {"x": 0.85, "y": 0.62, "z": 0.5}},
-    {"name": "joint_elbow_left",     "body_part": "elbow",    "deforms_mesh": true,  "position_normalized": {"x": 0.08, "y": 0.50, "z": 0.5}},
-    {"name": "joint_elbow_right",    "body_part": "elbow",    "deforms_mesh": true,  "position_normalized": {"x": 0.92, "y": 0.50, "z": 0.5}},
-    {"name": "joint_hand_left",      "body_part": "hand",     "deforms_mesh": true,  "position_normalized": {"x": 0.0,  "y": 0.38, "z": 0.5}},
-    {"name": "joint_hand_right",     "body_part": "hand",     "deforms_mesh": true,  "position_normalized": {"x": 1.0,  "y": 0.38, "z": 0.5}},
+    {"name": "joint_shoulder_left",  "body_part": "shoulder", "deforms_mesh": true,  "position_normalized": {"x": 0.15, "y": 0.72, "z": 0.5}},
+    {"name": "joint_shoulder_right", "body_part": "shoulder", "deforms_mesh": true,  "position_normalized": {"x": 0.85, "y": 0.72, "z": 0.5}},
+    {"name": "joint_elbow_left",     "body_part": "elbow",    "deforms_mesh": true,  "position_normalized": {"x": "MEASURE_FROM_IMAGE", "y": "MEASURE_FROM_IMAGE", "z": 0.5}},
+    {"name": "joint_elbow_right",    "body_part": "elbow",    "deforms_mesh": true,  "position_normalized": {"x": "MEASURE_FROM_IMAGE", "y": "MEASURE_FROM_IMAGE", "z": 0.5}},
+    {"name": "joint_hand_left",      "body_part": "hand",     "deforms_mesh": true,  "position_normalized": {"x": "MEASURE_FROM_IMAGE", "y": "MEASURE_FROM_IMAGE", "z": 0.5}},
+    {"name": "joint_hand_right",     "body_part": "hand",     "deforms_mesh": true,  "position_normalized": {"x": "MEASURE_FROM_IMAGE", "y": "MEASURE_FROM_IMAGE", "z": 0.5}},
     {"name": "joint_hip_left",       "body_part": "hip",      "deforms_mesh": true,  "position_normalized": {"x": 0.25, "y": 0.42, "z": 0.5}},
     {"name": "joint_hip_right",      "body_part": "hip",      "deforms_mesh": true,  "position_normalized": {"x": 0.75, "y": 0.42, "z": 0.5}},
     {"name": "joint_knee_left",      "body_part": "leg",      "deforms_mesh": true,  "position_normalized": {"x": 0.25, "y": 0.22, "z": 0.5}},
@@ -729,15 +762,33 @@ KNEE PLACEMENT — most important rule:
   If hip_left is at y=0.42 and foot_left is at y=0.02, knee_left MUST be at y=0.22.
   NEVER place the knee closer to the foot than to the hip.
 
+ARM POSE — determine this FIRST, then place elbow/hand accordingly.
+  Elbow and hand height depend entirely on the arm pose in THIS image — there
+  is no universal constant, unlike the spine. Look at the image and classify:
+    T-POSE (arms held straight out horizontally): elbow y and hand y are
+      both approximately EQUAL to shoulder y — the whole arm is one
+      horizontal line. Hand x reaches close to the mesh edge (x≈0.0/1.0).
+    A-POSE (arms angled down and out, like a capital "A"): elbow y is
+      noticeably BELOW shoulder y, and hand y is below elbow y. Hand x is
+      further out than shoulder x but less extreme than a T-pose.
+    ARMS AT SIDES (hanging down against the body): elbow y is close to
+      waist/hip height, hand y is near or below hip height, and hand x is
+      close to hip x (arms hang close to the torso, not spread out).
+  Measure the actual angle/position you see — do not default to any one of
+  these if the image clearly shows something else (e.g. one arm raised).
+
+Replace every "MEASURE_FROM_IMAGE" placeholder above with a value you
+measure from the actual image, following the ARM POSE guidance.
+
 POSITION GUIDE (starting points only — override with what you actually see):
   Head:      y≈0.88,  x=0.5
   Neck:      y≈0.75,  x=0.5
   Chest:     y≈0.65,  x=0.5
   Spine:     y≈0.55,  x=0.5
   Pelvis:    y≈0.42,  x=0.5   ← parent of BOTH spine and hips
-  Shoulders: y≈0.62,  x≈0.15 (left), x≈0.85 (right)
-  Elbows:    y≈0.50,  x≈0.08 (left), x≈0.92 (right)
-  Hands:     y≈0.38,  x=0.0  (left), x=1.0  (right)
+  Shoulders: y≈0.72,  x≈0.15 (left), x≈0.85 (right)  ← same height as neck, not chest
+  Elbows:    measure from image — see ARM POSE above
+  Hands:     measure from image — see ARM POSE above
   Hips:      y≈0.42,  x≈0.25 (left), x≈0.75 (right)  ← OUTER EDGE of leg, not center
   Knees:     y = midpoint(hip_y, foot_y), same x as hip
   Feet:      y≈0.02,  same x as hip"""
@@ -754,12 +805,12 @@ Return JSON in exactly this structure (adapt joint positions to match the image)
     {"name": "joint_chest",          "body_part": "chest",    "deforms_mesh": false, "position_normalized": {"x": 0.5,  "y": 0.65, "z": 0.5}},
     {"name": "joint_neck",           "body_part": "neck",     "deforms_mesh": false, "position_normalized": {"x": 0.5,  "y": 0.80, "z": 0.5}},
     {"name": "joint_head",           "body_part": "head",     "deforms_mesh": false, "position_normalized": {"x": 0.5,  "y": 0.92, "z": 0.5}},
-    {"name": "joint_shoulder_left",  "body_part": "shoulder", "deforms_mesh": true,  "position_normalized": {"x": 0.20, "y": 0.62, "z": 0.5}},
-    {"name": "joint_shoulder_right", "body_part": "shoulder", "deforms_mesh": true,  "position_normalized": {"x": 0.80, "y": 0.62, "z": 0.5}},
-    {"name": "joint_elbow_left",     "body_part": "elbow",    "deforms_mesh": true,  "position_normalized": {"x": 0.10, "y": 0.50, "z": 0.5}},
-    {"name": "joint_elbow_right",    "body_part": "elbow",    "deforms_mesh": true,  "position_normalized": {"x": 0.90, "y": 0.50, "z": 0.5}},
-    {"name": "joint_hand_left",      "body_part": "hand",     "deforms_mesh": true,  "position_normalized": {"x": 0.05, "y": 0.38, "z": 0.5}},
-    {"name": "joint_hand_right",     "body_part": "hand",     "deforms_mesh": true,  "position_normalized": {"x": 0.95, "y": 0.38, "z": 0.5}},
+    {"name": "joint_shoulder_left",  "body_part": "shoulder", "deforms_mesh": true,  "position_normalized": {"x": 0.20, "y": 0.76, "z": 0.5}},
+    {"name": "joint_shoulder_right", "body_part": "shoulder", "deforms_mesh": true,  "position_normalized": {"x": 0.80, "y": 0.76, "z": 0.5}},
+    {"name": "joint_elbow_left",     "body_part": "elbow",    "deforms_mesh": true,  "position_normalized": {"x": "MEASURE_FROM_IMAGE", "y": "MEASURE_FROM_IMAGE", "z": 0.5}},
+    {"name": "joint_elbow_right",    "body_part": "elbow",    "deforms_mesh": true,  "position_normalized": {"x": "MEASURE_FROM_IMAGE", "y": "MEASURE_FROM_IMAGE", "z": 0.5}},
+    {"name": "joint_hand_left",      "body_part": "hand",     "deforms_mesh": true,  "position_normalized": {"x": "MEASURE_FROM_IMAGE", "y": "MEASURE_FROM_IMAGE", "z": 0.5}},
+    {"name": "joint_hand_right",     "body_part": "hand",     "deforms_mesh": true,  "position_normalized": {"x": "MEASURE_FROM_IMAGE", "y": "MEASURE_FROM_IMAGE", "z": 0.5}},
     {"name": "joint_hip_left",       "body_part": "hip",      "deforms_mesh": true,  "position_normalized": {"x": 0.28, "y": 0.44, "z": 0.5}},
     {"name": "joint_hip_right",      "body_part": "hip",      "deforms_mesh": true,  "position_normalized": {"x": 0.72, "y": 0.44, "z": 0.5}},
     {"name": "joint_knee_left",      "body_part": "leg",      "deforms_mesh": true,  "position_normalized": {"x": 0.28, "y": 0.22, "z": 0.5}},
@@ -795,13 +846,31 @@ KNEE PLACEMENT — most important rule:
   Formula: knee_y = (hip_y + foot_y) / 2
   NEVER place the knee closer to the foot than to the hip.
 
+ARM POSE — determine this FIRST, then place elbow/hand accordingly.
+  Elbow and hand height depend entirely on the arm pose in THIS image — there
+  is no universal constant, unlike the spine. Look at the image and classify:
+    T-POSE (arms held straight out horizontally): elbow y and hand y are
+      both approximately EQUAL to shoulder y — the whole arm is one
+      horizontal line. Hand x reaches close to the mesh edge (x≈0.0/1.0).
+    A-POSE (arms angled down and out, like a capital "A"): elbow y is
+      noticeably BELOW shoulder y, and hand y is below elbow y. Hand x is
+      further out than shoulder x but less extreme than a T-pose.
+    ARMS AT SIDES (hanging down against the body): elbow y is close to
+      waist/hip height, hand y is near or below hip height, and hand x is
+      close to hip x (arms hang close to the torso, not spread out).
+  Measure the actual angle/position you see — do not default to any one of
+  these if the image clearly shows something else (e.g. one arm raised).
+
+Replace every "MEASURE_FROM_IMAGE" placeholder above with a value you
+measure from the actual image, following the ARM POSE guidance.
+
 POSITION GUIDE (use FULL range 0.0–1.0 — starting points only, override with actual image):
   Head:      y≈0.92
   Neck:      y≈0.80
   Chest:     y≈0.65
-  Shoulders: x≈0.20 (left), x≈0.80 (right), y≈0.62
-  Elbows:    x≈0.10 (left), x≈0.90 (right), y≈0.50
-  Hands:     x≈0.05 (left), x≈0.95 (right), y≈0.38
+  Shoulders: x≈0.20 (left), x≈0.80 (right), y≈0.76  ← same height as neck, not chest
+  Elbows:    measure from image — see ARM POSE above
+  Hands:     measure from image — see ARM POSE above
   Pelvis:    y≈0.44
   Hips:      x≈0.42 (left), x≈0.58 (right), y = top of leg
   Knees:     x same as hip, y = MIDPOINT between hip y and foot y

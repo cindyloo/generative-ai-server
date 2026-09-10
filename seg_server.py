@@ -889,14 +889,17 @@ def joints_from_model(joints_data: dict, glb_path: str):
     """
     Map normalised joint positions (0–1) onto mesh world-space.
 
-    Meshy exports Y-up. The camera is always a SIDE VIEW of the object, so:
-      Claude image-x (0=left edge of photo, 1=right edge)
-          → mesh Z  (front-to-rear in world space)
-      Claude image-y (0=top of photo, 1=bottom)
-          → mesh Y  (up-down) — INVERTED because image Y-down ≠ mesh Y-up
-      Claude image-z (depth hint, usually 0.5)
-          → mesh X  (left-right in world space, i.e. into/out of the photo)
+    Meshy exports Y-up (mesh index 0=X left/right, 1=Y up/down, 2=Z depth) —
+    same convention used everywhere else (mesh_bounds, snap_joints_to_mesh,
+    mesh_guided_joint_correction, visualize_normalized_joints). The vision
+    prompt already returns y in this bottom-up convention (0=feet, 1=head),
+    so no inversion is needed:
+      Claude x (0=left, 1=right)   → mesh X (left/right)
+      Claude y (0=feet, 1=head)    → mesh Y (up/down)
+      Claude z (depth hint, ~0.5)  → mesh Z (front/back depth)
 
+    The Y-up → Blender Z-up conversion happens later, in rig.py's
+    --from-json branch (`(x, -z, y)`), not here.
     """
     import trimesh
 
@@ -927,9 +930,9 @@ def joints_from_model(joints_data: dict, glb_path: str):
         norm_z = np.clip(p.get('z', 0.5), 0.0, 1.0)   # image depth
 
         world_pos = np.zeros(3)
-        world_pos[0] = bmin[0] + np.clip(p.get('x', 0.5), 0.0, 1.0) * brange[0]  # Claude x → Blender X
-        world_pos[1] = bmin[1] + np.clip(p.get('z', 0.5), 0.0, 1.0) * brange[1]  # Claude z → Blender Y
-        world_pos[2] = bmin[2] + np.clip(p.get('y', 0.5), 0.0, 1.0) * brange[2]  # Claude y → Blender Z
+        world_pos[0] = bmin[0] + np.clip(p.get('x', 0.5), 0.0, 1.0) * brange[0]  # Claude x → mesh X (left/right)
+        world_pos[1] = bmin[1] + np.clip(p.get('y', 0.5), 0.0, 1.0) * brange[1]  # Claude y → mesh Y (up)
+        world_pos[2] = bmin[2] + np.clip(p.get('z', 0.5), 0.0, 1.0) * brange[2]  # Claude z → mesh Z (depth)
 
 
 
@@ -948,7 +951,7 @@ def joints_from_model(joints_data: dict, glb_path: str):
         if p is not None and c is not None:
             hierarchy.append((p, c))
     log.info(f"joints_from_model: {len(joints)} joints, {len(hierarchy)} bones "
-         f"(Claude x→X, z→Y, y→Z)")
+         f"(Claude x→X, y→Y, z→Z)")
 
     return joints, hierarchy, hint_objects
 
@@ -994,20 +997,17 @@ def mirror_wheel_centers(mask_dir, joint_hints):
             json.dump(centers, f, indent=2)
 
     
-def mesh_guided_joint_correction(joints_data: dict, glb_path: str,
+def mesh_guided_joint_correction(joints_data: dict, mesh,
                                   rig_type: str) -> dict:
     """
     Use actual mesh geometry to correct and fill in Claude's joint placement.
     Handles cases where Claude misses joints or places them incorrectly
     due to unusual aspect ratios or novel object types.
     """
-    import trimesh
-
     hints = joints_data.get('joint_hints', [])
     if not hints:
         return joints_data
 
-    mesh   = trimesh.load(glb_path, force='mesh')
     verts  = np.array(mesh.vertices)
     bmin   = verts.min(axis=0)
     bmax   = verts.max(axis=0)
@@ -1078,32 +1078,57 @@ def mesh_guided_joint_correction(joints_data: dict, glb_path: str,
                 log.info(f"  GeoCorrect {mid_name} → wing midpoint")
 
     elif rt in ('biped', 'humanoid', 'other'):
-        # Find narrowest Y slice in mid-body = arm/stalk junction
-        n_slices = 50
-        slice_widths = []
-        for i in range(n_slices):
-            y_lo = bmin[1] + (i / n_slices) * brange[1]
-            y_hi = bmin[1] + ((i + 1) / n_slices) * brange[1]
-            sv   = verts[(verts[:, 1] >= y_lo) & (verts[:, 1] < y_hi)]
-            if len(sv) > 10:
-                width = sv[:, 0].max() - sv[:, 0].min()
-                slice_widths.append((i / n_slices + 0.5 / n_slices, width))
+        # Shoulder Y is no longer derived from a "narrowest slice" search
+        # here — the vision prompt now specifies shoulder height directly
+        # (same as neck, see utils.py's shoulder_y), and snap_joints_to_mesh
+        # already refines it against real geometry. The narrowest-slice
+        # heuristic that used to run here was unreliable (it often found a
+        # waist/torso taper rather than the actual armpit junction) and
+        # could drag an already-correct shoulder Y back down.
 
-        if slice_widths:
-            lower_mid = [(y, w) for y, w in slice_widths if 0.25 < y < 0.65]
-            if lower_mid:
-                stalk_y_norm = min(lower_mid, key=lambda t: t[1])[0]
-                for name in ['joint_shoulder_left', 'joint_shoulder_right']:
+        # Shoulder X = trunk edge at waist height, measured directly from
+        # the mesh — NOT trusted from the vision guess even after
+        # snap_joints_to_mesh, because a bad vision guess (anchored to a
+        # fixed fraction of the full image) can land deep in arm territory
+        # in a T-pose, and nearest-vertex search from a bad starting point
+        # just refines near the same wrong spot instead of correcting it.
+        # A plausible human torso is rarely wider than ~35% of the mesh's
+        # own total width — an A-pose's arm angling down through this
+        # height band can inflate the reading with arm width, so reject
+        # implausibly wide readings instead of trusting contaminated ones.
+        MAX_PLAUSIBLE_TRUNK_FRAC = 0.35
+        trunk_y_lo   = bmin[1] + 0.48 * brange[1]
+        trunk_y_hi   = bmin[1] + 0.60 * brange[1]
+        trunk_verts  = verts[(verts[:, 1] >= trunk_y_lo) & (verts[:, 1] < trunk_y_hi)]
+        if len(trunk_verts) > 10:
+            trunk_x_left  = float(trunk_verts[:, 0].min())
+            trunk_x_right = float(trunk_verts[:, 0].max())
+            if (trunk_x_right - trunk_x_left) / brange[0] > MAX_PLAUSIBLE_TRUNK_FRAC:
+                log.warning(f"  Trunk width reading implausibly wide "
+                            f"({(trunk_x_right - trunk_x_left) / brange[0]:.3f}) — "
+                            f"likely arm contamination (e.g. A-pose), skipping shoulder X snap")
+            else:
+                for name, trunk_x in [('joint_shoulder_left', trunk_x_left),
+                                       ('joint_shoulder_right', trunk_x_right)]:
                     if name in hint_map:
-                        old_y = hint_map[name]['position_normalized']['y']
-                        if abs(old_y - stalk_y_norm) > 0.08:
-                            hint_map[name]['position_normalized']['y'] = float(stalk_y_norm)
-                            log.info(f"  GeoCorrect {name} Y: {old_y:.3f}→{stalk_y_norm:.3f} "
-                                     f"(stalk junction)")
+                        new_x = float(np.clip((trunk_x - bmin[0]) / brange[0], 0.0, 1.0))
+                        old_x = hint_map[name]['position_normalized']['x']
+                        hint_map[name]['position_normalized']['x'] = new_x
+                        log.info(f"  GeoCorrect {name} X: {old_x:.3f}→{new_x:.3f} "
+                                 f"(trunk edge)")
 
-        # Hands = outermost X vertices in arm Y range
-        arm_y_lo  = bmin[1] + 0.25 * brange[1]
-        arm_y_hi  = bmin[1] + 0.70 * brange[1]
+        # Hands = outermost X vertices in arm Y range. Band must be wide
+        # enough to cover a hand at any arm pose — T-pose puts it near
+        # shoulder height (~0.7-0.8), A-pose or arms-at-sides puts it much
+        # lower (~0.3-0.45) — a narrower band can miss the true extremity
+        # and corrupt an already-correct X guess (same failure mode as the
+        # old shoulder Y-band). Adopt the found vertex's Y as well as X —
+        # a hand that flares outward at the wrist means the widest-X vertex
+        # is a real hand vertex, so its height is real signal too, and it
+        # can catch cases where the vision guess assumed the wrong arm pose
+        # (e.g. guessed T-pose when the actual mesh is an A-pose).
+        arm_y_lo  = bmin[1] + 0.15 * brange[1]
+        arm_y_hi  = bmin[1] + 0.85 * brange[1]
         arm_verts = verts[(verts[:, 1] >= arm_y_lo) & (verts[:, 1] < arm_y_hi)]
         if len(arm_verts) > 0:
             for name, selector in [
@@ -1114,10 +1139,30 @@ def mesh_guided_joint_correction(joints_data: dict, glb_path: str,
                     vert  = arm_verts[selector(arm_verts[:, 0])]
                     norm  = world_to_norm(vert)
                     old_x = hint_map[name]['position_normalized']['x']
-                    if abs(old_x - norm['x']) > 0.05:
-                        hint_map[name]['position_normalized']['x'] = norm['x']
+                    old_y = hint_map[name]['position_normalized']['y']
+                    if abs(old_x - norm['x']) > 0.05 or abs(old_y - norm['y']) > 0.05:
+                        hint_map[name]['position_normalized'] = {
+                            'x': norm['x'], 'y': norm['y'], 'z': 0.5,
+                        }
                         log.info(f"  GeoCorrect {name} X: {old_x:.3f}→{norm['x']:.3f} "
-                                 f"(mesh extremity)")
+                                 f"Y: {old_y:.3f}→{norm['y']:.3f} (mesh extremity)")
+
+        # Elbow = midpoint between shoulder and hand (same rule as
+        # knee_y = midpoint(hip_y, foot_y)), computed AFTER the hand
+        # correction above so it reflects the geometrically-grounded hand
+        # position rather than a possibly wrong vision guess.
+        for side, elbow_name, shoulder_name, hand_name in [
+            ('left',  'joint_elbow_left',  'joint_shoulder_left',  'joint_hand_left'),
+            ('right', 'joint_elbow_right', 'joint_shoulder_right', 'joint_hand_right'),
+        ]:
+            if elbow_name in hint_map and shoulder_name in hint_map and hand_name in hint_map:
+                shoulder_y = hint_map[shoulder_name]['position_normalized']['y']
+                hand_y     = hint_map[hand_name]['position_normalized']['y']
+                mid_y      = (shoulder_y + hand_y) / 2
+                old_y      = hint_map[elbow_name]['position_normalized']['y']
+                hint_map[elbow_name]['position_normalized']['y'] = mid_y
+                log.info(f"  GeoCorrect {elbow_name} Y: {old_y:.3f}→{mid_y:.3f} "
+                         f"(midpoint of shoulder/hand)")
 
         # Feet = bottommost vertices split left/right
         foot_verts = verts[verts[:, 1] < bmin[1] + 0.15 * brange[1]]
@@ -2087,6 +2132,7 @@ def infer_joints():
 
         # ── Extract mesh bounding box if available ────────────────────────────
         mesh_bounds = None
+        mesh        = None
         mesh_data   = record.get('mesh') or {}
         # Prefer decimated mesh for bounds extraction; fall back to full mesh
         _dec = ps._resolve_path(classify_id, 'decimated.glb')
@@ -2120,8 +2166,33 @@ def infer_joints():
                 log.info(f"Mesh bounds: x={brange[0]:.3f} y={brange[1]:.3f} "
                          f"z={brange[2]:.3f} (tallest={axis_names[tallest[0]]})")
 
+                # Trunk width at waist/lower-chest height (~0.48-0.60 of total
+                # height) — reliably below where arms reach in a T-pose, but
+                # an A-pose's arm angles down through this height too, which
+                # can inflate the reading with arm width. A plausible human
+                # torso is rarely wider than ~35% of the mesh's own total
+                # width, so reject implausibly wide readings (arm
+                # contamination) rather than trust a contaminated one.
+                MAX_PLAUSIBLE_TRUNK_FRAC = 0.35
+                trunk_y_lo = bmin[1] + 0.48 * brange[1]
+                trunk_y_hi = bmin[1] + 0.60 * brange[1]
+                trunk_verts = verts[(verts[:, 1] >= trunk_y_lo) & (verts[:, 1] < trunk_y_hi)]
+                if len(trunk_verts) > 10:
+                    trunk_x_left  = float((trunk_verts[:, 0].min() - bmin[0]) / brange[0])
+                    trunk_x_right = float((trunk_verts[:, 0].max() - bmin[0]) / brange[0])
+                    if trunk_x_right - trunk_x_left > MAX_PLAUSIBLE_TRUNK_FRAC:
+                        log.warning(f"Trunk width reading implausibly wide "
+                                    f"({trunk_x_right - trunk_x_left:.3f}) — likely "
+                                    f"arm contamination (e.g. A-pose), skipping")
+                    else:
+                        mesh_bounds['trunk_x_left']  = trunk_x_left
+                        mesh_bounds['trunk_x_right'] = trunk_x_right
+                        log.info(f"Trunk width at waist height: x=[{trunk_x_left:.3f}, "
+                                 f"{trunk_x_right:.3f}]")
+
             except Exception as e:
                 log.warning(f"Could not extract mesh bounds: {e}")
+                mesh = None
 
         log.info(f"Placing joints for: '{object_type}' ({category}) "
                  f"requested={requested_joints} "
@@ -2149,7 +2220,6 @@ def infer_joints():
                 }), 422
 
             from rig import infer_skeleton_geometric
-            import trimesh
             n = int(requested_joints) if requested_joints else None
             raw_joints, hierarchy, _ = infer_skeleton_geometric(glb_path, n)
 
@@ -2157,7 +2227,9 @@ def infer_joints():
             # relative to the mesh bounding box so joints_from_model can
             # map them back correctly.
             if mesh_bounds is None:
-                mesh   = trimesh.load(glb_path, force='mesh')
+                if mesh is None:
+                    import trimesh
+                    mesh = trimesh.load(glb_path, force='mesh')
                 verts  = np.array(mesh.vertices)
                 bmin   = np.array(verts.min(axis=0))
                 brange = np.array(verts.max(axis=0)) - bmin
@@ -2192,15 +2264,18 @@ def infer_joints():
         }
         log.info(f"GLB processing")
         if glb_path and os.path.exists(glb_path):
+            if mesh is None:
+                import trimesh
+                mesh = trimesh.load(glb_path, force='mesh')
             try:
-                joints_data = snap_joints_to_mesh(joints_data, glb_path)
+                joints_data = snap_joints_to_mesh(joints_data, mesh)
             except Exception as e:
                 log.warning(f"Snapping failed (non-fatal): {e}")
             log.info(f"Snapped")
             try:
                 rig_type = classify_data.get('rig_type', '')
                 joints_data = mesh_guided_joint_correction(
-                    joints_data, glb_path, rig_type)
+                    joints_data, mesh, rig_type)
             except Exception as e:
                 log.warning(f"Mesh-guided correction failed (non-fatal): {e}")
             log.info(f"Mesh correction")
@@ -2211,7 +2286,7 @@ def infer_joints():
             log.info(f"Mirrored")
             try:
                 viz_path = os.path.join(_rdir(classify_id), f"{classify_id}_joints_normalized_viz.glb")
-                visualize_normalized_joints(joints_data, glb_path, viz_path)
+                visualize_normalized_joints(joints_data, mesh, viz_path)
             except Exception as e:
                 log.warning(f"Normalized joints viz failed (non-fatal): {e}")
             log.info(f"Visualized")
@@ -2232,7 +2307,7 @@ def infer_joints():
         return jsonify({'error': str(e)}), 500
 
 
-def snap_joints_to_mesh(joints_data: dict, glb_path: str) -> dict:
+def snap_joints_to_mesh(joints_data: dict, mesh) -> dict:
     """
     Post-processing correction that brings Claude's 2D-estimated positions
     into alignment with the actual 3D mesh geometry.
@@ -2240,9 +2315,6 @@ def snap_joints_to_mesh(joints_data: dict, glb_path: str) -> dict:
                    filtering to the stalk/floret junction Y range.
     For hips/wing_base: snap X only — Y is correct from Claude.
     """
-    import trimesh
-
-    mesh   = trimesh.load(glb_path, force='mesh')
     verts  = np.array(mesh.vertices)
     bmin   = verts.min(axis=0)
     bmax   = verts.max(axis=0)
@@ -2268,9 +2340,14 @@ def snap_joints_to_mesh(joints_data: dict, glb_path: str) -> dict:
         is_shoulder = 'shoulder' in hint['name'].lower()
 
         if is_shoulder:
-            # Snap X and Y to arm attachment surface within Y band
-            y_lo = bmin[1] + 0.30 * brange[1]
-            y_hi = bmin[1] + 0.65 * brange[1]
+            # Snap X and Y to arm attachment surface within Y band.
+            # Real shoulders sit near chest/neck height (~0.6-0.75 of total
+            # height per this codebase's own spine-proportion constants in
+            # utils.py), not at the waist — the old 0.30-0.65 band excluded
+            # normal shoulder height entirely and forced a snap onto
+            # unrelated torso/waist geometry instead.
+            y_lo = bmin[1] + 0.45 * brange[1]
+            y_hi = bmin[1] + 0.82 * brange[1]
             mask = (verts[:, 1] >= y_lo) & (verts[:, 1] <= y_hi)
             candidates = verts[mask]
 
@@ -2304,23 +2381,22 @@ def snap_joints_to_mesh(joints_data: dict, glb_path: str) -> dict:
     return joints_data
 
 
-def visualize_normalized_joints(joints_data: dict, mesh_path: str,
+def visualize_normalized_joints(joints_data: dict, mesh,
                                  output_path: str):
     """
     Create GLB showing Claude's normalized joint positions overlaid on mesh.
-    
+
     Axis mapping (fixed):
       Claude x (left/right) → Blender X [0]
       Claude z (depth)      → Blender Y [1]  (always ~0.5 = center)
       Claude y (up/down)    → Blender Z [2]
-    
+
     Color coded: red = base joints (hip/shoulder/wing_base),
                  yellow = middle joints (knee/elbow/wing_mid),
                  green = end joints (hand/foot/head/wing_tip).
     """
     import trimesh
 
-    mesh  = trimesh.load(mesh_path, force='mesh')
     scene = trimesh.Scene()
     scene.add_geometry(mesh, node_name='mesh')
 
