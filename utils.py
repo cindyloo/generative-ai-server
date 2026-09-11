@@ -575,20 +575,47 @@ def _build_joints_prompt(object_type: str, category: str,
         h = mesh_bounds['height']
         hw = h / w
 
-        # Spine proportions by rig type — these are computed from mesh geometry,
-        # not estimated from the image.
+        # Spine proportions by rig type — mostly fixed fractions of total
+        # height, EXCEPT neck_y, which is measured directly from the mesh
+        # when available (see mesh_bounds['neck_y_detected'] in seg_server.py
+        # — a local minimum in cross-sectional width between the shoulders
+        # and head). Head-to-body ratio varies a lot per mesh (a chibi/
+        # big-head character vs. adult proportions), so a fixed neck_y is
+        # wrong for one or the other. chest/spine are then rescaled to keep
+        # their original fractional position between pelvis and neck, so
+        # the whole spine chain stays consistent even though only neck is
+        # independently measured.
         if rt in ('biped', 'humanoid'):
-            head_top = 1.00; head_bot = 0.75
-            neck_y   = 0.72; chest_y  = 0.62
-            pelvis_y = 0.42; spine_y  = 0.52
+            head_top = 1.00; head_bot_default = 0.75
+            neck_y_default = 0.72; chest_y_default = 0.62
+            pelvis_y = 0.42; spine_y_default = 0.52
         elif rt == 'quadruped':
-            head_top = 1.00; head_bot = 0.78
-            neck_y   = 0.72; chest_y  = 0.58
-            pelvis_y = 0.55; spine_y  = 0.57
+            head_top = 1.00; head_bot_default = 0.78
+            neck_y_default = 0.72; chest_y_default = 0.58
+            pelvis_y = 0.55; spine_y_default = 0.57
         else:
-            head_top = 1.00; head_bot = 0.78
-            neck_y   = 0.72; chest_y  = 0.60
-            pelvis_y = 0.45; spine_y  = 0.53
+            head_top = 1.00; head_bot_default = 0.78
+            neck_y_default = 0.72; chest_y_default = 0.60
+            pelvis_y = 0.45; spine_y_default = 0.53
+
+        neck_y_detected = mesh_bounds.get('neck_y_detected')
+        if neck_y_detected is not None and rt in ('biped', 'humanoid'):
+            neck_y   = neck_y_detected
+            head_bot = neck_y  # head starts right where the neck narrowing ends
+            # chest/spine keep their original fractional position between
+            # pelvis and neck (e.g. chest was 2/3 of the way from pelvis to
+            # neck in the default proportions) rather than fixed absolutes.
+            old_span   = neck_y_default - pelvis_y
+            chest_frac = (chest_y_default - pelvis_y) / old_span if old_span else 0.667
+            spine_frac = (spine_y_default - pelvis_y) / old_span if old_span else 0.333
+            new_span = neck_y - pelvis_y
+            chest_y  = pelvis_y + chest_frac * new_span
+            spine_y  = pelvis_y + spine_frac * new_span
+        else:
+            neck_y   = neck_y_default
+            head_bot = head_bot_default
+            chest_y  = chest_y_default
+            spine_y  = spine_y_default
 
         # Shoulders are siblings of the neck off joint_chest in the skeleton
         # hierarchy (both attach at the same point on the spine), so they

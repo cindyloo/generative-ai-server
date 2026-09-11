@@ -1119,16 +1119,18 @@ def mesh_guided_joint_correction(joints_data: dict, mesh,
 
         # Hands = outermost X vertices in arm Y range. Band must be wide
         # enough to cover a hand at any arm pose — T-pose puts it near
-        # shoulder height (~0.7-0.8), A-pose or arms-at-sides puts it much
-        # lower (~0.3-0.45) — a narrower band can miss the true extremity
-        # and corrupt an already-correct X guess (same failure mode as the
-        # old shoulder Y-band). Adopt the found vertex's Y as well as X —
-        # a hand that flares outward at the wrist means the widest-X vertex
+        # shoulder height, which (like neck_y) is now measured per mesh and
+        # can run above the old fixed 0.85 ceiling for a big-headed/
+        # short-body mesh; A-pose or arms-at-sides puts it much lower
+        # (~0.3-0.45) — a narrower band can miss the true extremity and
+        # corrupt an already-correct X guess (same failure mode as the old
+        # shoulder Y-band). Adopt the found vertex's Y as well as X — a
+        # hand that flares outward at the wrist means the widest-X vertex
         # is a real hand vertex, so its height is real signal too, and it
         # can catch cases where the vision guess assumed the wrong arm pose
         # (e.g. guessed T-pose when the actual mesh is an A-pose).
         arm_y_lo  = bmin[1] + 0.15 * brange[1]
-        arm_y_hi  = bmin[1] + 0.85 * brange[1]
+        arm_y_hi  = bmin[1] + 0.95 * brange[1]
         arm_verts = verts[(verts[:, 1] >= arm_y_lo) & (verts[:, 1] < arm_y_hi)]
         if len(arm_verts) > 0:
             for name, selector in [
@@ -2190,6 +2192,39 @@ def infer_joints():
                         log.info(f"Trunk width at waist height: x=[{trunk_x_left:.3f}, "
                                  f"{trunk_x_right:.3f}]")
 
+                # Neck height = local minimum of the cross-sectional width
+                # profile between shoulders (wide) and head (wide again) —
+                # a real geometric landmark, unlike a fixed fraction of
+                # total height. Head-to-body ratio varies a lot per mesh
+                # (e.g. a chibi/big-head character vs. adult proportions),
+                # so a single fixed neck_y is wrong for one or the other.
+                # Not attempted for the pelvis/waist the same way — an
+                # A-pose arm passes through that height range and
+                # contaminates the profile (same failure mode as the old
+                # trunk-width measurement above).
+                n_slices = 60
+                width_profile = []
+                for i in range(n_slices):
+                    y_lo = bmin[1] + (i / n_slices) * brange[1]
+                    y_hi = bmin[1] + ((i + 1) / n_slices) * brange[1]
+                    sv = verts[(verts[:, 1] >= y_lo) & (verts[:, 1] < y_hi)]
+                    if len(sv) > 5:
+                        w = float((sv[:, 0].max() - sv[:, 0].min()) / brange[0])
+                        width_profile.append((i / n_slices + 0.5 / n_slices, w))
+
+                neck_candidates = [(y, w) for y, w in width_profile if 0.55 <= y <= 0.92]
+                if neck_candidates:
+                    neck_y_detected, neck_w = min(neck_candidates, key=lambda t: t[1])
+                    boundary_w = max(
+                        neck_candidates[0][1], neck_candidates[-1][1]
+                    )
+                    # Require a genuine narrowing, not just the edge of the
+                    # search window (which would mean no real minimum exists).
+                    if boundary_w > 0 and neck_w < 0.7 * boundary_w:
+                        mesh_bounds['neck_y_detected'] = neck_y_detected
+                        log.info(f"Detected neck_y from mesh profile: "
+                                 f"{neck_y_detected:.3f} (width={neck_w:.3f})")
+
             except Exception as e:
                 log.warning(f"Could not extract mesh bounds: {e}")
                 mesh = None
@@ -2341,13 +2376,15 @@ def snap_joints_to_mesh(joints_data: dict, mesh) -> dict:
 
         if is_shoulder:
             # Snap X and Y to arm attachment surface within Y band.
-            # Real shoulders sit near chest/neck height (~0.6-0.75 of total
-            # height per this codebase's own spine-proportion constants in
-            # utils.py), not at the waist — the old 0.30-0.65 band excluded
-            # normal shoulder height entirely and forced a snap onto
-            # unrelated torso/waist geometry instead.
+            # Real shoulders sit near chest/neck height, not at the waist —
+            # the old 0.30-0.65 band excluded normal shoulder height
+            # entirely. neck_y (and shoulder_y = neck_y) is now measured per
+            # mesh in utils.py (mesh_bounds['neck_y_detected']) instead of a
+            # fixed 0.72-0.76, so a big-headed/short-body mesh can push neck
+            # well above 0.82 — the ceiling needs enough headroom to never
+            # exclude wherever neck_y actually landed for THIS mesh.
             y_lo = bmin[1] + 0.45 * brange[1]
-            y_hi = bmin[1] + 0.82 * brange[1]
+            y_hi = bmin[1] + 0.92 * brange[1]
             mask = (verts[:, 1] >= y_lo) & (verts[:, 1] <= y_hi)
             candidates = verts[mask]
 
