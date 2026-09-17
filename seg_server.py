@@ -996,7 +996,98 @@ def mirror_wheel_centers(mask_dir, joint_hints):
         with open(centers_path, 'w') as f:
             json.dump(centers, f, indent=2)
 
-    
+
+def _detect_trunk_x_edges(verts_in_band: np.ndarray, mesh_center_x: float):
+    """
+    Measure trunk width at a height band without assuming any particular
+    body shape or proportion. A naive min/max over the band is
+    contaminated whenever a limb also passes through that height (e.g. an
+    A-pose arm crossing waist height) — but a fixed "trunk can't be wider
+    than X% of the mesh" cap is just as wrong in the other direction (a
+    round/wide character body would be rejected as "implausible" even
+    when the reading is completely correct).
+
+    Instead, look for a real gap in the cross-section: sort all vertex X
+    values in the band and find the largest gap between consecutive
+    values. A limb crossing through is usually separated from the torso
+    by open space (e.g. the armpit gap in an A-pose or spread stance), so
+    a substantial gap means the band actually contains multiple
+    disconnected clusters, not one continuous torso. When that happens,
+    keep only the cluster nearest the mesh's own horizontal centerline —
+    that's the trunk; the other cluster(s) are the offending limb(s).
+    If there's no substantial gap, the band is one continuous blob and
+    the full min/max is trusted as-is, however wide it is — this is what
+    makes it work for a body shape with no slim waist at all.
+
+    Returns (x_left, x_right) in world-space coordinates, or None if
+    there aren't enough vertices in the band to measure.
+    """
+    if len(verts_in_band) < 10:
+        return None
+
+    xs = np.sort(verts_in_band[:, 0])
+    total_span = xs[-1] - xs[0]
+    if total_span <= 0:
+        return None
+
+    gaps = np.diff(xs)
+    GAP_FRAC_THRESHOLD = 0.12
+    split_idx = np.where(gaps / total_span >= GAP_FRAC_THRESHOLD)[0]
+
+    if len(split_idx) == 0:
+        # One continuous blob — no limb crossing detected, trust it fully.
+        return float(xs[0]), float(xs[-1])
+
+    # Split into clusters at every substantial gap (handles more than one
+    # limb crossing at the same height, e.g. both arms in an A-pose).
+    boundaries = [0] + (split_idx + 1).tolist() + [len(xs)]
+    clusters = [xs[boundaries[i]:boundaries[i + 1]]
+                for i in range(len(boundaries) - 1)]
+
+    trunk_cluster = min(
+        clusters, key=lambda c: abs((c[0] + c[-1]) / 2 - mesh_center_x)
+    )
+    return float(trunk_cluster[0]), float(trunk_cluster[-1])
+
+
+def _measure_trunk_x_edges(verts: np.ndarray, bmin: np.ndarray,
+                            bmax: np.ndarray, brange: np.ndarray):
+    """
+    Robust trunk-width measurement: a single height band can still be
+    contaminated even with gap detection (_detect_trunk_x_edges) — if a
+    limb happens to sit close enough to the torso at that exact height,
+    there's no real air gap to find (this genuinely happens on some
+    meshes, e.g. a thick/low-poly A-pose character whose arm blends into
+    the torso silhouette at certain heights, even though it's clearly
+    separate at others).
+
+    Sample several height bands spanning the waist/lower-chest region and
+    take the MEDIAN-width band's result. A limb only contaminates the
+    bands its own height overlaps — the true trunk width tends to be far
+    more consistent band-to-band than a contaminated reading — so the
+    median is naturally resistant to the 1-2 bands a limb happens to
+    intrude on, without needing any fixed plausibility threshold.
+
+    Returns (x_left, x_right) in world-space coordinates, or None if no
+    band had enough vertices to measure.
+    """
+    mesh_center_x = (bmin[0] + bmax[0]) / 2
+    band_results = []
+    for lo_frac in np.arange(0.40, 0.61, 0.05):
+        y_lo = bmin[1] + lo_frac * brange[1]
+        y_hi = bmin[1] + (lo_frac + 0.05) * brange[1]
+        band_verts = verts[(verts[:, 1] >= y_lo) & (verts[:, 1] < y_hi)]
+        edges = _detect_trunk_x_edges(band_verts, mesh_center_x)
+        if edges is not None:
+            band_results.append((edges[1] - edges[0], edges))
+
+    if not band_results:
+        return None
+
+    band_results.sort(key=lambda t: t[0])
+    return band_results[len(band_results) // 2][1]
+
+
 def mesh_guided_joint_correction(joints_data: dict, mesh,
                                   rig_type: str) -> dict:
     """
@@ -1086,36 +1177,27 @@ def mesh_guided_joint_correction(joints_data: dict, mesh,
         # waist/torso taper rather than the actual armpit junction) and
         # could drag an already-correct shoulder Y back down.
 
-        # Shoulder X = trunk edge at waist height, measured directly from
-        # the mesh — NOT trusted from the vision guess even after
-        # snap_joints_to_mesh, because a bad vision guess (anchored to a
-        # fixed fraction of the full image) can land deep in arm territory
-        # in a T-pose, and nearest-vertex search from a bad starting point
-        # just refines near the same wrong spot instead of correcting it.
-        # A plausible human torso is rarely wider than ~35% of the mesh's
-        # own total width — an A-pose's arm angling down through this
-        # height band can inflate the reading with arm width, so reject
-        # implausibly wide readings instead of trusting contaminated ones.
-        MAX_PLAUSIBLE_TRUNK_FRAC = 0.35
-        trunk_y_lo   = bmin[1] + 0.48 * brange[1]
-        trunk_y_hi   = bmin[1] + 0.60 * brange[1]
-        trunk_verts  = verts[(verts[:, 1] >= trunk_y_lo) & (verts[:, 1] < trunk_y_hi)]
-        if len(trunk_verts) > 10:
-            trunk_x_left  = float(trunk_verts[:, 0].min())
-            trunk_x_right = float(trunk_verts[:, 0].max())
-            if (trunk_x_right - trunk_x_left) / brange[0] > MAX_PLAUSIBLE_TRUNK_FRAC:
-                log.warning(f"  Trunk width reading implausibly wide "
-                            f"({(trunk_x_right - trunk_x_left) / brange[0]:.3f}) — "
-                            f"likely arm contamination (e.g. A-pose), skipping shoulder X snap")
-            else:
-                for name, trunk_x in [('joint_shoulder_left', trunk_x_left),
-                                       ('joint_shoulder_right', trunk_x_right)]:
-                    if name in hint_map:
-                        new_x = float(np.clip((trunk_x - bmin[0]) / brange[0], 0.0, 1.0))
-                        old_x = hint_map[name]['position_normalized']['x']
-                        hint_map[name]['position_normalized']['x'] = new_x
-                        log.info(f"  GeoCorrect {name} X: {old_x:.3f}→{new_x:.3f} "
-                                 f"(trunk edge)")
+        # Shoulder X = trunk edge, measured directly from the mesh — NOT
+        # trusted from the vision guess even after snap_joints_to_mesh,
+        # because a bad vision guess (anchored to a fixed fraction of the
+        # full image) can land deep in arm territory in a T-pose, and
+        # nearest-vertex search from a bad starting point just refines
+        # near the same wrong spot instead of correcting it.
+        # See _measure_trunk_x_edges for how arm-crossing contamination
+        # (e.g. an A-pose arm passing through waist height) is filtered
+        # out via gap detection across multiple height bands, rather than
+        # a fixed width assumption.
+        trunk_edges = _measure_trunk_x_edges(verts, bmin, bmax, brange)
+        if trunk_edges is not None:
+            trunk_x_left, trunk_x_right = trunk_edges
+            for name, trunk_x in [('joint_shoulder_left', trunk_x_left),
+                                   ('joint_shoulder_right', trunk_x_right)]:
+                if name in hint_map:
+                    new_x = float(np.clip((trunk_x - bmin[0]) / brange[0], 0.0, 1.0))
+                    old_x = hint_map[name]['position_normalized']['x']
+                    hint_map[name]['position_normalized']['x'] = new_x
+                    log.info(f"  GeoCorrect {name} X: {old_x:.3f}→{new_x:.3f} "
+                             f"(trunk edge)")
 
         # Hands = outermost X vertices in arm Y range. Band must be wide
         # enough to cover a hand at any arm pose — T-pose puts it near
@@ -2168,29 +2250,22 @@ def infer_joints():
                 log.info(f"Mesh bounds: x={brange[0]:.3f} y={brange[1]:.3f} "
                          f"z={brange[2]:.3f} (tallest={axis_names[tallest[0]]})")
 
-                # Trunk width at waist/lower-chest height (~0.48-0.60 of total
-                # height) — reliably below where arms reach in a T-pose, but
-                # an A-pose's arm angles down through this height too, which
-                # can inflate the reading with arm width. A plausible human
-                # torso is rarely wider than ~35% of the mesh's own total
-                # width, so reject implausibly wide readings (arm
-                # contamination) rather than trust a contaminated one.
-                MAX_PLAUSIBLE_TRUNK_FRAC = 0.35
-                trunk_y_lo = bmin[1] + 0.48 * brange[1]
-                trunk_y_hi = bmin[1] + 0.60 * brange[1]
-                trunk_verts = verts[(verts[:, 1] >= trunk_y_lo) & (verts[:, 1] < trunk_y_hi)]
-                if len(trunk_verts) > 10:
-                    trunk_x_left  = float((trunk_verts[:, 0].min() - bmin[0]) / brange[0])
-                    trunk_x_right = float((trunk_verts[:, 0].max() - bmin[0]) / brange[0])
-                    if trunk_x_right - trunk_x_left > MAX_PLAUSIBLE_TRUNK_FRAC:
-                        log.warning(f"Trunk width reading implausibly wide "
-                                    f"({trunk_x_right - trunk_x_left:.3f}) — likely "
-                                    f"arm contamination (e.g. A-pose), skipping")
-                    else:
-                        mesh_bounds['trunk_x_left']  = trunk_x_left
-                        mesh_bounds['trunk_x_right'] = trunk_x_right
-                        log.info(f"Trunk width at waist height: x=[{trunk_x_left:.3f}, "
-                                 f"{trunk_x_right:.3f}]")
+                # Trunk width at waist/lower-chest height — reliably below
+                # where arms reach in a T-pose, but an A-pose's arm angles
+                # down through this region too. See _measure_trunk_x_edges
+                # for how arm-crossing contamination is filtered out via
+                # gap detection across multiple height bands, rather than a
+                # fixed width assumption (which would misfire on a body
+                # shape with no slim waist at all, e.g. a round/tomato-like
+                # character).
+                trunk_edges = _measure_trunk_x_edges(verts, bmin, bmax, brange)
+                if trunk_edges is not None:
+                    trunk_x_left  = float((trunk_edges[0] - bmin[0]) / brange[0])
+                    trunk_x_right = float((trunk_edges[1] - bmin[0]) / brange[0])
+                    mesh_bounds['trunk_x_left']  = trunk_x_left
+                    mesh_bounds['trunk_x_right'] = trunk_x_right
+                    log.info(f"Trunk width at waist height: x=[{trunk_x_left:.3f}, "
+                             f"{trunk_x_right:.3f}]")
 
                 # Neck height = local minimum of the cross-sectional width
                 # profile between shoulders (wide) and head (wide again) —
