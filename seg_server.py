@@ -2088,6 +2088,15 @@ def augment_image():
         img_a.save(path_a)
         img_b.save(path_b)
 
+        # The user explicitly requested augmentation by calling this endpoint —
+        # record that, regardless of what /classify originally decided. This
+        # keeps needs_augmentation an accurate reflection of "augmentation was
+        # requested for this record" (e.g. a client working around a stale or
+        # incorrect classify result), not just classify's own initial guess.
+        if not classify_data.get('needs_augmentation'):
+            _store.upsert_classify(classify_id, record.get('tag', ''),
+                                   {**classify_data, 'needs_augmentation': True})
+
         return jsonify({
             'status':      'ok',
             'classify_id': classify_id,
@@ -2575,25 +2584,78 @@ def mesh():
         if not active_path or not os.path.exists(active_path):
             return jsonify({'error': f"Active image not found: '{active_path}'"}), 404
 
+        # ── Augmentation-skipped guard ────────────────────────────────────────
+        # classify flagged this object as needing a pose change, but no
+        # augmented variant has been confirmed as active yet — meshing now
+        # would silently use the original (e.g. limbless) image instead.
+        # This is exactly what happened for real records before this check
+        # existed: augmentation was generated but /augment_image/confirm was
+        # never called, so /mesh quietly used the un-augmented image and
+        # spent a Meshy credit on a mesh that didn't match the intended pose.
+        classify_data      = record.get('classify') or {}
+        active_image_key   = record.get('active_image_key')
+        if (classify_data.get('needs_augmentation') and not force
+                and active_image_key in (None, '', 'segmented')):
+            return jsonify({
+                'error': (
+                    'needs_augmentation is true for this object but no '
+                    'augmented image has been confirmed — /mesh would use '
+                    'the original, un-augmented image. Call /augment_image '
+                    'then /augment_image/confirm first, or pass '
+                    '?force=true to mesh the original image anyway.'
+                ),
+                'needs_augmentation': True,
+                'active_image_key':   active_image_key,
+                'classify_id':        classify_id,
+            }), 422
+
         # ── Cache hit ─────────────────────────────────────────────────────────
-        existing_mesh = record.get('mesh') or {}
-        if not force and existing_mesh.get('glb_path') and \
-                os.path.exists(existing_mesh['glb_path']):
+        # glb_path is never persisted in the store (paths are reconstructed
+        # from classify_id at read time, same as active_image_path) — it must
+        # be resolved here rather than read off the record, or this check can
+        # never succeed.
+        existing_mesh     = record.get('mesh') or {}
+        existing_glb_path = ps._resolve_path(classify_id, 'mesh.glb')
+        mesh_exists        = bool(existing_mesh) and os.path.exists(existing_glb_path)
+
+        # A confirmed augmented (or re-augmented) image can be newer than an
+        # already-generated mesh — e.g. /mesh ran once against the original
+        # image before augmentation was confirmed. Comparing filesystem
+        # mtimes directly (image file vs. GLB file) catches this
+        # automatically, without requiring the caller to remember
+        # ?force=true every time the active image changes underneath an
+        # existing mesh. Deliberately NOT comparing against the mesh's
+        # stored created_at string — _now() truncates to whole-second
+        # precision, so a mesh created within the same second as its own
+        # source image would almost always look (falsely) older than the
+        # image once truncated, making the cache spuriously miss on nearly
+        # every real request. Two real mtimes have matching precision.
+        mesh_is_stale = False
+        if mesh_exists:
+            try:
+                if os.path.getmtime(active_path) > os.path.getmtime(existing_glb_path):
+                    mesh_is_stale = True
+                    log.info(f"Active image is newer than cached mesh for "
+                             f"{classify_id} — regenerating instead of using cache")
+            except OSError as e:
+                log.warning(f"Could not compare mesh/image timestamps for "
+                            f"{classify_id}: {e}")
+
+        if mesh_exists and not force and not mesh_is_stale:
             log.info(f"Mesh cache hit: {classify_id}")
             return jsonify({
                 'status':        'ok',
                 'task_id':       None,
                 'glb_url':       existing_mesh.get('glb_url'),
-                'glb_local_url': _local_url(existing_mesh['glb_path'], request.host),
+                'glb_local_url': _local_url(existing_glb_path, request.host),
                 'classify_id':   classify_id,
             })
 
         with open(active_path, 'rb') as f:
             img_bytes = f.read()
 
-        classify_data = record.get('classify') or {}
-        object_type   = classify_data.get('object_type', '') or \
-                        request.args.get('type', '').lower().strip().replace('+', ' ')
+        object_type = classify_data.get('object_type', '') or \
+                      request.args.get('type', '').lower().strip().replace('+', ' ')
         img       = Image.open(io.BytesIO(img_bytes)).convert('RGBA')
         img       = utils.resize_if_needed(img, max_size=1024)
         mesh_hash = hashlib.md5(img_bytes + object_type.encode()).hexdigest()[:12]

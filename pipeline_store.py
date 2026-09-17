@@ -397,13 +397,18 @@ class JsonStore:
 
     def get_mesh_by_hash(self, mesh_hash: str) -> dict | None:
         """Return mesh sub-object if mesh_hash matches and GLB file exists on disk.
-        glb_path is reconstructed from classify_id since it is not stored."""
+        glb_path is not stored, so it's reconstructed here (from the MATCHING
+        record's own classify_id, not the caller's) and injected into the
+        returned dict — callers need a real path, not just metadata."""
         with self._lock:
             for cid, r in self._data.items():
                 msh = r.get('mesh') or {}
                 if msh.get('mesh_hash') == mesh_hash:
-                    if os.path.exists(_resolve_path(cid, 'mesh.glb')):
-                        return dict(msh)
+                    glb_path = _resolve_path(cid, 'mesh.glb')
+                    if os.path.exists(glb_path):
+                        result = dict(msh)
+                        result['glb_path'] = glb_path
+                        return result
             return None
 
     def all_tags_for_user(self, user_id: str) -> list[str]:
@@ -563,8 +568,11 @@ class TinyDbStore:
             for r in self._table.all():
                 msh = r.get('mesh') or {}
                 if msh.get('mesh_hash') == mesh_hash:
-                    if os.path.exists(_resolve_path(r['classify_id'], 'mesh.glb')):
-                        return dict(msh)
+                    glb_path = _resolve_path(r['classify_id'], 'mesh.glb')
+                    if os.path.exists(glb_path):
+                        result = dict(msh)
+                        result['glb_path'] = glb_path
+                        return result
             return None
 
     def all_tags_for_user(self, user_id: str) -> list[str]:
@@ -745,7 +753,14 @@ class CloudDbStore:
         if msh.get('mesh_hash') != mesh_hash:
             return None
         cid = record.get('classify_id', '')
-        return dict(msh) if cid and os.path.exists(_resolve_path(cid, 'mesh.glb')) else None
+        if not cid:
+            return None
+        glb_path = _resolve_path(cid, 'mesh.glb')
+        if not os.path.exists(glb_path):
+            return None
+        result = dict(msh)
+        result['glb_path'] = glb_path
+        return result
 
     def all_tags_for_user(self, user_id: str) -> list[str]:
         tags: set[str] = set()
