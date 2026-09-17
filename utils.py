@@ -466,6 +466,11 @@ Rules:
     vehicle    — wheels and axles (car, truck, bike, spacecraft)
     mechanical - interlocking mechanical parts (tools, toys, gadgets)
     other      — no clear locomotion structure (snake, fish, furniture, abstract)
+    If the object currently has NO visible limbs but the user's tag explicitly
+    asks for some (e.g. "with legs", "with arms", "walking", "standing"), pick
+    the rig_type that matches what the tag requests (e.g. "biped" for "with
+    legs") instead of "other" — the missing limbs will be added via
+    augmentation, not left unrigged.
 
 - style: describe the visual style and medium in a few specific words.
     This is critical — it will be used to preserve the exact look during augmentation.
@@ -498,8 +503,15 @@ Rules:
     • Limbs are bent, folded, or hidden (sitting, curled, wings closed)
     • Body parts overlap and cannot be separated
     • Extreme foreshortening hides limb structure
+    • The object has NO visible limbs at all, but the user's tag explicitly
+      requests a locomotion structure (e.g. "with legs", "with arms",
+      "walking") that isn't present in the image — the limbs must be added
     if a vehicle and the wheels are in a front of the car or 3/4 view, better to make a side view
-    Set false if pose is neutral/spread out or if rig_type is vehicle/other
+    Set false if pose is neutral/spread out and none of the above apply.
+    Do NOT default to false just because rig_type is "other" — the
+    no-visible-limbs rule above still applies to "other" objects when the
+    tag requests limbs. Vehicles are only reposed for the wheel-angle reason
+    above; mechanical objects are not reposed.
     For flying objects: set false if wings are already spread — spread wings IS the correct rigging pose
 
 - augment_prompt: only if needs_augmentation is true — describe the pose change needed
@@ -510,6 +522,9 @@ Rules:
       biped:    "Keep the exact same appearance. Repose standing upright with legs slightly apart, facing forward."
       flying:   "Keep the exact same bird/creature appearance. Repose with wings fully extended horizontally, legs visible below, facing forward."
       quadruped:"Keep the exact same animal appearance. Repose standing with all four legs apart and visible."
+      other with requested limbs: "Keep the exact same appearance, materials, and character.
+        Add simple cartoon arms and legs in a T-pose or A-pose, arms extended
+        horizontally, standing upright, facing forward."
     Leave empty string if needs_augmentation is false.
 """
 
@@ -1301,8 +1316,9 @@ Rules:
 
 - needs_augmentation: true if the current pose will make rigging very difficult:
     if a vehicle and the wheels are in a front of the car or 3/4 view, better to make a side view
-    Set false if pose is neutral/spread out or if rig_type is vehicle/other
-    For flying objects: set false if wings are already spread — spread wings IS the correct rigging pose
+    Set false if pose is neutral/spread out (e.g. already a clean side view) and none of the above apply.
+    Do NOT set false just because rig_type is "vehicle" — the wheel-angle rule
+    above applies specifically to vehicles. Mechanical objects are not reposed.
 
 - augment_prompt: only if needs_augmentation is true — describe the pose change needed
     while PRESERVING the original style, materials, and appearance.
