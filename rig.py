@@ -643,6 +643,120 @@ def validate_bone_mesh_fit(mesh_obj, armature_obj):
     
     return report
     
+def _validate_heat_weights(mesh_objects, armature_obj,
+                            envelope_factor=2.5, size_floor_factor=0.06,
+                            leaked_weight_threshold=0.10, leak_fraction=0.15):
+    """
+    Check whether Blender's heat-weighting (Automatic Weights) produced
+    geometrically local weights, rather than just checking that vertex
+    groups exist at all. Heat diffusion can badly leak a bone's influence
+    across the whole mesh when that bone is very short relative to the
+    mesh (e.g. stubby legs on a round character) — the diffusion source
+    is too small/close to neighboring geometry to localize properly, so
+    far-away vertices (chest, head) can end up with substantial weight
+    from a leg bone. The previous check here only asked "did any vertex
+    group get any weight at all", which this kind of leak still passes.
+
+    Each bone gets its own influence envelope — envelope_factor times that
+    bone's own length, with a floor of size_floor_factor times the mesh's
+    bounding-box diagonal (so a very short/near-zero-length bone still
+    gets a sane minimum envelope instead of ~0). A vertex whose distance
+    to a bone exceeds that bone's envelope is "far" from it. Comparing
+    against each bone's OWN envelope, rather than a multiple of the
+    vertex's nearest-bone distance, matters specifically for a compact
+    body: when every bone sits within a similar distance range of a given
+    vertex (e.g. a round character with a short overall skeleton), a
+    relative "3x the nearest bone" comparison never triggers even for a
+    clearly wrong assignment, because nothing is proportionally much
+    farther than anything else.
+
+    For each weighted vertex, sum the weight assigned to far bones —
+    checking only the single heaviest-weighted bone per vertex is not
+    enough, since a vertex can have a perfectly reasonable primary bone
+    (e.g. chest) but still carry real, anatomically-implausible secondary
+    weight from a distant bone (e.g. a leg) that a primary-only check
+    would miss. Flags a vertex as leaked when that far-bone weight
+    exceeds leaked_weight_threshold of its total weight. Returns False
+    (meaning "fall back to segment weighting") when too large a fraction
+    of vertices are leaked.
+    """
+    import numpy as np
+
+    bone_names = [b.name for b in armature_obj.data.bones]
+    bone_segments = []
+    for b in armature_obj.data.bones:
+        head = np.array(armature_obj.matrix_world @ b.head_local)
+        tail = np.array(armature_obj.matrix_world @ b.tail_local)
+        bone_segments.append((head, tail))
+    if not bone_segments:
+        return True
+
+    all_verts_for_size = []
+    for mesh_obj in mesh_objects:
+        verts_local = np.array([v.co for v in mesh_obj.data.vertices])
+        if len(verts_local) == 0:
+            continue
+        mat  = np.array(mesh_obj.matrix_world)
+        ones = np.ones((len(verts_local), 1))
+        all_verts_for_size.append((mat @ np.hstack([verts_local, ones]).T).T[:, :3])
+    if not all_verts_for_size:
+        return True
+    all_verts = np.vstack(all_verts_for_size)
+    mesh_diagonal = float(np.linalg.norm(all_verts.max(axis=0) - all_verts.min(axis=0)))
+    size_floor = size_floor_factor * mesh_diagonal
+
+    bone_envelopes = np.array([
+        envelope_factor * max(np.linalg.norm(tail - head), size_floor)
+        for head, tail in bone_segments
+    ])
+
+    bad_count   = 0
+    total_count = 0
+    for mesh_obj in mesh_objects:
+        verts_local = np.array([v.co for v in mesh_obj.data.vertices])
+        if len(verts_local) == 0:
+            continue
+        mat  = np.array(mesh_obj.matrix_world)
+        ones = np.ones((len(verts_local), 1))
+        verts = (mat @ np.hstack([verts_local, ones]).T).T[:, :3]
+
+        dists = np.column_stack([
+            point_to_segment_distance(verts, head, tail)
+            for head, tail in bone_segments
+        ])
+
+        group_to_bone = {}
+        for vg in mesh_obj.vertex_groups:
+            if vg.name in bone_names:
+                group_to_bone[vg.index] = bone_names.index(vg.name)
+
+        for vi, v in enumerate(mesh_obj.data.vertices):
+            if not v.groups:
+                continue
+            total_w = 0.0
+            far_w   = 0.0
+            for g in v.groups:
+                bi = group_to_bone.get(g.group)
+                if bi is None:
+                    continue
+                total_w += g.weight
+                if dists[vi, bi] > bone_envelopes[bi]:
+                    far_w += g.weight
+            if total_w <= 0:
+                continue
+            total_count += 1
+            if far_w / total_w > leaked_weight_threshold:
+                bad_count += 1
+
+    if total_count == 0:
+        return True
+    bad_fraction = bad_count / total_count
+    print(f"  Weight locality check: {bad_count}/{total_count} vertices "
+          f"({bad_fraction:.1%}) carry >{leaked_weight_threshold:.0%} weight "
+          f"from bones much farther than their nearest bone")
+    return bad_fraction <= leak_fraction
+
+
 def skin_mesh(mesh_objects, armature_obj, skeleton_joints_data):
     """
     Try heat weighting first, fall back to segment weighting.
@@ -665,6 +779,11 @@ def skin_mesh(mesh_objects, armature_obj, skeleton_joints_data):
         )
         for mesh_obj in mesh_objects
     )
+
+    if heat_succeeded and not _validate_heat_weights(mesh_objects, armature_obj):
+        print("  Heat weighting produced leaked/non-local weights (likely "
+              "from a very short bone) — falling back to segment weighting")
+        heat_succeeded = False
 
     if heat_succeeded:
         print("  Heat weighting succeeded")
