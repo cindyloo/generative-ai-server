@@ -508,6 +508,13 @@ Rules:
       "walking") that isn't present in the image — the limbs must be added
     if a vehicle and the wheels are in a front of the car or 3/4 view, better to make a side view
     Set false if pose is neutral/spread out and none of the above apply.
+    A limb that is already extended AWAY from the torso (arms out to the
+    sides, legs apart) counts as spread even if the character's art style
+    draws it as a tapered, curved, or slightly droopy stalk rather than a
+    perfectly straight rigid line — that is a normal stylistic choice, NOT
+    a rigging problem. Do NOT set true just to make an already-extended
+    limb straighter, more symmetric, or more centered — only set true when
+    a limb is actually bent back toward the body, tucked away, or hidden.
     Do NOT default to false just because rig_type is "other" — the
     no-visible-limbs rule above still applies to "other" objects when the
     tag requests limbs. Vehicles are only reposed for the wheel-angle reason
