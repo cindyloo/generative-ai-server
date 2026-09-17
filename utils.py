@@ -517,9 +517,20 @@ Rules:
 - augment_prompt: only if needs_augmentation is true — describe the pose change needed
     while PRESERVING the original style, materials, and appearance.
     Always start with style preservation, then describe the pose change.
+    The limbs you describe MUST exactly match the rig_type you chose above —
+    the skeleton will only have joints for the limbs rig_type implies, so any
+    limb described here that rig_type doesn't cover will end up in the mesh
+    with no bone to move it. Never hedge with "if present" or "or small
+    stubs" — pick a limb structure and describe it definitely:
+      rig_type=biped:      legs ONLY. Do not mention arms, stubs, or any
+                            other upper-body limb.
+      rig_type=humanoid:   arms AND legs, both explicitly described.
+      rig_type=quadruped:  four legs.
+      rig_type=flying:     wings (plus legs only if rig_type/object also has them).
+      rig_type=other with requested limbs: only the limbs the tag asked for.
     Examples by rig_type:
       humanoid: "Keep the exact same character appearance. Repose into a T-pose with arms extended horizontally."
-      biped:    "Keep the exact same appearance. Repose standing upright with legs slightly apart, facing forward."
+      biped:    "Keep the exact same appearance. Repose standing upright on two legs, legs slightly apart, facing forward. No arms."
       flying:   "Keep the exact same bird/creature appearance. Repose with wings fully extended horizontally, legs visible below, facing forward."
       quadruped:"Keep the exact same animal appearance. Repose standing with all four legs apart and visible."
       other with requested limbs: "Keep the exact same appearance, materials, and character.
