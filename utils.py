@@ -631,6 +631,20 @@ def _build_joints_prompt(object_type: str, category: str,
             neck_y_default = 0.72; chest_y_default = 0.60
             pelvis_y = 0.45; spine_y_default = 0.53
 
+        # pelvis_y is normally a fixed fraction of total height, which
+        # assumes legs take up a "normal" share of that height. For a
+        # squatty character with very short legs relative to a large round
+        # body, the real waist (where legs meet the body) sits much lower
+        # than the fixed default — measured directly as the local minimum
+        # in cross-sectional width in the lower body (mirrors neck_y
+        # detection below, just applied near the legs instead of the head).
+        # Only for rig_type='biped' — by definition it has no arms, so
+        # there's no A-pose/arms-at-sides arm to pass through this height
+        # range and contaminate the profile the way it would for humanoid.
+        pelvis_y_detected = mesh_bounds.get('pelvis_y_detected')
+        if pelvis_y_detected is not None and rt == 'biped':
+            pelvis_y = pelvis_y_detected
+
         neck_y_detected = mesh_bounds.get('neck_y_detected')
         if neck_y_detected is not None and rt in ('biped', 'humanoid'):
             neck_y   = neck_y_detected
@@ -695,10 +709,15 @@ These values are computed from the actual 3D mesh proportions:
   chest:  y ≈ {chest_y:.2f}
   spine:  y ≈ {spine_y:.2f}
   pelvis: y ≈ {pelvis_y:.2f}
+  root:   y ≈ {pelvis_y:.2f}  (root and pelvis are coincident — root is
+          pelvis's parent, not a separate location)
 {shoulder_y_line}{shoulder_x_line}
 LIMB JOINTS — estimate X and Y from the image:
   Look at where the legs/arms actually attach and articulate in this specific image.
   The hip x must be at the outer surface of the leg where it meets the pelvis.
+  The hip y must be at or very close to pelvis y ({pelvis_y:.2f}) — hips attach
+  directly at the pelvis, so do NOT estimate hip y independently from the
+  image; use the pelvis y value above.
   The knee y must be the midpoint between hip y and foot y.
   The foot y should be at or near 0.0 (ground level).
   Do NOT copy example x values — measure from the actual image.

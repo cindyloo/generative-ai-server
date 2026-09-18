@@ -2309,6 +2309,30 @@ def infer_joints():
                         log.info(f"Detected neck_y from mesh profile: "
                                  f"{neck_y_detected:.3f} (width={neck_w:.3f})")
 
+                # Pelvis/hip height = same local-minimum technique, applied to
+                # the LOWER body — the waist narrowing between the legs and
+                # the main body mass. A fixed pelvis_y (e.g. 0.42) assumes
+                # legs take up a "normal" fraction of total height; for a
+                # squatty character with very short legs relative to a large
+                # round body, the real waist sits much lower, and hip was
+                # otherwise left entirely to Claude's own guess (see
+                # snap_joints_to_mesh, which only ever snapped hip X).
+                # Only attempted for rig_type='biped' — by definition it has
+                # no arms, so (unlike the general pelvis/waist case) there's
+                # no A-pose/arms-at-sides arm to pass through this height
+                # range and contaminate the profile.
+                if rig_type == 'biped':
+                    pelvis_candidates = [(y, w) for y, w in width_profile if 0.05 <= y <= 0.35]
+                    if pelvis_candidates:
+                        pelvis_y_detected, pelvis_w = min(pelvis_candidates, key=lambda t: t[1])
+                        boundary_w = max(
+                            pelvis_candidates[0][1], pelvis_candidates[-1][1]
+                        )
+                        if boundary_w > 0 and pelvis_w < 0.85 * boundary_w:
+                            mesh_bounds['pelvis_y_detected'] = pelvis_y_detected
+                            log.info(f"Detected pelvis_y from mesh profile: "
+                                     f"{pelvis_y_detected:.3f} (width={pelvis_w:.3f})")
+
             except Exception as e:
                 log.warning(f"Could not extract mesh bounds: {e}")
                 mesh = None
