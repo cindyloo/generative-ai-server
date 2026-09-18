@@ -777,6 +777,79 @@ LIMB PLACEMENT — measure each joint from the actual image:
 """
 
 
+def _build_joint_verification_prompt(object_type: str, rig_type: str) -> str:
+    """
+    Verification pass for /infer_joints: shown a RENDER of the actual
+    reconstructed 3D mesh (not the original 2D source photo) with the
+    current joint guesses overlaid as labeled markers, and asked to flag
+    any joint that's clearly wrong given the real geometry.
+
+    This exists because the initial joint guess (_build_joints_prompt)
+    only ever sees the flat 2D source photo — which can disagree with
+    what the mesh reconstruction actually produced — plus a few fixed
+    proportion assumptions (e.g. "shoulders sit near the neck") that only
+    hold for roughly normal body proportions and visibly fail for an
+    unusual body plan (e.g. a character with a head far larger than its
+    body). Showing the actual mesh lets the model catch exactly that kind
+    of mismatch, which no amount of reasoning from the 2D photo alone
+    could resolve.
+
+    The returned corrections are coarse visual estimates, not precise
+    measurements — the caller is expected to geometrically snap each one
+    to the nearest real mesh surface point rather than trust the raw
+    numbers (see verify_and_snap_joints in seg_server.py).
+    """
+    return f"""You are reviewing a 3D skeleton placement overlaid on a rendered mesh.
+
+The image shows a shaded front-view render of the ACTUAL reconstructed 3D
+mesh for a "{object_type}" (rig_type: {rig_type}), with the CURRENTLY
+PLACED joints marked as red dots and labeled with their names (labels are
+shortened, e.g. "shoulder_left" not "joint_shoulder_left").
+
+FIRST, assess the overall body plan you can actually see in this render:
+- Is it top-heavy (a large head/torso dominating a small lower body)?
+- Is it long-waisted or squatty (a large round body over very short legs)?
+- Is it roughly normal proportions?
+Let this assessment guide how much weight to put on each joint's plausible
+position — a fixed assumption like "shoulders sit near the neck" or "hips
+sit partway up the body" only holds for roughly normal proportions, and
+will be visibly wrong for a body plan that isn't.
+
+THEN, look carefully at each marker and compare it to the VISIBLE mesh
+geometry:
+- Does shoulder_left / shoulder_right sit right where the arm actually
+  attaches to the body, or is it floating somewhere else (e.g. inside the
+  head, out on the arm itself, or at the wrong height)?
+- Does elbow / hand sit at a reasonable point along the visible arm?
+- Does hip / knee / foot sit on the visible leg, at a height consistent
+  with the body plan you identified above?
+- Does pelvis / spine / chest / neck / head form a sensible vertical
+  chain given the actual proportions visible in the image?
+
+Coordinate system (same convention the markers already use):
+  x: 0.0 = leftmost edge of the image, 1.0 = rightmost edge.
+  y: 0.0 = bottom of the image, 1.0 = top of the image.
+
+Return ONLY valid JSON, no markdown:
+{{
+  "body_plan_assessment": "one short sentence describing the proportions you see",
+  "corrections": [
+    {{"name": "shoulder_left", "x": 0.24, "y": 0.42, "reason": "one short phrase"}}
+  ]
+}}
+
+Rules:
+- Only include a joint if its CURRENT marker position is clearly wrong
+  relative to the visible mesh — e.g. not touching the limb it should be
+  on, or obviously at the wrong height for this body's actual proportions.
+- Do NOT adjust a joint that already looks reasonably correct — leave it
+  out of the corrections list entirely.
+- Small nudges (a few percent) are fine if that's all that's needed — you
+  don't have to either leave a joint alone or make a huge change.
+- If every joint already looks correct, return {{"corrections": []}}.
+"""
+
+
 # ── Full example JSON skeletons per category ──────────────────────────────────
 # These mirror the original _build_animal_prompt example closely.
 # The model needs concrete coordinate values — a position guide table is weaker

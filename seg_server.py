@@ -2428,6 +2428,12 @@ def infer_joints():
                 log.warning(f"Symmetry enforcement failed (non-fatal): {e}")
             log.info(f"Mirrored")
             try:
+                joints_data = verify_and_snap_joints(
+                    joints_data, mesh, object_type, rig_type)
+            except Exception as e:
+                log.warning(f"Vision-based joint verification failed (non-fatal): {e}")
+            log.info(f"Verified")
+            try:
                 viz_path = os.path.join(_rdir(classify_id), f"{classify_id}_joints_normalized_viz.glb")
                 visualize_normalized_joints(joints_data, mesh, viz_path)
             except Exception as e:
@@ -2582,6 +2588,162 @@ def visualize_normalized_joints(joints_data: dict, mesh,
     scene.export(output_path)
     log.info(f"Normalized joints viz: {output_path}")
     return output_path
+
+
+def render_mesh_front_view(mesh, joints_data: dict | None = None,
+                            size: tuple = (900, 1100)) -> bytes:
+    """
+    Orthographic front-view shaded render of the mesh (flat Lambertian
+    shading, painter's-algorithm depth sort — no external renderer
+    needed), optionally with joint_hints from joints_data overlaid as
+    labeled red markers. Returns PNG bytes.
+
+    The pixel<->normalized-coordinate mapping is exact and uses the SAME
+    convention as position_normalized elsewhere in this file (x: 0=left
+    edge, 1=right edge; y: 0=bottom, 1=top) — a corrected pixel position
+    read off this image by a vision model converts back to that format
+    with no reinterpretation needed.
+    """
+    from PIL import ImageDraw
+
+    W, H = size
+    margin = 50
+    verts = np.array(mesh.vertices)
+    faces = np.array(mesh.faces)
+    bmin = verts.min(axis=0)
+    bmax = verts.max(axis=0)
+    brange = bmax - bmin
+    brange[brange == 0] = 1.0
+
+    def to_px(v):
+        xn = (v[0] - bmin[0]) / brange[0]
+        yn = (v[1] - bmin[1]) / brange[1]
+        return (xn * (W - 2 * margin) + margin, (1.0 - yn) * (H - 2 * margin) + margin)
+
+    tri_verts = verts[faces]
+    v0, v1, v2 = tri_verts[:, 0], tri_verts[:, 1], tri_verts[:, 2]
+    normals = np.cross(v1 - v0, v2 - v0)
+    norm_len = np.linalg.norm(normals, axis=1, keepdims=True)
+    norm_len[norm_len == 0] = 1
+    normals = normals / norm_len
+    depth = tri_verts[:, :, 2].mean(axis=1)
+    order = np.argsort(depth)
+
+    img  = Image.new('RGB', (W, H), (235, 235, 235))
+    draw = ImageDraw.Draw(img)
+    light_dir = np.array([0.3, 0.4, 1.0])
+    light_dir /= np.linalg.norm(light_dir)
+    base_color = np.array([150, 150, 150])
+
+    for i in order:
+        n = normals[i]
+        if n[2] <= 0:
+            continue  # backface cull
+        shade = max(0.2, float(np.dot(n, light_dir)))
+        color = tuple(np.clip(base_color * shade, 0, 255).astype(int))
+        draw.polygon([to_px(tri_verts[i, j]) for j in range(3)], fill=color)
+
+    if joints_data:
+        for h in joints_data.get('joint_hints', []):
+            p  = h.get('position_normalized', {})
+            px = p.get('x', 0.5) * (W - 2 * margin) + margin
+            py = (1.0 - p.get('y', 0.5)) * (H - 2 * margin) + margin
+            r  = 9
+            draw.ellipse((px - r, py - r, px + r, py + r), outline=(255, 0, 0), width=3)
+            draw.text((px + 12, py - 7), h.get('name', '').replace('joint_', ''),
+                      fill=(255, 0, 0))
+
+    buf = io.BytesIO()
+    img.save(buf, format='PNG')
+    return buf.getvalue()
+
+
+def verify_and_snap_joints(joints_data: dict, mesh, object_type: str,
+                            rig_type: str, max_rounds: int = 2) -> dict:
+    """
+    Render the mesh with the current joint positions and ask a vision
+    model to flag any joint that looks clearly wrong against the ACTUAL
+    3D geometry (not just the 2D source photo used for the initial
+    guess), then geometrically snap each flagged joint's coarse corrected
+    position to the nearest real mesh surface point.
+
+    Why the snap step: a vision model reading approximate coordinates off
+    a static image is good at noticing "this is obviously wrong" and
+    roughly where to look (confirmed: it correctly diagnoses body-plan
+    issues like a giant-headed character and points corrections in the
+    right direction), but isn't precise enough on its own to land exactly
+    on the mesh surface — verified corrections still needed refinement
+    round over round without fully converging. Snapping to the nearest
+    vertex near its coarse guess is the same technique already used in
+    snap_joints_to_mesh, just seeded by a vision-informed target instead
+    of a fixed search band.
+
+    Runs a small number of rounds since one pass isn't always enough (a
+    joint can still look wrong after the first correction), but does not
+    loop until convergence — testing showed the vision model rarely
+    settles on "nothing left to fix" even after real improvement, so a
+    capped round count is used instead of relying on an empty corrections
+    list to stop.
+    """
+    verts  = np.array(mesh.vertices)
+    bmin   = verts.min(axis=0)
+    bmax   = verts.max(axis=0)
+    brange = bmax - bmin
+    brange[brange == 0] = 1.0
+
+    hint_by_short_name = {
+        h['name'].replace('joint_', ''): h
+        for h in joints_data.get('joint_hints', [])
+    }
+
+    for round_i in range(max_rounds):
+        try:
+            png_bytes  = render_mesh_front_view(mesh, joints_data)
+            prompt     = utils._build_joint_verification_prompt(object_type, rig_type)
+            img_base64 = base64.b64encode(png_bytes).decode('utf-8')
+            result     = _try_claude(img_base64, 'image/png', prompt, max_tokens=1024)
+        except Exception as e:
+            log.warning(f"Joint verification render/vision failed (non-fatal): {e}")
+            break
+
+        if not result:
+            break
+        corrections = result.get('corrections', [])
+        log.info(f"Joint verification round {round_i + 1}: "
+                 f"{result.get('body_plan_assessment', '')} "
+                 f"({len(corrections)} correction(s))")
+        if not corrections:
+            break
+
+        for c in corrections:
+            name = c.get('name')
+            hint = hint_by_short_name.get(name)
+            if hint is None or 'x' not in c or 'y' not in c:
+                continue
+            try:
+                coarse_x = float(np.clip(c['x'], 0.0, 1.0))
+                coarse_y = float(np.clip(c['y'], 0.0, 1.0))
+            except (TypeError, ValueError):
+                continue
+
+            target_world = np.array([
+                bmin[0] + coarse_x * brange[0],
+                bmin[1] + coarse_y * brange[1],
+                bmin[2] + 0.5 * brange[2],
+            ])
+            distances = np.linalg.norm(verts - target_world, axis=1)
+            closest   = verts[np.argmin(distances)]
+            new_x = float(np.clip((closest[0] - bmin[0]) / brange[0], 0.0, 1.0))
+            new_y = float(np.clip((closest[1] - bmin[1]) / brange[1], 0.0, 1.0))
+
+            old = dict(hint['position_normalized'])
+            hint['position_normalized']['x'] = new_x
+            hint['position_normalized']['y'] = new_y
+            log.info(f"  Vision-verified snap: joint_{name} {old} → "
+                     f"coarse=({coarse_x:.2f},{coarse_y:.2f}) → "
+                     f"snapped=({new_x:.2f},{new_y:.2f}) [{c.get('reason', '')}]")
+
+    return joints_data
 
 # ── /mesh ─────────────────────────────────────────────────────────────────────
 

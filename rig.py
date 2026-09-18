@@ -413,8 +413,8 @@ def build_segment_weights(mesh_obj, armature_obj, skeleton_joints_data):
                ['root', 'pelvis', 'spine', 'neck', 'head']):
             spine_bone_indices.add(bi)
         elif any(p in bname_lower for p in
-                 ['elbow', 'hand', 'hip', 'knee', 'foot',
-                'wing_mid', 'wing_tip']):
+                 ['shoulder', 'elbow', 'hand', 'hip', 'knee', 'foot',
+                'wing_base', 'wing_mid', 'wing_tip']):
             limb_bone_indices.add(bi)
 
     # For each vertex, determine if it's in a limb region by finding
