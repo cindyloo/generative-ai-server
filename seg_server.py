@@ -2631,15 +2631,27 @@ def render_mesh_front_view(mesh, joints_data: dict | None = None,
 
     img  = Image.new('RGB', (W, H), (235, 235, 235))
     draw = ImageDraw.Draw(img)
-    light_dir = np.array([0.3, 0.4, 1.0])
-    light_dir /= np.linalg.norm(light_dir)
+    # Key + fill lights from different angles, plus a high ambient floor.
+    # A single light with a low floor (as this used to be) renders any
+    # surface that's nearly edge-on to that one light as almost black —
+    # indistinguishable from empty background at a glance. This matters
+    # a lot for a thin limb (e.g. an arm) viewed near where it curves:
+    # exactly the area a joint marker needs to land on can render as a
+    # near-invisible dark sliver even though real geometry is there,
+    # which misleads a human (or vision model) reviewing the render into
+    # thinking a joint is floating off the mesh when it's actually on it.
+    key_dir  = np.array([0.3, 0.4, 1.0]);  key_dir  /= np.linalg.norm(key_dir)
+    fill_dir = np.array([-0.4, 0.1, 0.6]); fill_dir /= np.linalg.norm(fill_dir)
+    ambient  = 0.45
     base_color = np.array([150, 150, 150])
 
     for i in order:
         n = normals[i]
         if n[2] <= 0:
             continue  # backface cull
-        shade = max(0.2, float(np.dot(n, light_dir)))
+        key_shade  = max(0.0, float(np.dot(n, key_dir)))
+        fill_shade = max(0.0, float(np.dot(n, fill_dir))) * 0.4
+        shade = min(1.0, ambient + key_shade + fill_shade)
         color = tuple(np.clip(base_color * shade, 0, 255).astype(int))
         draw.polygon([to_px(tri_verts[i, j]) for j in range(3)], fill=color)
 
