@@ -431,17 +431,32 @@ def build_segment_weights(mesh_obj, armature_obj, skeleton_joints_data):
         # to the central spine bone, simply because the body's lateral
         # radius exceeds the vertical gap. That never happens on a slender
         # human silhouette, which is why this only surfaces on round bodies.
-        limb_seg_dists = seg_dists[:, limb_indices_list].copy()
-        for col, bi in enumerate(limb_indices_list):
+        #
+        # This is applied directly to seg_dists (not a separate copy) so it
+        # propagates to every downstream consumer -- the Gaussian weight
+        # computation below and the rigid-lock nearest-bone step both read
+        # seg_dists too. An earlier version only padded a throwaway copy
+        # used for the spine/limb classification, which fixed *that*
+        # decision but left the raw, unpadded distance in seg_dists itself
+        # -- so a vertex could still correctly classify as "limb" (because
+        # some OTHER limb bone's padded distance qualified it) and then get
+        # its actual weight assigned, via raw distance, to a totally
+        # unrelated limb bone far outside that bone's own reach. Confirmed
+        # on a real record: a broccoli's leaf geometry, sitting near the
+        # crown/stem boundary, ended up 100% rigidly weighted to
+        # joint_knee_right (a leg bone) purely because knee_right's raw 3D
+        # distance happened to be shortest, even though the leaf sits
+        # nowhere near the leg vertically.
+        for bi in limb_indices_list:
             head, tail = bone_segments[bi]
             z_lo, z_hi = sorted((head[2], tail[2]))
             bone_len   = np.linalg.norm(tail - head)
             pad        = max(bone_len * 0.75, mesh_size * 0.08)
             out_of_band = (verts[:, 2] < z_lo - pad) | (verts[:, 2] > z_hi + pad)
-            limb_seg_dists[out_of_band, col] = np.inf
+            seg_dists[out_of_band, bi] = np.inf
 
         spine_dists = seg_dists[:, spine_indices_list].min(axis=1)
-        limb_dists  = limb_seg_dists.min(axis=1)
+        limb_dists  = seg_dists[:, limb_indices_list].min(axis=1)
 
         # Vertices closer to a limb bone → zero out spine bone influences
         # Vertices closer to a spine bone → zero out limb bone influences
