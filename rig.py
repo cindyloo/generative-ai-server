@@ -420,8 +420,28 @@ def build_segment_weights(mesh_obj, armature_obj, skeleton_joints_data):
     # For each vertex, determine if it's in a limb region by finding
     # its nearest limb bone and nearest spine bone, then comparing distances
     if spine_bone_indices and limb_bone_indices:
-        spine_dists = seg_dists[:, list(spine_bone_indices)].min(axis=1)
-        limb_dists  = seg_dists[:, list(limb_bone_indices)].min(axis=1)
+        spine_indices_list = list(spine_bone_indices)
+        limb_indices_list  = list(limb_bone_indices)
+
+        # Restrict each limb bone's candidacy to its own vertical (Z) span,
+        # padded a bit for smooth blending near the joint. Plain raw 3D
+        # distance breaks down for a wide/round body (e.g. a tomato): a
+        # waist-height vertex on the outer bulge can be closer in straight-
+        # line distance to an off-center hip bone (down at the legs) than
+        # to the central spine bone, simply because the body's lateral
+        # radius exceeds the vertical gap. That never happens on a slender
+        # human silhouette, which is why this only surfaces on round bodies.
+        limb_seg_dists = seg_dists[:, limb_indices_list].copy()
+        for col, bi in enumerate(limb_indices_list):
+            head, tail = bone_segments[bi]
+            z_lo, z_hi = sorted((head[2], tail[2]))
+            bone_len   = np.linalg.norm(tail - head)
+            pad        = max(bone_len * 0.75, mesh_size * 0.08)
+            out_of_band = (verts[:, 2] < z_lo - pad) | (verts[:, 2] > z_hi + pad)
+            limb_seg_dists[out_of_band, col] = np.inf
+
+        spine_dists = seg_dists[:, spine_indices_list].min(axis=1)
+        limb_dists  = limb_seg_dists.min(axis=1)
 
         # Vertices closer to a limb bone → zero out spine bone influences
         # Vertices closer to a spine bone → zero out limb bone influences

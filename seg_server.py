@@ -2878,7 +2878,7 @@ def verify_and_snap_joints(joints_data: dict, mesh, object_type: str,
         # contaminated by the arm (~0.42 vs ~0.325 — a ~0.10 gap), should
         # not. 0.15 sits between the two.
         MAGNITUDE_THRESHOLD = 0.15
-        for name in ('hip_left', 'hip_right', 'pelvis'):
+        for name in ('hip_left', 'hip_right'):
             hint = hint_by_short_name.get(name)
             if hint is None:
                 continue
@@ -2890,6 +2890,35 @@ def verify_and_snap_joints(joints_data: dict, mesh, object_type: str,
                          f"(gap {gap:.3f} exceeds {MAGNITUDE_THRESHOLD} "
                          f"threshold vs. measured waist narrowing)")
                 hint['position_normalized']['y'] = pelvis_y_detected
+
+    # pelvis/root must match the hips, not be independently correct —
+    # pelvis is structurally the convergence point of hip_left/hip_right,
+    # and root is coincident with pelvis (see the "root: y ≈ pelvis_y"
+    # prompt instruction). Checking pelvis against pelvis_y_detected
+    # SEPARATELY from hip (as an earlier version of this safety net did)
+    # missed a real case: hip_left/hip_right's gap fell under the
+    # threshold and got left alone, but pelvis's own vision-pass value
+    # had a smaller, also-under-threshold gap in a DIFFERENT direction —
+    # leaving pelvis 0.08 away from where the hips actually ended up.
+    # (This inconsistency is real and worth fixing on its own, but it
+    # was NOT the cause of the leg/spine weight contamination seen on
+    # the tomato — that turned out to be a separate bug in
+    # build_segment_weights's spine/limb distance partition; see rig.py.)
+    hip_left_hint  = hint_by_short_name.get('hip_left')
+    hip_right_hint = hint_by_short_name.get('hip_right')
+    if hip_left_hint is not None and hip_right_hint is not None:
+        hip_center_y = (hip_left_hint['position_normalized'].get('y', 0.5)
+                        + hip_right_hint['position_normalized'].get('y', 0.5)) / 2
+        for name in ('pelvis', 'root'):
+            hint = hint_by_short_name.get(name)
+            if hint is None:
+                continue
+            old_y = hint['position_normalized'].get('y', 0.5)
+            if abs(old_y - hip_center_y) > 1e-6:
+                log.info(f"  Pelvis/root consistency: joint_{name} y "
+                         f"{old_y:.3f} → {hip_center_y:.3f} "
+                         f"(matching hip_left/hip_right convergence point)")
+                hint['position_normalized']['y'] = hip_center_y
 
     return joints_data
 
