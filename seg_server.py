@@ -2429,7 +2429,7 @@ def infer_joints():
             log.info(f"Mirrored")
             try:
                 joints_data = verify_and_snap_joints(
-                    joints_data, mesh, object_type, rig_type)
+                    joints_data, mesh, object_type, rig_type, classify_id=classify_id)
             except Exception as e:
                 log.warning(f"Vision-based joint verification failed (non-fatal): {e}")
             log.info(f"Verified")
@@ -2720,7 +2720,8 @@ def render_mesh_front_view(mesh, joints_data: dict | None = None,
 
 
 def verify_and_snap_joints(joints_data: dict, mesh, object_type: str,
-                            rig_type: str, max_rounds: int = 1) -> dict:
+                            rig_type: str, max_rounds: int = 1,
+                            classify_id: str | None = None) -> dict:
     """
     Render the mesh with the current joint positions and ask a vision
     model to flag any joint that looks clearly wrong against the ACTUAL
@@ -2776,6 +2777,16 @@ def verify_and_snap_joints(joints_data: dict, mesh, object_type: str,
     for round_i in range(max_rounds):
         try:
             png_bytes  = render_mesh_front_view(mesh, joints_data)
+            if classify_id:
+                # Persist exactly what the model was shown — without this,
+                # the only way to know what drove a given correction was
+                # to manually regenerate the render after the fact, which
+                # isn't guaranteed to match (joints_data may have moved on).
+                render_path = os.path.join(
+                    _rdir(classify_id),
+                    f"{classify_id}_joint_verification_round{round_i + 1}.png")
+                with open(render_path, 'wb') as f:
+                    f.write(png_bytes)
             prompt     = utils._build_joint_verification_prompt(object_type, rig_type)
             img_base64 = base64.b64encode(png_bytes).decode('utf-8')
             result     = _try_claude(img_base64, 'image/png', prompt, max_tokens=1024)
