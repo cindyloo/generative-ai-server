@@ -2532,6 +2532,64 @@ def snap_joints_to_mesh(joints_data: dict, mesh) -> dict:
     return joints_data
 
 
+def _joint_marker_color(name: str) -> list:
+    """
+    Shared color coding for joint markers, used by both the human-facing
+    GLB visualization and the vision-model-facing PNG render, so the two
+    are showing the literal same construct rather than two independently
+    drawn (and potentially inconsistent) representations.
+    Red = base joints (hip/shoulder/wing_base),
+    yellow = middle joints (knee/elbow/wing_mid),
+    green = end joints (hand/foot/head/wing_tip).
+    """
+    n = name.lower()
+    if any(x in n for x in ['hip', 'shoulder', 'wing_base']):
+        return [255, 50,  50,  220]
+    elif any(x in n for x in ['knee', 'elbow', 'wing_mid']):
+        return [255, 255, 50,  220]
+    else:
+        return [50,  220, 50,  220]
+
+
+def _build_joint_spheres(joints_data: dict, mesh):
+    """
+    Build one small icosphere per joint hint, positioned at its world-
+    space location and colored per _joint_marker_color. Returns a list of
+    (sphere_mesh, joint_name) tuples.
+
+    This is the single source of truth for "what does a joint marker look
+    like in 3D" — both visualize_normalized_joints (exports these as part
+    of a GLB for a human to inspect) and render_mesh_front_view (rasterizes
+    these same spheres, from the same positions, into the PNG sent to the
+    vision model for verification) build their markers from this function,
+    so a human opening the GLB and the vision model looking at the render
+    are guaranteed to be looking at the same joint placements, not two
+    independently-implemented approximations of it.
+    """
+    import trimesh
+
+    mesh_size = np.linalg.norm(mesh.bounds[1] - mesh.bounds[0])
+    verts     = np.array(mesh.vertices)
+    bmin      = verts.min(axis=0)
+    brange    = verts.max(axis=0) - bmin
+    brange[brange == 0] = 1.0
+
+    sphere_r = mesh_size * 0.02
+    spheres  = []
+    for hint in joints_data.get('joint_hints', []):
+        p = hint.get('position_normalized', {})
+        world_x = bmin[0] + p.get('x', 0.5) * brange[0]
+        world_y = bmin[1] + p.get('y', 0.5) * brange[1]
+        world_z = bmin[2] + p.get('z', 0.5) * brange[2]
+
+        sphere = trimesh.creation.icosphere(radius=sphere_r)
+        sphere.apply_translation([world_x, world_y, world_z])
+        sphere.visual.face_colors = _joint_marker_color(hint['name'])
+        spheres.append((sphere, hint['name']))
+
+    return spheres
+
+
 def visualize_normalized_joints(joints_data: dict, mesh,
                                  output_path: str):
     """
@@ -2541,49 +2599,14 @@ def visualize_normalized_joints(joints_data: dict, mesh,
       Claude x (left/right) → Blender X [0]
       Claude z (depth)      → Blender Y [1]  (always ~0.5 = center)
       Claude y (up/down)    → Blender Z [2]
-
-    Color coded: red = base joints (hip/shoulder/wing_base),
-                 yellow = middle joints (knee/elbow/wing_mid),
-                 green = end joints (hand/foot/head/wing_tip).
     """
     import trimesh
 
     scene = trimesh.Scene()
     scene.add_geometry(mesh, node_name='mesh')
 
-    mesh_size = np.linalg.norm(mesh.bounds[1] - mesh.bounds[0])
-    verts     = np.array(mesh.vertices)
-    bmin      = verts.min(axis=0)
-    brange    = verts.max(axis=0) - bmin
-    brange[brange == 0] = 1.0
-
-    hints    = joints_data.get('joint_hints', [])
-    sphere_r = mesh_size * 0.02
-
-    def get_color(name):
-        n = name.lower()
-        if any(x in n for x in ['hip', 'shoulder', 'wing_base']):
-            return [255, 50,  50,  220]   # red — base
-        elif any(x in n for x in ['knee', 'elbow', 'wing_mid']):
-            return [255, 255, 50,  220]   # yellow — middle
-        else:
-            return [50,  220, 50,  220]   # green — end
-
-    for hint in hints:
-        p = hint.get('position_normalized', {})
-
-        world_x = bmin[0] + p.get('x', 0.5) * brange[0]
-        world_y = bmin[1] + p.get('y', 0.5) * brange[1]
-        world_z = bmin[2] + p.get('z', 0.5) * brange[2]
-
-        log.info(f"viz joint {hint['name']}: "
-                 f"claude=({p.get('x'):.2f},{p.get('y'):.2f},{p.get('z'):.2f}) "
-                 f"→ blender=({world_x:.3f},{world_y:.3f},{world_z:.3f})")
-
-        sphere = trimesh.creation.icosphere(radius=sphere_r)
-        sphere.apply_translation([world_x, world_y, world_z])
-        sphere.visual.face_colors = get_color(hint['name'])
-        scene.add_geometry(sphere, node_name=hint['name'])
+    for sphere, name in _build_joint_spheres(joints_data, mesh):
+        scene.add_geometry(sphere, node_name=name)
 
     scene.export(output_path)
     log.info(f"Normalized joints viz: {output_path}")
@@ -2595,8 +2618,18 @@ def render_mesh_front_view(mesh, joints_data: dict | None = None,
     """
     Orthographic front-view shaded render of the mesh (flat Lambertian
     shading, painter's-algorithm depth sort — no external renderer
-    needed), optionally with joint_hints from joints_data overlaid as
-    labeled red markers. Returns PNG bytes.
+    needed), with the SAME joint-marker spheres used by
+    visualize_normalized_joints's GLB (built via _build_joint_spheres)
+    rasterized alongside the mesh — not a separately-drawn flat overlay.
+    Returns PNG bytes.
+
+    Rendering the actual sphere geometry (rather than always-on-top flat
+    circles) means occlusion behaves correctly: a joint embedded inside
+    the mesh is properly hidden behind the mesh's own front surface, the
+    same way it would look if you opened the GLB and looked at it — a
+    human inspecting the GLB and the vision model looking at this render
+    are seeing the same construct, not two independently approximated
+    ones that could quietly drift out of sync.
 
     The pixel<->normalized-coordinate mapping is exact and uses the SAME
     convention as position_normalized elsewhere in this file (x: 0=left
@@ -2620,7 +2653,26 @@ def render_mesh_front_view(mesh, joints_data: dict | None = None,
         yn = (v[1] - bmin[1]) / brange[1]
         return (xn * (W - 2 * margin) + margin, (1.0 - yn) * (H - 2 * margin) + margin)
 
-    tri_verts = verts[faces]
+    # Combine the mesh's triangles with every joint sphere's triangles
+    # into one array so they can be depth-sorted and shaded together —
+    # this is what makes correct occlusion between mesh and markers
+    # possible, instead of markers always drawn on top regardless of depth.
+    all_tri_verts   = [verts[faces]]
+    all_base_colors = [np.tile(np.array([150, 150, 150]), (len(faces), 1))]
+
+    joint_world_positions = []  # (name, world_xyz) for label placement
+    if joints_data:
+        for sphere, name in _build_joint_spheres(joints_data, mesh):
+            sv = np.array(sphere.vertices)
+            sf = np.array(sphere.faces)
+            all_tri_verts.append(sv[sf])
+            color = np.array(_joint_marker_color(name)[:3])
+            all_base_colors.append(np.tile(color, (len(sf), 1)))
+            joint_world_positions.append((name, sphere.vertices.mean(axis=0)))
+
+    tri_verts   = np.concatenate(all_tri_verts, axis=0)
+    base_colors = np.concatenate(all_base_colors, axis=0)
+
     v0, v1, v2 = tri_verts[:, 0], tri_verts[:, 1], tri_verts[:, 2]
     normals = np.cross(v1 - v0, v2 - v0)
     norm_len = np.linalg.norm(normals, axis=1, keepdims=True)
@@ -2643,7 +2695,6 @@ def render_mesh_front_view(mesh, joints_data: dict | None = None,
     key_dir  = np.array([0.3, 0.4, 1.0]);  key_dir  /= np.linalg.norm(key_dir)
     fill_dir = np.array([-0.4, 0.1, 0.6]); fill_dir /= np.linalg.norm(fill_dir)
     ambient  = 0.45
-    base_color = np.array([150, 150, 150])
 
     for i in order:
         n = normals[i]
@@ -2652,18 +2703,16 @@ def render_mesh_front_view(mesh, joints_data: dict | None = None,
         key_shade  = max(0.0, float(np.dot(n, key_dir)))
         fill_shade = max(0.0, float(np.dot(n, fill_dir))) * 0.4
         shade = min(1.0, ambient + key_shade + fill_shade)
-        color = tuple(np.clip(base_color * shade, 0, 255).astype(int))
+        color = tuple(np.clip(base_colors[i] * shade, 0, 255).astype(int))
         draw.polygon([to_px(tri_verts[i, j]) for j in range(3)], fill=color)
 
-    if joints_data:
-        for h in joints_data.get('joint_hints', []):
-            p  = h.get('position_normalized', {})
-            px = p.get('x', 0.5) * (W - 2 * margin) + margin
-            py = (1.0 - p.get('y', 0.5)) * (H - 2 * margin) + margin
-            r  = 9
-            draw.ellipse((px - r, py - r, px + r, py + r), outline=(255, 0, 0), width=3)
-            draw.text((px + 12, py - 7), h.get('name', '').replace('joint_', ''),
-                      fill=(255, 0, 0))
+    # Labels are the one thing drawn as a flat 2D overlay rather than
+    # rasterized in 3D — text has no meaningful 3D depth. Still placed at
+    # the exact same world position as the sphere itself (not a separate
+    # mapping), and kept small/thin so it doesn't obscure the render.
+    for name, world_pos in joint_world_positions:
+        px, py = to_px(world_pos)
+        draw.text((px + 10, py - 6), name.replace('joint_', ''), fill=(0, 0, 0))
 
     buf = io.BytesIO()
     img.save(buf, format='PNG')
