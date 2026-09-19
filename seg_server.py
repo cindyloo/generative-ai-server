@@ -2708,6 +2708,18 @@ def verify_and_snap_joints(joints_data: dict, mesh, object_type: str,
         for h in joints_data.get('joint_hints', [])
     }
 
+    # Hard scope limit, independent of the prompt: this pass only ever
+    # touches hip/shoulder/pelvis. knee/foot/elbow/hand already have
+    # solid geometric handling elsewhere in the pipeline (mesh-extremity
+    # search, foot centroid, midpoint formulas) — a real run showed the
+    # vision pass can drag an already-correct hand joint onto the elbow
+    # when allowed to "correct" them too, so this is enforced in code,
+    # not just requested in the prompt (which the model doesn't always
+    # follow exactly).
+    ALLOWED_CORRECTION_NAMES = {
+        'hip_left', 'hip_right', 'shoulder_left', 'shoulder_right', 'pelvis',
+    }
+
     for round_i in range(max_rounds):
         try:
             png_bytes  = render_mesh_front_view(mesh, joints_data)
@@ -2729,6 +2741,10 @@ def verify_and_snap_joints(joints_data: dict, mesh, object_type: str,
 
         for c in corrections:
             name = c.get('name')
+            if name not in ALLOWED_CORRECTION_NAMES:
+                log.warning(f"  Ignoring out-of-scope correction for "
+                            f"'{name}' (only hip/shoulder/pelvis allowed)")
+                continue
             hint = hint_by_short_name.get(name)
             if hint is None or 'x' not in c or 'y' not in c:
                 continue

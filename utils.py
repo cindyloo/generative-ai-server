@@ -806,53 +806,45 @@ mesh for a "{object_type}" (rig_type: {rig_type}), with the CURRENTLY
 PLACED joints marked as red dots and labeled with their names (labels are
 shortened, e.g. "shoulder_left" not "joint_shoulder_left").
 
-FIRST, assess the overall body plan you can actually see in this render:
+STEP 1 — identify the body type you actually see in this render:
 - Is it top-heavy (a large head/torso dominating a small lower body)?
 - Is it long-waisted or squatty (a large round body over very short legs)?
 - Is it roughly normal proportions?
-Let this assessment guide how much weight to put on each joint's plausible
-position — a fixed assumption like "shoulders sit near the neck" or "hips
-sit partway up the body" only holds for roughly normal proportions, and
-will be visibly wrong for a body plan that isn't.
+This matters because the two most important joints below do NOT sit at a
+fixed height fraction of the body — where they actually are depends
+entirely on this body's real proportions, which you can only get from
+looking at the image, not from a general assumption about where
+shoulders or hips "usually" go.
 
-THEN, for EVERY limb joint below, do NOT just eyeball "does this look
-okay" — instead, explicitly trace that limb's visible silhouette in the
-image and find its bounding min/max extent, then place the joint at the
-specific extremum listed. This is a mechanical measurement, not a
-judgment call, and you must do it for every limb joint even if its
-current marker looks plausible at a glance:
-  hip:      the TOP of the leg's visible silhouette — the highest point
-            where the leg outline is still distinct from the main body
-            mass, i.e. the MAXIMUM y of that leg's visible extent.
-  knee:     the midpoint between hip y and foot y (not a separate visual
-            measurement).
-  foot:     the BOTTOM of the leg's visible silhouette — the MINIMUM y of
-            that leg's visible extent (the lowest point still part of the
-            leg/foot shape).
-  shoulder: the point where the arm's visible silhouette first separates
-            from the main body mass — the boundary of the arm's own
-            bounding box closest to the body, NOT wherever looks
-            centered. If the arm is not a separate protrusion from the
-            body silhouette at any point, use the highest y at which the
-            arm is at its full, unambiguous width.
-  elbow:    the midpoint along the arm's visible length between shoulder
-            and hand (not a separate visual measurement).
-  hand:     the FARTHEST point of the arm's visible silhouette from the
-            shoulder — the extremum (min or max x, whichever is farther
-            from the body) of that arm's bounding box.
+STEP 2 — this pass ONLY looks at four joints: hip_left, hip_right,
+shoulder_left, shoulder_right (and pelvis, which follows directly from
+hip). Ignore knee, foot, elbow, and hand entirely — do not comment on or
+correct them, even if they look wrong; they are handled elsewhere in the
+pipeline and are out of scope here. Touching them in this pass has caused
+real regressions before (a correctly-placed hand joint was dragged onto
+the elbow in an earlier run) — leave them alone completely.
 
-Every one of these is defined by a min/max extent of the LIMB's own
-silhouette, not by comparison to other joints, not by a proportion
-guess, and not by where it "usually" goes on a body. Re-derive each one
-directly from what is visible in this specific image, even for joints
-whose current marker isn't obviously wrong — a marker can look
-"plausible" while still being off from the limb's true visible extent.
-
-For the spine chain (pelvis / spine / chest / neck / head), check that
-the sequence forms a sensible vertical order given the actual proportions
-visible in the image (not a fixed proportion assumption) — head at the
-top of the visible head mass, pelvis at the point where hip left/right
-converge toward the body's centerline.
+For each of the four in-scope joints, the ONLY question that matters is:
+where does this limb VISUALLY MEET THE MAIN BODY MASS?
+  HIP (left/right): the point where the leg visibly meets / separates
+    from the main body mass. Trace the leg's outline upward from the
+    foot until it merges into the torso/body silhouette — that merge
+    point, not a height fraction, not "partway up the body", is the hip.
+    For a squatty body type, this can be much lower than it looks like it
+    "should" be; for a normal body type it's roughly at the waist.
+  SHOULDER (left/right): the point where the arm visibly meets /
+    separates from the main body mass. Trace the arm's outline inward
+    from the hand until it merges into the torso/head/body silhouette —
+    that merge point is the shoulder. For a top-heavy body type (a large
+    head dominating the figure), this can be much lower than "near the
+    neck" — do not default to neck height just because that's typical for
+    normal proportions.
+  PELVIS: the point where hip_left and hip_right converge toward the
+    body's centerline — follows directly from your hip answer above, not
+    a separate measurement.
+  If the current hip, shoulder, or pelvis marker is not sitting at this
+  visible merge point, it is wrong and must be corrected, even if it
+  looks "close enough" at a glance.
 
 Coordinate system (same convention the markers already use):
   x: 0.0 = leftmost edge of the image, 1.0 = rightmost edge.
@@ -862,20 +854,22 @@ Return ONLY valid JSON, no markdown:
 {{
   "body_plan_assessment": "one short sentence describing the proportions you see",
   "corrections": [
-    {{"name": "shoulder_left", "x": 0.24, "y": 0.42, "reason": "one short phrase naming the min/max extent used"}}
+    {{"name": "shoulder_left", "x": 0.24, "y": 0.42, "reason": "one short phrase naming the merge point used"}}
   ]
 }}
 
 Rules:
-- You must explicitly re-check EVERY limb joint (hip, knee, foot, shoulder,
-  elbow, hand — both sides) against its limb's min/max visible extent, not
-  just the ones that look obviously wrong at a glance.
-- Include a joint in "corrections" whenever its current position differs
-  from the measured extent, even by a small amount — small nudges are
-  expected and fine, this does not need to be a dramatic error to fix.
-- Do NOT change a joint that already matches its measured extent.
-- If every joint already matches its measured extent, return
-  {{"corrections": []}}.
+- ONLY these names may ever appear in "corrections": hip_left, hip_right,
+  shoulder_left, shoulder_right, pelvis. Any other joint name is invalid
+  — do not include knee, foot, elbow, or hand under any circumstances.
+- You must explicitly re-check all four in-scope joints (plus pelvis)
+  against the visible merge point, not just the ones that look obviously
+  wrong at a glance.
+- Include a joint whenever its current position differs from the merge
+  point you find, even by a small amount — small nudges are expected and
+  fine, this does not need to be a dramatic error to fix.
+- Do NOT change a joint that already matches its merge point.
+- If every in-scope joint already matches, return {{"corrections": []}}.
 """
 
 
