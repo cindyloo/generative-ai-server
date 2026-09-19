@@ -2671,7 +2671,7 @@ def render_mesh_front_view(mesh, joints_data: dict | None = None,
 
 
 def verify_and_snap_joints(joints_data: dict, mesh, object_type: str,
-                            rig_type: str, max_rounds: int = 2) -> dict:
+                            rig_type: str, max_rounds: int = 1) -> dict:
     """
     Render the mesh with the current joint positions and ask a vision
     model to flag any joint that looks clearly wrong against the ACTUAL
@@ -2690,12 +2690,16 @@ def verify_and_snap_joints(joints_data: dict, mesh, object_type: str,
     snap_joints_to_mesh, just seeded by a vision-informed target instead
     of a fixed search band.
 
-    Runs a small number of rounds since one pass isn't always enough (a
-    joint can still look wrong after the first correction), but does not
-    loop until convergence — testing showed the vision model rarely
-    settles on "nothing left to fix" even after real improvement, so a
-    capped round count is used instead of relying on an empty corrections
-    list to stop.
+    Defaults to a single round. A second round was tried and reliably
+    made things worse rather than refining them further — verified twice
+    on real records: it dragged an already-good hip position from
+    y≈0.09 (matching an independent geometric measurement) to y≈0.97
+    while its own stated reasoning still said "bottom of the body",
+    a self-contradictory answer that ignored the coordinate convention it
+    had used correctly one round earlier. The model does not reliably
+    "lock in" a correct answer once found — it can still overwrite it with
+    a worse one on a later pass — so max_rounds is intentionally 1 rather
+    than iterating for refinement.
     """
     verts  = np.array(mesh.vertices)
     bmin   = verts.min(axis=0)

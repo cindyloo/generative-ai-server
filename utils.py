@@ -824,18 +824,35 @@ pipeline and are out of scope here. Touching them in this pass has caused
 real regressions before (a correctly-placed hand joint was dragged onto
 the elbow in an earlier run) — leave them alone completely.
 
+Some bodies have MULTIPLE similar-looking protrusions — e.g. small round
+stub arms AND small round stub legs on the same character. Do not pick
+whichever protrusion merely "looks leg-shaped" or "looks arm-shaped" —
+identify the leg and arm specifically by which marker is already on them:
+the foot_left/foot_right markers (shown in the render, out of scope to
+move) are ALREADY on the real legs, and the hand_left/hand_right markers
+(if present) are already on the real arms. HIP must be traced up the
+EXACT SAME limb that foot_left/foot_right currently sits on — not any
+other protrusion, even one that looks similarly leg-like. Likewise
+SHOULDER must be traced along the EXACT SAME limb hand_left/hand_right
+sits on. If you cannot identify a hand marker at all (this rig type may
+have no arms), do not guess a shoulder location from an unlabeled
+protrusion — leave shoulder out of your corrections entirely.
+
 For each of the four in-scope joints, the ONLY question that matters is:
-where does this limb VISUALLY MEET THE MAIN BODY MASS?
-  HIP (left/right): the point where the leg visibly meets / separates
-    from the main body mass. Trace the leg's outline upward from the
-    foot until it merges into the torso/body silhouette — that merge
-    point, not a height fraction, not "partway up the body", is the hip.
-    For a squatty body type, this can be much lower than it looks like it
-    "should" be; for a normal body type it's roughly at the waist.
-  SHOULDER (left/right): the point where the arm visibly meets /
-    separates from the main body mass. Trace the arm's outline inward
-    from the hand until it merges into the torso/head/body silhouette —
-    that merge point is the shoulder. For a top-heavy body type (a large
+where does THAT SPECIFIC limb (identified above) VISUALLY MEET THE MAIN
+BODY MASS?
+  HIP (left/right): the point where that specific leg (the one
+    foot_left/foot_right is on) visibly meets / separates from the main
+    body mass. Trace that leg's outline upward from its foot marker until
+    it merges into the torso/body silhouette — that merge point, not a
+    height fraction, not "partway up the body", is the hip. For a squatty
+    body type, this can be much lower than it looks like it "should" be;
+    for a normal body type it's roughly at the waist.
+  SHOULDER (left/right): the point where that specific arm (the one
+    hand_left/hand_right is on) visibly meets / separates from the main
+    body mass. Trace that arm's outline inward from its hand marker until
+    it merges into the torso/head/body silhouette — that merge point is
+    the shoulder. For a top-heavy body type (a large
     head dominating the figure), this can be much lower than "near the
     neck" — do not default to neck height just because that's typical for
     normal proportions.
