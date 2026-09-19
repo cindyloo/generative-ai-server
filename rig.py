@@ -451,7 +451,19 @@ def build_segment_weights(mesh_obj, armature_obj, skeleton_joints_data):
             head, tail = bone_segments[bi]
             z_lo, z_hi = sorted((head[2], tail[2]))
             bone_len   = np.linalg.norm(tail - head)
-            pad        = max(bone_len * 0.75, mesh_size * 0.08)
+            # Pad relative to this bone's OWN length only -- no mesh_size
+            # floor. A mesh_size-based floor is an absolute reference that
+            # assumes limbs are a roughly fixed fraction of overall body
+            # size, which fails for a character like broccoli where a
+            # giant head dominates mesh_size while the legs are tiny: the
+            # floor (mesh_size * 0.08) came out over 2x the leg bone's own
+            # length, extending its padded reach from the leg all the way
+            # up to the stalk/arm boundary -- exactly the vertices the user
+            # reported moving with the leg. bone_len is already meaningful
+            # and positive for any properly-placed skeleton, so it alone
+            # is enough to keep blending smooth at the joint without
+            # borrowing scale from unrelated parts of the mesh.
+            pad = bone_len * 0.75
             out_of_band = (verts[:, 2] < z_lo - pad) | (verts[:, 2] > z_hi + pad)
             seg_dists[out_of_band, bi] = np.inf
 
