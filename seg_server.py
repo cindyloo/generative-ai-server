@@ -2317,21 +2317,31 @@ def infer_joints():
                 # round body, the real waist sits much lower, and hip was
                 # otherwise left entirely to Claude's own guess (see
                 # snap_joints_to_mesh, which only ever snapped hip X).
-                # Only attempted for rig_type='biped' — by definition it has
-                # no arms, so (unlike the general pelvis/waist case) there's
-                # no A-pose/arms-at-sides arm to pass through this height
-                # range and contaminate the profile.
-                if rig_type == 'biped':
-                    pelvis_candidates = [(y, w) for y, w in width_profile if 0.05 <= y <= 0.35]
-                    if pelvis_candidates:
-                        pelvis_y_detected, pelvis_w = min(pelvis_candidates, key=lambda t: t[1])
-                        boundary_w = max(
-                            pelvis_candidates[0][1], pelvis_candidates[-1][1]
-                        )
-                        if boundary_w > 0 and pelvis_w < 0.85 * boundary_w:
-                            mesh_bounds['pelvis_y_detected'] = pelvis_y_detected
-                            log.info(f"Detected pelvis_y from mesh profile: "
-                                     f"{pelvis_y_detected:.3f} (width={pelvis_w:.3f})")
+                #
+                # Computed for ALL rig types now (not just biped) — a real
+                # A-pose humanoid (aaf17890) confirmed an arm can pass
+                # through this height range and mildly contaminate the
+                # profile, but the resulting candidate still differs from
+                # that character's fixed default by only ~0.1, well under
+                # the ~0.27 seen on a genuinely broken case (broccoli) —
+                # see verify_and_snap_joints's magnitude-gated override,
+                # which uses that gap to apply this value only when it's
+                # clearly needed, not on borderline/already-fine cases.
+                # This mesh_bounds value itself is still only injected into
+                # the PROMPT as an authoritative override for biped (see
+                # _build_joints_prompt) — this broader computation exists so
+                # the code-side safety net has a value to check against
+                # regardless of rig_type.
+                pelvis_candidates = [(y, w) for y, w in width_profile if 0.05 <= y <= 0.35]
+                if pelvis_candidates:
+                    pelvis_y_detected, pelvis_w = min(pelvis_candidates, key=lambda t: t[1])
+                    boundary_w = max(
+                        pelvis_candidates[0][1], pelvis_candidates[-1][1]
+                    )
+                    if boundary_w > 0 and pelvis_w < 0.85 * boundary_w:
+                        mesh_bounds['pelvis_y_detected'] = pelvis_y_detected
+                        log.info(f"Detected pelvis_y from mesh profile: "
+                                 f"{pelvis_y_detected:.3f} (width={pelvis_w:.3f})")
 
             except Exception as e:
                 log.warning(f"Could not extract mesh bounds: {e}")
@@ -2429,7 +2439,8 @@ def infer_joints():
             log.info(f"Mirrored")
             try:
                 joints_data = verify_and_snap_joints(
-                    joints_data, mesh, object_type, rig_type, classify_id=classify_id)
+                    joints_data, mesh, object_type, rig_type,
+                    classify_id=classify_id, mesh_bounds=mesh_bounds)
             except Exception as e:
                 log.warning(f"Vision-based joint verification failed (non-fatal): {e}")
             log.info(f"Verified")
@@ -2721,7 +2732,8 @@ def render_mesh_front_view(mesh, joints_data: dict | None = None,
 
 def verify_and_snap_joints(joints_data: dict, mesh, object_type: str,
                             rig_type: str, max_rounds: int = 1,
-                            classify_id: str | None = None) -> dict:
+                            classify_id: str | None = None,
+                            mesh_bounds: dict | None = None) -> dict:
     """
     Render the mesh with the current joint positions and ask a vision
     model to flag any joint that looks clearly wrong against the ACTUAL
@@ -2750,6 +2762,18 @@ def verify_and_snap_joints(joints_data: dict, mesh, object_type: str,
     "lock in" a correct answer once found — it can still overwrite it with
     a worse one on a later pass — so max_rounds is intentionally 1 rather
     than iterating for refinement.
+
+    After the vision pass, also applies a deterministic geometric safety
+    net for hip/pelvis specifically (see the pelvis_y_detected check
+    below) — confirmed via two back-to-back /infer_joints?force=true runs
+    on the SAME record that the vision pass is not reliable here: one run
+    correctly flagged and fixed a badly-wrong hip (0.42, the fixed
+    default, for a giant-headed body plan where the real value should be
+    ~0.15), the very next run left it untouched at 0.42. Since a reliable
+    geometric measurement already exists for this exact question (the
+    same width-profile technique used for neck_y, applied to the lower
+    body), it's used as a backstop rather than depending on the vision
+    model to catch this every time.
     """
     verts  = np.array(mesh.vertices)
     bmin   = verts.min(axis=0)
@@ -2834,6 +2858,38 @@ def verify_and_snap_joints(joints_data: dict, mesh, object_type: str,
             log.info(f"  Vision-verified snap: joint_{name} {old} → "
                      f"coarse=({coarse_x:.2f},{coarse_y:.2f}) → "
                      f"snapped=({new_x:.2f},{new_y:.2f}) [{c.get('reason', '')}]")
+
+    # ── Deterministic geometric safety net for hip/pelvis ────────────────
+    # Applied regardless of whether the vision pass above touched these
+    # joints. Confirmed the vision pass alone isn't reliable for this:
+    # two back-to-back /infer_joints?force=true runs on the same record
+    # gave different outcomes (one correctly fixed a badly-wrong hip, the
+    # next left it untouched). A reliable geometric measurement already
+    # exists for this exact question (mesh_bounds['pelvis_y_detected'],
+    # the same width-profile technique used for neck_y) — use it as a
+    # backstop rather than depending on the vision model to catch this
+    # every time.
+    pelvis_y_detected = (mesh_bounds or {}).get('pelvis_y_detected')
+    if pelvis_y_detected is not None:
+        # Calibrated against two real cases: a genuinely broken hip
+        # (broccoli, fixed 0.42 default vs. measured ~0.15 — a ~0.27 gap)
+        # should trigger this; an already-reasonable value on a normal
+        # A-pose humanoid, where the geometric candidate is itself mildly
+        # contaminated by the arm (~0.42 vs ~0.325 — a ~0.10 gap), should
+        # not. 0.15 sits between the two.
+        MAGNITUDE_THRESHOLD = 0.15
+        for name in ('hip_left', 'hip_right', 'pelvis'):
+            hint = hint_by_short_name.get(name)
+            if hint is None:
+                continue
+            current_y = hint['position_normalized'].get('y', 0.5)
+            gap = abs(current_y - pelvis_y_detected)
+            if gap > MAGNITUDE_THRESHOLD:
+                log.info(f"  Geometric safety net: joint_{name} y "
+                         f"{current_y:.3f} → {pelvis_y_detected:.3f} "
+                         f"(gap {gap:.3f} exceeds {MAGNITUDE_THRESHOLD} "
+                         f"threshold vs. measured waist narrowing)")
+                hint['position_normalized']['y'] = pelvis_y_detected
 
     return joints_data
 
