@@ -463,7 +463,15 @@ def build_segment_weights(mesh_obj, armature_obj, skeleton_joints_data):
             # and positive for any properly-placed skeleton, so it alone
             # is enough to keep blending smooth at the joint without
             # borrowing scale from unrelated parts of the mesh.
-            pad = bone_len * 0.75
+            #
+            # 0.75 was still too loose -- it lets a bone's padded reach
+            # extend up to 75% of its own length past each end, i.e. up to
+            # 2.5x its natural span. For a short leg bone that's still
+            # enough absolute distance to bleed into neighboring geometry
+            # (stalk/arm boundary) on a compact body. The padding only
+            # needs to cover skin thickness right at the joint surface, not
+            # a large fraction of the bone's length, so tighten it down.
+            pad = bone_len * 0.2
             out_of_band = (verts[:, 2] < z_lo - pad) | (verts[:, 2] > z_hi + pad)
             seg_dists[out_of_band, bi] = np.inf
 
