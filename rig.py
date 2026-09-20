@@ -398,65 +398,57 @@ def build_segment_weights(mesh_obj, armature_obj, skeleton_joints_data):
                     non_deforming_indices.add(idx)
                     print(f"  Non-deforming bone: '{name}' (deforms_mesh=false)")
 
-    # ── Find terminal bones ───────────────────────────────────────────────────
-    all_parent_names = set()
-    for b in armature_obj.data.bones:
-        if b.parent:
-            all_parent_names.add(b.parent.name)
-
-    terminal_bone_indices = [
-        i for i, name in enumerate(bone_names_list)
-        if name not in all_parent_names
-    ]
-
-    # After computing seg_dists, before terminal locks:
-
-    # ── Pre-partition vertices into spine vs limb regions ──────────────────────
-    # Spine bones occupy the vertical center column of the mesh.
-    # Limb bones occupy the outer regions.
-    # We separate them by X distance from center — limb vertices are far from X=0,
-    # spine vertices are near X=0.
-
-    spine_bone_indices = set()
-    limb_bone_indices  = set()
-
+    # ── Simplest rule that works: each vertex moves with whichever bone is
+    # nearest, weighted by a Gaussian that decays to zero beyond a per-bone
+    # cutoff distance. No spine-vs-limb grouping, no left/right chain
+    # partitioning, no separate rigid-lock pass -- all of that was layered
+    # on over several iterations to patch specific symptoms (a wide body
+    # picking an off-center hip over the central spine, a foot bone's tiny
+    # synthetic tail excluding real foot vertices, left/right sides
+    # blending into each other) and each patch kept surfacing a new
+    # failure elsewhere: internal tearing at every joint boundary, whole
+    # chains of vertices defaulting to a frozen root bone, opposite-side
+    # contamination. A tight enough per-bone cutoff prevents cross-talk by
+    # construction -- hip_left simply can't reach hip_right or a shoulder
+    # if its own reach is kept close to its real extent -- and a smooth
+    # Gaussian within that cutoff means two mesh-adjacent vertices always
+    # have similar bone weights, so there's no seam for the mesh to tear
+    # along in the first place.
+    #
+    # A single bone's own head-to-tail length is not a reliable cutoff
+    # scale for a TERMINAL bone (foot, hand -- no real child, so Blender
+    # gives it a short, arbitrary synthetic tail): on a compact/stubby limb
+    # like the tomato's, that can leave the foot with an almost-zero scale
+    # even though the leg it's attached to reaches much further, starving
+    # real foot-sole vertices of any valid cutoff. Non-terminal bones don't
+    # have this problem -- their own segment (or the one coming in from
+    # their parent) is a real, meaningful joint-to-joint distance -- and
+    # giving them the same whole-chain fallback was too generous, letting
+    # a bone like the hip reach nearly the full leg's length into the
+    # torso. So the whole-chain fallback applies to terminal bones only.
+    limb_bone_indices = set()
     for bi, bname in enumerate(bone_names_list):
         bname_lower = bname.lower()
         if any(p in bname_lower for p in
-               ['root', 'pelvis', 'spine', 'neck', 'head']):
-            spine_bone_indices.add(bi)
-        elif any(p in bname_lower for p in
-                 ['shoulder', 'elbow', 'hand', 'hip', 'knee', 'foot',
+               ['shoulder', 'elbow', 'hand', 'hip', 'knee', 'foot',
                 'wing_base', 'wing_mid', 'wing_tip']):
             limb_bone_indices.add(bi)
 
-    # Local length scale per bone, used both for the Z-band padding below
-    # and for the Gaussian sigma later -- computed once here so both stay
-    # consistent.
-    #
-    # A single bone's own head-to-tail length is not a reliable scale on a
-    # compact/stubby limb: a character like the tomato can have its
-    # hip-to-knee and knee-to-foot joints placed almost on top of each
-    # other (a ~0.03-unit segment), even though the actual leg mesh is
-    # nowhere near that thin. Padding relative to one degenerate segment's
-    # length is too tight regardless of the multiplier used on it. What's
-    # actually meaningful is the WHOLE limb's reach -- hip all the way to
-    # foot -- so walk each limb chain from its attachment point on the
-    # spine out to its terminal tip and use that total chain length as the
-    # scale for every bone along it.
+    all_parent_names = {b.parent.name for b in armature_obj.data.bones if b.parent}
+    terminal_bone_indices = {i for i, name in enumerate(bone_names_list)
+                              if name not in all_parent_names}
+
     chain_length_by_bone = {}
     for bi in limb_bone_indices:
-        # Find this bone's chain root: walk up until the parent is a spine
-        # bone (or there's no parent).
+        # Chain root: walk up while the parent is ALSO a limb bone --
+        # stops at the first limb bone whose parent attaches to the main
+        # body (spine, or nothing).
         root_idx = bi
         while (root_idx in parent_index_by_index
-               and parent_index_by_index[root_idx] not in spine_bone_indices):
+               and parent_index_by_index[root_idx] in limb_bone_indices):
             root_idx = parent_index_by_index[root_idx]
-        # Walk down from the chain root to its terminal tip, summing
-        # bone lengths along the way.
-        total = 0.0
-        cur = root_idx
-        seen = set()
+        # Walk down from the root to the terminal tip, summing lengths.
+        total, cur, seen = 0.0, root_idx, set()
         while cur not in seen:
             seen.add(cur)
             h, t = bone_segments[cur]
@@ -469,172 +461,45 @@ def build_segment_weights(mesh_obj, armature_obj, skeleton_joints_data):
         chain_length_by_bone[bi] = total
 
     effective_len_by_bone = {}
-
-    # For each vertex, determine if it's in a limb region by finding
-    # its nearest limb bone and nearest spine bone, then comparing distances
-    if spine_bone_indices and limb_bone_indices:
-        spine_indices_list = list(spine_bone_indices)
-        limb_indices_list  = list(limb_bone_indices)
-
-        # Restrict each limb bone's candidacy to its own vertical (Z) span,
-        # padded a bit for smooth blending near the joint. Plain raw 3D
-        # distance breaks down for a wide/round body (e.g. a tomato): a
-        # waist-height vertex on the outer bulge can be closer in straight-
-        # line distance to an off-center hip bone (down at the legs) than
-        # to the central spine bone, simply because the body's lateral
-        # radius exceeds the vertical gap. That never happens on a slender
-        # human silhouette, which is why this only surfaces on round bodies.
-        #
-        # This is applied directly to seg_dists (not a separate copy) so it
-        # propagates to every downstream consumer -- the Gaussian weight
-        # computation below and the rigid-lock nearest-bone step both read
-        # seg_dists too. An earlier version only padded a throwaway copy
-        # used for the spine/limb classification, which fixed *that*
-        # decision but left the raw, unpadded distance in seg_dists itself
-        # -- so a vertex could still correctly classify as "limb" (because
-        # some OTHER limb bone's padded distance qualified it) and then get
-        # its actual weight assigned, via raw distance, to a totally
-        # unrelated limb bone far outside that bone's own reach. Confirmed
-        # on a real record: a broccoli's leaf geometry, sitting near the
-        # crown/stem boundary, ended up 100% rigidly weighted to
-        # joint_knee_right (a leg bone) purely because knee_right's raw 3D
-        # distance happened to be shortest, even though the leaf sits
-        # nowhere near the leg vertically.
-        for bi in limb_indices_list:
-            head, tail = bone_segments[bi]
-            bone_len   = np.linalg.norm(tail - head)
-            parent_head = parent_head_by_index.get(bi)
-            incoming_len = (np.linalg.norm(head - parent_head)
-                            if parent_head is not None else 0.0)
-            effective_len = max(bone_len, incoming_len,
-                                 chain_length_by_bone.get(bi, 0.0))
-            effective_len_by_bone[bi] = effective_len
-            # Pad relative to this bone's own (or incoming) length only --
-            # no mesh_size floor. A mesh_size-based floor is an absolute
-            # reference that assumes limbs are a roughly fixed fraction of
-            # overall body size, which fails for a character like broccoli
-            # where a giant head dominates mesh_size while the legs are
-            # tiny: the floor (mesh_size * 0.08) came out over 2x the leg
-            # bone's own length, extending its padded reach from the leg
-            # all the way up to the stalk/arm boundary -- exactly the
-            # vertices the user reported moving with the leg.
-            #
-            # 0.75x was still too loose -- it let a bone's padded reach
-            # extend up to 75% of its own length past each end, i.e. up to
-            # 2.5x its natural span. For a short leg bone that's still
-            # enough absolute distance to bleed into neighboring geometry
-            # (stalk/arm boundary) on a compact body. The padding only
-            # needs to cover skin thickness right at the joint surface, not
-            # a large fraction of the bone's length, so tighten it down.
-            pad = effective_len * 0.2
-
-            if bi in terminal_bone_indices and parent_head is not None:
-                # A terminal bone (foot, hand, wing_tip -- no child) has no
-                # real "tail": Blender synthesizes a short, arbitrary stub
-                # for it (see bone.tail assignment above), so its direction
-                # doesn't reflect real mesh geometry. What IS real is
-                # `head`, this joint's own placed position, and the
-                # direction toward its parent. Restrict tightly only on
-                # the PROXIMAL side (toward the parent/body) and leave the
-                # DISTAL side (away from the body -- further out along the
-                # limb) unrestricted: nothing else can legitimately claim
-                # territory past the tip of a limb, so there's no risk in
-                # leaving that side open, and it's exactly what a foot's
-                # sole or a hand's fingertips need to stay in-bounds.
-                # Symmetric padding off the tiny synthetic tail was instead
-                # excluding real foot-sole vertices from ever being
-                # foot-bone candidates, leaving them to fall through to an
-                # unrestricted spine bone (root) by default -- the "some
-                # vertices in the foot don't move" bug.
-                # A terminal bone's proximal boundary only risks bleeding
-                # into its OWN parent (e.g. foot into knee) -- still the
-                # same limb, not a different one -- so it's much lower
-                # consequence than the hip/knee proximal boundary (which
-                # risks bleeding into an unrelated stalk/arm). On a very
-                # compact leg (e.g. the tomato's ~0.03-unit knee-to-foot
-                # segment), even 0.2x of that is too tiny to cover real
-                # foot-sole geometry, which left foot-sole vertices with no
-                # valid limb candidate and defaulting to root (frozen) --
-                # the "some vertices in the foot don't move" bug. A more
-                # generous proximal pad here is safe.
-                proximal_pad = effective_len * 0.6
-                proximal_z = head[2]
-                if parent_head[2] > proximal_z:
-                    out_of_band = verts[:, 2] > proximal_z + proximal_pad
-                else:
-                    out_of_band = verts[:, 2] < proximal_z - proximal_pad
-            else:
-                z_lo, z_hi = sorted((head[2], tail[2]))
-                out_of_band = (verts[:, 2] < z_lo - pad) | (verts[:, 2] > z_hi + pad)
-
-            seg_dists[out_of_band, bi] = np.inf
-
-        spine_dists = seg_dists[:, spine_indices_list].min(axis=1)
-        limb_dists  = seg_dists[:, limb_indices_list].min(axis=1)
-
-        # Vertices closer to a limb bone → zero out spine bone influences
-        # Vertices closer to a spine bone → zero out limb bone influences
-        is_limb_vert  = limb_dists < spine_dists
-        is_spine_vert = ~is_limb_vert
-
-        # Zero out cross-region influences
-        for bi in spine_bone_indices:
-            seg_dists[is_limb_vert, bi] = np.inf
-        for bi in limb_bone_indices:
-            seg_dists[is_spine_vert, bi] = np.inf
-
-        print(f"  Partitioned: {is_limb_vert.sum()} limb verts, "
-              f"{is_spine_vert.sum()} spine verts")
-
-    # Terminal bones (feet, hands, wing tips) used to get a hard 100%/0%
-    # lock here for any vertex within a fixed radius of the bone -- assigned
-    # entirely to the terminal bone with every other influence zeroed out.
-    # That created a visible seam ("the mesh breaking from itself"): a
-    # vertex just inside the radius moved fully with the terminal bone while
-    # its immediate neighbor just outside reverted to an entirely different
-    # Gaussian blend, with no transition between the two. The Z-band
-    # restriction above already keeps the wrong bones from competing for
-    # these vertices, so the Gaussian weighting below -- which naturally
-    # gives near-100% weight right at the bone and tapers off smoothly with
-    # distance -- can be trusted to handle terminal bones too, without a
-    # separate hard override.
-
-    # ✅ Build smooth Gaussian-based weights
-
-    # ── Rigid lock for non-deforming bones ────────────────────────────────────
-    # All vertices whose nearest bone is a non-deforming bone get locked to it
-    # with 100% weight — no blending. This makes the head, pelvis, etc. move
-    # as solid rigid units rather than deforming.
-    if non_deforming_indices:
-        # Compute nearest bone for all vertices using current seg_dists
-        nearest_bone = np.argmin(seg_dists, axis=1)
-        for bi in non_deforming_indices:
-            rigid_mask = nearest_bone == bi
-            if rigid_mask.any():
-                seg_dists[rigid_mask, :]  = np.inf
-                seg_dists[rigid_mask, bi] = 0.0
-                print(f"  Rigid lock: {rigid_mask.sum()} vertices → "
-                      f"'{bone_names_list[bi]}' (deforms_mesh=false)")
-
-    # ── Smooth Gaussian weights for remaining vertices ────────────────────────
-    smooth_weights = np.zeros((len(verts), len(bone_names_list)))
-
     for bi in range(len(bone_names_list)):
         head, tail = bone_segments[bi]
-        bone_len   = np.linalg.norm(tail - head)
-        # Same mesh_size-floor problem as the Z-band padding: on a
-        # character where a giant head dominates mesh_size while a limb
-        # bone is tiny (or a terminal bone's synthetic tail makes bone_len
-        # near-zero), mesh_size * 0.02 inflates sigma far past the limb's
-        # real scale, spreading its Gaussian influence well beyond where it
-        # should smoothly reach zero. Use the same effective_len (falls
-        # back to the incoming parent-to-head length for terminal bones)
-        # computed above for limb bones; spine bones keep the mesh_size
-        # floor since they legitimately span a large fraction of the body.
-        sigma      = (effective_len_by_bone[bi] * 0.5 if bi in effective_len_by_bone
-                      else max(bone_len * 0.5, mesh_size * 0.02))
-        distances  = seg_dists[:, bi]
-        smooth_weights[:, bi] = np.exp(-(distances ** 2) / (2 * sigma ** 2))
+        bone_len = np.linalg.norm(tail - head)
+        parent_head = parent_head_by_index.get(bi)
+        incoming_len = (np.linalg.norm(head - parent_head)
+                        if parent_head is not None else 0.0)
+        chain_fallback = (chain_length_by_bone.get(bi, 0.0)
+                          if bi in terminal_bone_indices else 0.0)
+        effective_len_by_bone[bi] = max(
+            bone_len, incoming_len, chain_fallback, 1e-4)
+
+    # An ABSOLUTE cutoff (zero weight beyond a fixed distance) forces a
+    # trade-off that can't be won with one constant: tight enough to keep
+    # a hip from reaching into the torso, and a real chunk of the mesh
+    # ends up farther than EVERY bone's cutoff (all-zero rows, falling
+    # back to a Blender/exporter default "neutral_bone" with no real
+    # weight at all); loose enough to give every vertex a real candidate,
+    # and the same over-reach that let a hip contaminate the torso or one
+    # shoulder blend into the other comes right back.
+    #
+    # What actually matters is RELATIVE, not absolute: how much farther is
+    # this bone than the closest one *for this vertex*. Weight each bone
+    # by the gap between its distance and the nearest bone's distance,
+    # decaying with a sigma taken from the nearest bone's own local scale.
+    # The nearest bone always has gap=0, so it always gets full weight
+    # before normalization -- every vertex has a well-defined nearest
+    # bone, so there is no coverage gap to patch. A bone on the wrong side
+    # of the body (the opposite shoulder, the opposite leg) or in the
+    # wrong region (a hip reaching into the torso) has a large gap versus
+    # whatever bone is actually closest there, so it decays away on its
+    # own without needing a separate cross-side or cross-region rule.
+    SIGMA_FACTOR = 0.2
+
+    nearest_bone_idx = np.argmin(seg_dists, axis=1)
+    nearest_dist     = seg_dists[np.arange(len(seg_dists)), nearest_bone_idx]
+    sigma_per_vertex = np.array(
+        [effective_len_by_bone[bi] for bi in nearest_bone_idx]) * SIGMA_FACTOR
+    gap = seg_dists - nearest_dist[:, None]
+    smooth_weights = np.exp(-(gap ** 2) / (2 * sigma_per_vertex[:, None] ** 2))
 
 
 # ── Island coherence lock ─────────────────────────────────────────────────
