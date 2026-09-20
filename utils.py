@@ -89,9 +89,13 @@ WALK_KEYFRAMES = {
     "chest":     ("y", -1,  0.05),
     "neck":      ("z",  1,  0.02),
     "head":      ("z", -1,  0.02),
-    "shoulder":  ("x",  1,  0.35),
-    "elbow":     ("x",  1,  0.20),
-    "hand":      ("x",  1,  0.10),
+    # Arms are intentionally excluded from the walk cycle -- the user wants
+    # a legs-only gait (matching the earlier "only the legs moved from the
+    # hips down" baseline), not a counter-swinging arm. build_wave_keyframes
+    # still gives the arms their own dedicated 'wave' clip.
+    "shoulder":  None,
+    "elbow":     None,
+    "hand":      None,
     "hip":       ("x",  1,  0.45),
     "leg":       ("x",  1,  0.60),
     "foot":      ("x",  1,  0.20),
@@ -108,24 +112,10 @@ RIGHT_SIDE_FLIP = {"shoulder", "elbow", "hand", "hip", "leg", "foot",
 
 
 def build_walk_keyframes(body_part: str, joint_name: str,
-                         bone_length: float = None,
-                         arm_leg_reach_ratio: float = None) -> list:
+                         bone_length: float = None) -> list:
     """
     Return an animations list for a joint given its body_part label.
     bone_length: world-space distance to nearest child, used to scale amplitude.
-    arm_leg_reach_ratio: leg_reach / arm_reach for THIS character (sum of
-        hip+knee bone length over sum of shoulder+elbow bone length). Used
-        instead of the fixed-reference bone_length scaling for arm joints,
-        because arm swing exists to counter the leg's angular momentum — what
-        must stay proportionate is the LINEAR distance each limb's tip
-        sweeps, not the angle. A character with short legs and long arms
-        (e.g. broccoli) swinging its arms at the same angle as a normal
-        human sweeps a much larger linear distance at the hand than at the
-        foot, which reads as "the upper body moves too much" even though
-        the angle itself matches a normal human's. Scaling arm amplitude by
-        this character's own leg_reach/arm_reach keeps the swept distances
-        in proportion for any body plan, instead of relying on a fixed
-        REFERENCE_BONE constant tuned for average human proportions.
     """
     body_part_lower = (body_part or '').lower()
 
@@ -147,9 +137,7 @@ def build_walk_keyframes(body_part: str, joint_name: str,
     if is_right and body_part_lower in RIGHT_SIDE_FLIP:
         phase *= -1
 
-    if body_part_lower in ("shoulder", "elbow", "hand") and arm_leg_reach_ratio is not None:
-        amp = base_amp * arm_leg_reach_ratio
-    elif bone_length is not None and bone_length > 1e-6:
+    if bone_length is not None and bone_length > 1e-6:
         REFERENCE_BONE = 0.4
         amp = base_amp * min(1.5, max(0.5, REFERENCE_BONE / bone_length))
     else:
@@ -398,26 +386,6 @@ def inject_keyframes(skel: dict) -> dict:
     for bone in skel['bones']:
         children.setdefault(bone['parent'], []).append(bone['child'])
 
-    def _bone_length_for(name_keyword):
-        for j in skel['joints']:
-            if name_keyword in (j.get('name') or '').lower():
-                child_ids = children.get(j['id'], [])
-                if child_ids:
-                    child_pos = positions.get(child_ids[0])
-                    if child_pos is not None:
-                        return float(np.linalg.norm(
-                            np.array(j['position']) - child_pos
-                        ))
-        return None
-
-    leg_reach = sum(v for v in (_bone_length_for('hip'), _bone_length_for('knee')) if v)
-    arm_reach = sum(v for v in (_bone_length_for('shoulder'), _bone_length_for('elbow')) if v)
-    arm_leg_reach_ratio = None
-    if leg_reach > 1e-6 and arm_reach > 1e-6:
-        arm_leg_reach_ratio = max(0.3, min(2.0, leg_reach / arm_reach))
-        print(f"  arm/leg reach: leg_reach={leg_reach:.3f} arm_reach={arm_reach:.3f} "
-              f"-> arm_leg_reach_ratio={arm_leg_reach_ratio:.3f}")
-
     for joint in skel['joints']:
         hint      = joint.get('hint') or {}
         body_part = hint.get('body_part', '')
@@ -437,8 +405,7 @@ def inject_keyframes(skel: dict) -> dict:
 
         # Walk — only deforming bones (limbs)
         if deforms:
-            animations += build_walk_keyframes(body_part, name, bone_length,
-                                                arm_leg_reach_ratio)
+            animations += build_walk_keyframes(body_part, name, bone_length)
 
         # Idle — root bob and head nod only
         animations += build_idle_keyframes(body_part, name)
