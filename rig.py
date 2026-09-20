@@ -439,6 +439,7 @@ def build_segment_weights(mesh_obj, armature_obj, skeleton_joints_data):
                               if name not in all_parent_names}
 
     chain_length_by_bone = {}
+    chain_root_by_bone   = {}
     for bi in limb_bone_indices:
         # Chain root: walk up while the parent is ALSO a limb bone --
         # stops at the first limb bone whose parent attaches to the main
@@ -447,6 +448,7 @@ def build_segment_weights(mesh_obj, armature_obj, skeleton_joints_data):
         while (root_idx in parent_index_by_index
                and parent_index_by_index[root_idx] in limb_bone_indices):
             root_idx = parent_index_by_index[root_idx]
+        chain_root_by_bone[bi] = root_idx
         # Walk down from the root to the terminal tip, summing lengths.
         total, cur, seen = 0.0, root_idx, set()
         while cur not in seen:
@@ -459,6 +461,82 @@ def build_segment_weights(mesh_obj, armature_obj, skeleton_joints_data):
                 break
             cur = children[0]
         chain_length_by_bone[bi] = total
+
+    # A limb chain attaches to the body at its root (hip for a leg,
+    # shoulder for an arm) and only ever extends outward/downward from
+    # there -- "rig the leg from where the hip is down." Cap each chain's
+    # candidacy at its own root's attachment height, so a leg bone simply
+    # cannot compete for a vertex sitting above where the leg attaches to
+    # the body, no matter how close it is in raw 3D distance. This is a
+    # hard, literal rule tied directly to the joint's own (vision-
+    # verified) position -- no proportional padding to calibrate. A small
+    # fixed margin allows for surface thickness right at the joint (e.g.
+    # a T-pose arm's own rounded thickness sitting slightly above the
+    # exact shoulder height), not a body-shape-dependent one.
+    UP_AXIS = 2
+    chain_ceiling_by_bone = {}
+    for bi in limb_bone_indices:
+        root_idx  = chain_root_by_bone[bi]
+        root_head, root_tail = bone_segments[root_idx]
+        # Margin scaled to the chain's OWN root segment, not mesh_size --
+        # a mesh_size-based margin is an absolute reference that breaks
+        # down exactly like it did for the old Z-band padding (a giant
+        # head dominating mesh_size while the actual limb is tiny).
+        margin = np.linalg.norm(root_tail - root_head) * 0.3
+        chain_ceiling_by_bone[bi] = root_head[UP_AXIS] + margin
+
+    # Same idea, applied laterally: a chain rooted clearly on one side of
+    # the body (shoulder_left, hip_left) only ever rigs that side. Without
+    # this, left and right instances of the same bone -- at very similar
+    # heights by construction -- have nothing else to separate them by
+    # raw distance, and can blend into each other for a near-central
+    # vertex. Only exclude the OPPOSITE side, with a small crossover
+    # margin at the midline for smooth blending there; a same-side vertex
+    # is never excluded no matter how far laterally it sits from this
+    # specific bone (a wide/round body's leg-adjacent vertices can
+    # legitimately sit far in X from the leg bone's own narrow position).
+    # A per-bone margin (sized off each chain's own segment) produced two
+    # DIFFERENT crossover widths that didn't meet at the same line -- e.g.
+    # shoulder_left's own margin excluded it only past X=+0.05, while
+    # shoulder_right's margin let it reach as far as X=-0.14, leaving a
+    # wide dead zone in between where BOTH remained eligible. A margin
+    # shared by both sides of a pair fixes that -- but sizing it off the
+    # OVERALL mesh width breaks just like the old mesh_size floor did: a
+    # human in a T-pose has arms stretched out sideways, which balloons
+    # the mesh's overall X-extent and made the shared margin far too
+    # generous at the midline. Size each pair's margin off the actual
+    # distance BETWEEN that pair's own two joints (shoulder_left to
+    # shoulder_right, hip_left to hip_right) instead -- a real, local
+    # measurement of how wide the body is at that specific joint level.
+    SIDE_AXIS = 0
+    chain_side_by_bone = {}
+    for bi in limb_bone_indices:
+        root_idx = chain_root_by_bone[bi]
+        root_name = bone_names_list[root_idx].lower()
+        root_head, root_tail = bone_segments[root_idx]
+        center = (root_head[SIDE_AXIS] + root_tail[SIDE_AXIS]) / 2
+
+        if 'left' in root_name:
+            partner_name = root_name.replace('left', 'right')
+        elif 'right' in root_name:
+            partner_name = root_name.replace('right', 'left')
+        else:
+            continue  # root sits centrally -- no side to restrict to
+
+        partner_idx = next((i for i, n in enumerate(bone_names_list)
+                             if n.lower() == partner_name), None)
+        if partner_idx is None:
+            continue
+        p_head, p_tail = bone_segments[partner_idx]
+        partner_center = (p_head[SIDE_AXIS] + p_tail[SIDE_AXIS]) / 2
+        pair_margin = abs(center - partner_center) * 0.02
+
+        if center > pair_margin:
+            chain_side_by_bone[bi] = (1, pair_margin)
+        elif center < -pair_margin:
+            chain_side_by_bone[bi] = (-1, pair_margin)
+        # else: this chain's root sits within its own pair's crossover
+        # margin of the midline -- no side to restrict to.
 
     effective_len_by_bone = {}
     for bi in range(len(bone_names_list)):
@@ -483,23 +561,41 @@ def build_segment_weights(mesh_obj, armature_obj, skeleton_joints_data):
     #
     # What actually matters is RELATIVE, not absolute: how much farther is
     # this bone than the closest one *for this vertex*. Weight each bone
-    # by the gap between its distance and the nearest bone's distance,
-    # decaying with a sigma taken from the nearest bone's own local scale.
-    # The nearest bone always has gap=0, so it always gets full weight
-    # before normalization -- every vertex has a well-defined nearest
-    # bone, so there is no coverage gap to patch. A bone on the wrong side
-    # of the body (the opposite shoulder, the opposite leg) or in the
-    # wrong region (a hip reaching into the torso) has a large gap versus
+    # by the gap between its distance and the nearest bone's distance. The
+    # nearest bone always has gap=0, so it always gets full weight before
+    # normalization -- every vertex has a well-defined nearest bone, so
+    # there is no coverage gap to patch. A bone on the wrong side of the
+    # body (the opposite shoulder, the opposite leg) or in the wrong
+    # region (a hip reaching into the torso) has a large gap versus
     # whatever bone is actually closest there, so it decays away on its
-    # own without needing a separate cross-side or cross-region rule.
-    SIGMA_FACTOR = 0.2
+    # own without needing a separate cross-side or cross-region rule --
+    # PROVIDED the decay is scaled to that competing bone's OWN local
+    # size, not the nearest bone's. Scaling every bone's decay by the
+    # nearest bone's scale was a real regression: on a body dominated by
+    # a few large spine bones (broccoli's chest/spine, which each span a
+    # big fraction of total height), that let a small bone like hip stay
+    # falsely competitive over a wide swath of the torso, since a modest
+    # gap looked small relative to the spine bone's large sigma even
+    # though it was large relative to hip's own actual reach. Each
+    # candidate bone's contribution should decay relative to ITS OWN
+    # scale -- how much farther than its best case is this, for THIS
+    # bone specifically.
+    SIGMA_FACTOR = 0.4
 
-    nearest_bone_idx = np.argmin(seg_dists, axis=1)
-    nearest_dist     = seg_dists[np.arange(len(seg_dists)), nearest_bone_idx]
-    sigma_per_vertex = np.array(
-        [effective_len_by_bone[bi] for bi in nearest_bone_idx]) * SIGMA_FACTOR
-    gap = seg_dists - nearest_dist[:, None]
-    smooth_weights = np.exp(-(gap ** 2) / (2 * sigma_per_vertex[:, None] ** 2))
+    for bi, ceiling in chain_ceiling_by_bone.items():
+        seg_dists[verts[:, UP_AXIS] > ceiling, bi] = np.inf
+    for bi, (side, side_margin) in chain_side_by_bone.items():
+        if side > 0:
+            seg_dists[verts[:, SIDE_AXIS] < -side_margin, bi] = np.inf
+        else:
+            seg_dists[verts[:, SIDE_AXIS] > side_margin, bi] = np.inf
+
+    nearest_dist = seg_dists.min(axis=1, keepdims=True)
+    gap          = seg_dists - nearest_dist
+    sigma_by_bone = np.array(
+        [effective_len_by_bone[bi] for bi in range(len(bone_names_list))]
+    ) * SIGMA_FACTOR
+    smooth_weights = np.exp(-(gap ** 2) / (2 * sigma_by_bone[None, :] ** 2))
 
 
 # ── Island coherence lock ─────────────────────────────────────────────────
