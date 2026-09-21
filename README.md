@@ -1,4 +1,4 @@
-<b>How to animate anything!</b> 
+<b>How to animate anything!</b>  More background here: <a href="https://medium.com/@csbishopfilm/endeavoring-animation-bebe0b16b085?sharedUserId=csbishopfilm">here</a>
 <p><img width="300" height="200" alt="broccoli" src="https://github.com/user-attachments/assets/d4cc8a00-df4b-425d-996d-a2bf53978c59" />
  <img width="300" height="200" alt="Screenshot 2026-07-23 at 8 13 43 PM" src="https://github.com/user-attachments/assets/5f74de0b-6653-4d12-9b75-d5b6f9412e9b" />
 <img width="300" height="200" alt="happy_broccoli_walking" src="https://github.com/user-attachments/assets/8edd0e55-a014-4bc1-a21c-0537c948b246" />
@@ -19,8 +19,16 @@ MESHY_API_KEY<br/>
 <br/>
 <br/>
 
-Create a virtual env</br>
-`source venv/bin/activate`
+Install the virtual environment tool (if not already installed)<br/>
+`pip install virtualenv`
+or `brew install virtualenv`
+<br/>
+Create a virtual environment named "myenv"<br/>
+`virtualenv myenv`
+
+Activate the environment<br/>
+`source myenv/bin/activate`
+<br/>
 install required libs (there may be a few more you need to add)</br>
 `pip install -r requirements.txt`
 <br/>
@@ -44,6 +52,8 @@ CLOUDDB_PROJECT=your_project_id </p>
 
 
 ***THE PIPELINE!***</br>
+```segment->classify->(augment)->mesh->infer_joints->rig```
+</br>
 Begin with an image (as specified above) of something you want to animate. Create an assets folder (at the same level as vehicle and results) and drop it there
 
 
