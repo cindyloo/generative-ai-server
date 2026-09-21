@@ -145,6 +145,52 @@ def build_walk_keyframes(body_part: str, joint_name: str,
 
     print(f"  walk keyframe: {joint_name} body_part={body_part} is_right={is_right} phase={phase} amp={amp}")
 
+    if body_part_lower == 'leg':
+        # Knee: unidirectional flexion (a knee only bends one way, never
+        # hyperextends) that peaks once during THIS leg's swing and stays
+        # at zero through its stance, rather than mirroring hip's own
+        # signed oscillation on the same timing. Sharing hip's exact
+        # phase and timing (the previous approach) made the knee's
+        # rotation RELATIVE TO THE HIP -- the actual visible bend at the
+        # knee joint -- tiny, since both rotated together in the same
+        # direction at the same time: the leg read as one rigid pendulum
+        # swinging from the hip, confirmed directly by the user ("the hip
+        # moves the entire leg as if it was frozen"). A real knee does
+        # most of its bending near the middle of the swing (clearing the
+        # foot off the ground) and stays essentially straight during
+        # stance (the planted, weight-bearing half of the cycle).
+        # phase's sign (already flipped for the right leg above) is reused
+        # here to decide WHICH half of the 60-frame loop is this leg's
+        # swing, mirroring hip/foot's own left/right timing split instead
+        # of introducing a separate convention.
+        if phase > 0:
+            kf = [
+                [1,  0.0],
+                [15, 0.0],
+                [30, 0.0],
+                [45, 0.0],
+                [50, round(amp * 0.6, 4)],
+                [55, round(amp, 4)],
+                [60, 0.0],
+            ]
+        else:
+            kf = [
+                [1,  0.0],
+                [15, 0.0],
+                [20, round(amp * 0.6, 4)],
+                [25, round(amp, 4)],
+                [30, 0.0],
+                [45, 0.0],
+                [60, 0.0],
+            ]
+        return [{
+            "clip":      "walk",
+            "property":  "rotation_euler",
+            "axis":      axis,
+            "keyframes": kf,
+            "loop":      True,
+        }]
+
     kf = [
         [1,  0.0],
         [15, round( phase * amp, 4)],

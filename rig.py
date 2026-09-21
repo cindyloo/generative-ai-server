@@ -531,7 +531,23 @@ def build_segment_weights(mesh_obj, armature_obj, skeleton_joints_data):
             continue
         p_head, p_tail = bone_segments[partner_idx]
         partner_center = (p_head[SIDE_AXIS] + p_tail[SIDE_AXIS]) / 2
-        pair_margin = abs(center - partner_center) * 0.02
+        # Scaled to the PAIR'S OWN bone length, not their lateral
+        # separation -- separation and bone length are unrelated
+        # quantities. Confirmed on a real (normally-proportioned) human
+        # character standing with feet close together: a small lateral
+        # separation produced a tiny margin, but that character's leg
+        # bones are long (normal human proportions, unlike the compact
+        # broccoli/tomato this was tuned against), so the resulting
+        # excess-past-margin was tiny relative to that bone's own large
+        # sigma and barely suppressed the opposite foot at all --
+        # confirmed visually and numerically (opposite foot/knee still
+        # getting 15-25% weight well past the margin). Bone length is
+        # what the later Gaussian sigma is ALSO scaled from, so tying the
+        # margin to it keeps the two consistent regardless of how close
+        # together the character's feet happen to stand.
+        own_len     = np.linalg.norm(root_tail - root_head)
+        partner_len = np.linalg.norm(p_tail - p_head)
+        pair_margin = max(own_len, partner_len) * 0.3
 
         if center > pair_margin:
             chain_side_by_bone[bi] = (1, pair_margin)
