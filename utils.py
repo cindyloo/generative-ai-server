@@ -270,17 +270,50 @@ def build_wave_keyframes(body_part: str, joint_name: str) -> list:
     is_right = 'right' in joint_name.lower()
 
     # ── Arm wave (left only) ──────────────────────────────────────────────────
+    # Axis is 'y', not 'x' — and NOT 'z' either, despite 'z' being the axis
+    # that intuitively means "the third one". rig.py's create_animations_from_hints
+    # remaps these JSON axis labels before applying them:
+    #   'x' → Blender Euler index 0 (local X)
+    #   'y' → Blender Euler index 2 (local Z)
+    #   'z' → Blender Euler index 1 (local Y)
+    # _align_bone_roll aligns every bone so local X rotation always produces
+    # a front-back swing (correct for walking: legs swing forward/back) and
+    # local Z a sideways swing. Raising an arm out to the side to wave needs
+    # that sideways swing — local Z — which is JSON axis 'y' after the remap.
+    # Two wrong axes were tried and ruled out by actually rendering the clip
+    # and reading back the baked world-space joint positions, not by
+    # reasoning about the remap alone:
+    #   'x' (local X, front-back swing): arm swung backward in depth — the
+    #       original bug report ("moves the hand backwards").
+    #   'z' (local Y, the bone's OWN head-to-tail axis): a pure twist/roll.
+    #       The elbow sits almost exactly ON that axis so it barely moved;
+    #       the hand, offset from it by the forearm, swept out to Z≈-0.44 —
+    #       a different-looking but equally wrong "backward" motion.
+    # Shoulder and elbow rotate around the SAME axis and their angles simply
+    # add together (both measured from the upper arm's own rest direction,
+    # straight down), so hitting the classic "raised arm, bent elbow, hand
+    # near the head" wave silhouette means budgeting the total carefully:
+    #   shoulder ~1.4 rad (80°) alone: swings the upper arm from hanging
+    #     straight down to nearly horizontal, out to the side.
+    #   elbow adds ~1.3 rad (74°) MORE on top of that: continues the same
+    #     rotation past horizontal, folding the forearm back up toward
+    #     vertical — hand ends up above and behind the elbow, near the head.
+    # Two smaller splits were tried and rendered first and both read as one
+    # straight extended arm, not a bent elbow: 0.80+0.60 (a nearly-
+    # horizontal straight line) and 0.70+1.30 (still only ~70° total at the
+    # shoulder, so the "elbow fold" just continued the same shallow rise
+    # rather than doubling back past horizontal).
     if body_part_lower == 'shoulder' and is_left:
         return [{
             "clip":      "wave",
             "property":  "rotation_euler",
-            "axis":      "x",
+            "axis":      "y",
             "keyframes": [
                 [1,   0.00],
-                [15,  0.80],
-                [30,  0.65],
-                [40,  0.80],
-                [50,  0.65],
+                [15,  1.40],
+                [30,  1.20],
+                [40,  1.40],
+                [50,  1.20],
                 [60,  0.00],
             ],
             "loop": True,
@@ -290,13 +323,13 @@ def build_wave_keyframes(body_part: str, joint_name: str) -> list:
         return [{
             "clip":      "wave",
             "property":  "rotation_euler",
-            "axis":      "x",
+            "axis":      "y",
             "keyframes": [
                 [1,   0.00],
-                [15,  0.40],
-                [30,  0.60],
-                [40,  0.40],
-                [50,  0.60],
+                [15,  1.10],
+                [30,  1.30],
+                [40,  1.10],
+                [50,  1.30],
                 [60,  0.00],
             ],
             "loop": True,
@@ -709,18 +742,32 @@ def _build_joints_prompt(object_type: str, category: str,
             chest_y  = chest_y_default
             spine_y  = spine_y_default
 
-        # Shoulders are siblings of the neck off joint_chest in the skeleton
-        # hierarchy (both attach at the same point on the spine), so they
-        # belong at the same height as the neck — not left to "estimate from
-        # the image" below, which is what let them drift down to chest
-        # height in practice. Only applies to rig types whose arms use
-        # "shoulder" body parts (humanoid, and the animal-fallback "other");
-        # biped has no arms, and quadruped/flying use "shoulder"/"wing_base"
-        # for a front-leg or wing attachment near chest height instead.
-        shoulder_y = neck_y if rt in ('humanoid', 'other') else None
-        shoulder_y_line = (f"  shoulder: y ≈ {shoulder_y:.2f}  (same height as "
-                           f"neck — they attach at the same point)\n"
-                           if shoulder_y is not None else "")
+        # Shoulders default to the same height as the neck — a reasonable
+        # assumption when a real measurement isn't available, since on a
+        # normal humanoid "narrow neck between wide shoulders and wide
+        # head" and "where the arms attach" sit at about the same height.
+        # That assumption breaks for a body plan where a large head/crown
+        # mass sits on a short torso (e.g. broccoli) — the arms can attach
+        # much lower, near the waist/collar. shoulder_y_detected_left/right
+        # (seg_server.py) trace each arm's own vertex cluster to where it
+        # actually merges into the main body mass, bottom-up — a direct
+        # geometric answer to "where does this limb visually merge with
+        # the body" instead of assuming it lines up with the neck.
+        shoulder_y_detected_left  = mesh_bounds.get('shoulder_y_detected_left')
+        shoulder_y_detected_right = mesh_bounds.get('shoulder_y_detected_right')
+        if (rt in ('humanoid', 'other') and shoulder_y_detected_left is not None
+                and shoulder_y_detected_right is not None):
+            shoulder_y = (shoulder_y_detected_left + shoulder_y_detected_right) / 2
+            shoulder_y_line = (
+                f"  shoulder: y ≈ {shoulder_y:.2f}  (measured directly from the "
+                f"mesh — the height where each arm's own geometry merges into "
+                f"the main body mass; do NOT assume this equals neck height)\n"
+            )
+        else:
+            shoulder_y = neck_y if rt in ('humanoid', 'other') else None
+            shoulder_y_line = (f"  shoulder: y ≈ {shoulder_y:.2f}  (same height as "
+                               f"neck — they attach at the same point)\n"
+                               if shoulder_y is not None else "")
 
         # Shoulder X must be measured from the TRUNK width, not a fixed
         # fraction of the full mesh width — in a T-pose, the full mesh width

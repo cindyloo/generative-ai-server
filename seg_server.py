@@ -1051,7 +1051,8 @@ def _detect_trunk_x_edges(verts_in_band: np.ndarray, mesh_center_x: float):
 
 
 def _measure_trunk_x_edges(verts: np.ndarray, bmin: np.ndarray,
-                            bmax: np.ndarray, brange: np.ndarray):
+                            bmax: np.ndarray, brange: np.ndarray,
+                            center_frac: float = 0.50, span_frac: float = 0.21):
     """
     Robust trunk-width measurement: a single height band can still be
     contaminated even with gap detection (_detect_trunk_x_edges) — if a
@@ -1061,19 +1062,32 @@ def _measure_trunk_x_edges(verts: np.ndarray, bmin: np.ndarray,
     the torso silhouette at certain heights, even though it's clearly
     separate at others).
 
-    Sample several height bands spanning the waist/lower-chest region and
-    take the MEDIAN-width band's result. A limb only contaminates the
-    bands its own height overlaps — the true trunk width tends to be far
-    more consistent band-to-band than a contaminated reading — so the
-    median is naturally resistant to the 1-2 bands a limb happens to
-    intrude on, without needing any fixed plausibility threshold.
+    Sample several height bands spanning [center_frac - span_frac/2,
+    center_frac + span_frac/2] and take the MEDIAN-width band's result. A
+    limb only contaminates the bands its own height overlaps — the true
+    trunk width tends to be far more consistent band-to-band than a
+    contaminated reading — so the median is naturally resistant to the
+    1-2 bands a limb happens to intrude on, without needing any fixed
+    plausibility threshold.
+
+    center_frac/span_frac default to the waist/lower-chest region (a
+    reasonable default for a normal-proportioned humanoid), but callers
+    measuring shoulder width should center this on the shoulder joint's
+    own Y instead — for a body plan where the torso silhouette isn't
+    roughly vertical between waist and shoulder (e.g. a wide, tapering
+    crown/head mass sitting on a thin stalk), measuring at a fixed waist
+    height and pairing the result with a shoulder Y from somewhere else
+    entirely produces an (x, y) pair that doesn't correspond to any real
+    cross-section — it can land outside the actual mesh surface.
 
     Returns (x_left, x_right) in world-space coordinates, or None if no
     band had enough vertices to measure.
     """
     mesh_center_x = (bmin[0] + bmax[0]) / 2
     band_results = []
-    for lo_frac in np.arange(0.40, 0.61, 0.05):
+    lo_bound = max(0.0, center_frac - span_frac / 2)
+    hi_bound = min(1.0 - 0.05, center_frac + span_frac / 2)
+    for lo_frac in np.arange(lo_bound, hi_bound + 1e-9, 0.05):
         y_lo = bmin[1] + lo_frac * brange[1]
         y_hi = bmin[1] + (lo_frac + 0.05) * brange[1]
         band_verts = verts[(verts[:, 1] >= y_lo) & (verts[:, 1] < y_hi)]
@@ -1187,17 +1201,33 @@ def mesh_guided_joint_correction(joints_data: dict, mesh,
         # (e.g. an A-pose arm passing through waist height) is filtered
         # out via gap detection across multiple height bands, rather than
         # a fixed width assumption.
-        trunk_edges = _measure_trunk_x_edges(verts, bmin, bmax, brange)
-        if trunk_edges is not None:
-            trunk_x_left, trunk_x_right = trunk_edges
-            for name, trunk_x in [('joint_shoulder_left', trunk_x_left),
-                                   ('joint_shoulder_right', trunk_x_right)]:
-                if name in hint_map:
-                    new_x = float(np.clip((trunk_x - bmin[0]) / brange[0], 0.0, 1.0))
-                    old_x = hint_map[name]['position_normalized']['x']
-                    hint_map[name]['position_normalized']['x'] = new_x
-                    log.info(f"  GeoCorrect {name} X: {old_x:.3f}→{new_x:.3f} "
-                             f"(trunk edge)")
+        #
+        # Measured separately per side, centered on THAT side's own
+        # shoulder Y (not a fixed waist fraction) — pairing an X measured
+        # at one height with a Y from somewhere else only lines up for a
+        # body whose torso silhouette is roughly vertical between waist
+        # and shoulder. For a body plan where it isn't (e.g. a wide,
+        # tapering crown/head mass on a thin stalk, where the torso is
+        # much narrower at "waist" height than up at real shoulder
+        # height), that mismatch produces an (x, y) pair that lands
+        # outside the actual mesh surface — confirmed via a vision-
+        # verification render showing the shoulder marker floating in
+        # empty space next to the body rather than on it.
+        for side, name in [('left', 'joint_shoulder_left'),
+                            ('right', 'joint_shoulder_right')]:
+            if name not in hint_map:
+                continue
+            shoulder_y_frac = hint_map[name]['position_normalized'].get('y', 0.5)
+            trunk_edges = _measure_trunk_x_edges(
+                verts, bmin, bmax, brange, center_frac=shoulder_y_frac)
+            if trunk_edges is None:
+                continue
+            trunk_x = trunk_edges[0] if side == 'left' else trunk_edges[1]
+            new_x = float(np.clip((trunk_x - bmin[0]) / brange[0], 0.0, 1.0))
+            old_x = hint_map[name]['position_normalized']['x']
+            hint_map[name]['position_normalized']['x'] = new_x
+            log.info(f"  GeoCorrect {name} X: {old_x:.3f}→{new_x:.3f} "
+                     f"(trunk edge @ shoulder y={shoulder_y_frac:.3f})")
 
         # Hands = outermost X vertices in arm Y range. Band must be wide
         # enough to cover a hand at any arm pose — T-pose puts it near
@@ -1231,22 +1261,76 @@ def mesh_guided_joint_correction(joints_data: dict, mesh,
                         log.info(f"  GeoCorrect {name} X: {old_x:.3f}→{norm['x']:.3f} "
                                  f"Y: {old_y:.3f}→{norm['y']:.3f} (mesh extremity)")
 
-        # Elbow = midpoint between shoulder and hand (same rule as
-        # knee_y = midpoint(hip_y, foot_y)), computed AFTER the hand
-        # correction above so it reflects the geometrically-grounded hand
-        # position rather than a possibly wrong vision guess.
-        for side, elbow_name, shoulder_name, hand_name in [
-            ('left',  'joint_elbow_left',  'joint_shoulder_left',  'joint_hand_left'),
-            ('right', 'joint_elbow_right', 'joint_shoulder_right', 'joint_hand_right'),
+        # Elbow = the point along the arm's OWN geometry that bends
+        # farthest away from a straight shoulder→hand line, computed
+        # AFTER the shoulder/hand corrections above so it reflects their
+        # geometrically-grounded positions rather than a possibly wrong
+        # vision guess.
+        #
+        # This used to be a plain Y-midpoint between shoulder and hand
+        # (mirroring knee_y = midpoint(hip_y, foot_y)) — a reasonable
+        # assumption for a knee, since legs are load-bearing and stay
+        # close to straight, but wrong for an arm that visibly droops or
+        # bends (e.g. broccoli's floppy dangling arms, clearly curved in
+        # the mesh, not a straight diagonal from shoulder to hand). Taking
+        # the midpoint in that case lands the elbow in empty space between
+        # the two ends rather than on the actual bend in the arm. Tracing
+        # the arm's own cross-section (same clustering technique used for
+        # shoulder's arm/trunk merge detection) and picking the vertex
+        # that deviates most from the straight line finds the real bend
+        # regardless of whether the arm is straight or curved.
+        mesh_center_x = (bmin[0] + bmax[0]) / 2
+        for side, sign, elbow_name, shoulder_name, hand_name in [
+            ('left',  -1.0, 'joint_elbow_left',  'joint_shoulder_left',  'joint_hand_left'),
+            ('right',  1.0, 'joint_elbow_right', 'joint_shoulder_right', 'joint_hand_right'),
         ]:
-            if elbow_name in hint_map and shoulder_name in hint_map and hand_name in hint_map:
-                shoulder_y = hint_map[shoulder_name]['position_normalized']['y']
-                hand_y     = hint_map[hand_name]['position_normalized']['y']
-                mid_y      = (shoulder_y + hand_y) / 2
-                old_y      = hint_map[elbow_name]['position_normalized']['y']
-                hint_map[elbow_name]['position_normalized']['y'] = mid_y
-                log.info(f"  GeoCorrect {elbow_name} Y: {old_y:.3f}→{mid_y:.3f} "
-                         f"(midpoint of shoulder/hand)")
+            if not (elbow_name in hint_map and shoulder_name in hint_map and hand_name in hint_map):
+                continue
+            sp = hint_map[shoulder_name]['position_normalized']
+            hp = hint_map[hand_name]['position_normalized']
+            shoulder_world = np.array([bmin[0] + sp['x'] * brange[0],
+                                        bmin[1] + sp['y'] * brange[1]])
+            hand_world     = np.array([bmin[0] + hp['x'] * brange[0],
+                                        bmin[1] + hp['y'] * brange[1]])
+
+            y_lo, y_hi = sorted([shoulder_world[1], hand_world[1]])
+            n_bands = 24
+            band_edges = np.linspace(y_lo, y_hi, n_bands + 1)
+            samples = []
+            for i in range(n_bands):
+                band_verts = verts[(verts[:, 1] >= band_edges[i]) &
+                                    (verts[:, 1] < band_edges[i + 1])]
+                if len(band_verts) < 5:
+                    continue
+                # Outer edge of the arm's own side, away from the trunk —
+                # avoids picking a torso/armpit vertex as if it were arm.
+                outer = (band_verts[np.argmin(band_verts[:, 0])] if sign < 0
+                         else band_verts[np.argmax(band_verts[:, 0])])
+                if sign * (outer[0] - mesh_center_x) > 0:
+                    samples.append(outer[:2])
+
+            if not samples:
+                continue
+            samples = np.array(samples)
+            line_vec  = hand_world - shoulder_world
+            line_len2 = float(np.dot(line_vec, line_vec))
+            if line_len2 < 1e-9:
+                continue
+            t = np.clip(np.dot(samples - shoulder_world, line_vec) / line_len2, 0.0, 1.0)
+            proj  = shoulder_world[None, :] + t[:, None] * line_vec[None, :]
+            perp_dist = np.linalg.norm(samples - proj, axis=1)
+            bend_vert = samples[np.argmax(perp_dist)]
+
+            old_norm = dict(hint_map[elbow_name]['position_normalized'])
+            new_norm = {
+                'x': float(np.clip((bend_vert[0] - bmin[0]) / brange[0], 0.0, 1.0)),
+                'y': float(np.clip((bend_vert[1] - bmin[1]) / brange[1], 0.0, 1.0)),
+                'z': 0.5,
+            }
+            hint_map[elbow_name]['position_normalized'] = new_norm
+            log.info(f"  GeoCorrect {elbow_name}: {old_norm} → {new_norm} "
+                     f"(arm bend point, {perp_dist.max():.3f} off the "
+                     f"shoulder-hand line)")
 
         # Feet = bottommost vertices split left/right
         foot_verts = verts[verts[:, 1] < bmin[1] + 0.15 * brange[1]]
@@ -2343,6 +2427,56 @@ def infer_joints():
                         log.info(f"Detected pelvis_y from mesh profile: "
                                  f"{pelvis_y_detected:.3f} (width={pelvis_w:.3f})")
 
+                # Shoulder height = where each arm's own vertex cluster
+                # actually merges into the main body mass, scanned bottom-up.
+                # neck_y (used as shoulder_y's default/fallback above) is
+                # only a good proxy for shoulder height on a normal
+                # humanoid, where "narrow neck between wide shoulders and
+                # wide head" and "where the arms attach" happen to sit at
+                # about the same height. That assumption breaks for a body
+                # plan where a large head/crown mass sits on a short torso
+                # (e.g. broccoli) — the arms can attach much lower, near
+                # the waist/collar, well below where the neck-narrowing
+                # search (confined to y=0.55-0.92) ever looks. Tracing each
+                # arm's own cluster directly answers "where does this
+                # specific limb visually merge with the body" — the exact
+                # question the vision prompt already asks, done
+                # geometrically instead of trusting vision to trace it.
+                mesh_center_x = (bmin[0] + bmax[0]) / 2
+                n_bands = 48
+                GAP_FRAC_THRESHOLD = 0.12
+                for side, sign in [('left', -1.0), ('right', 1.0)]:
+                    merge_y = None
+                    for i in range(n_bands):
+                        y_lo = bmin[1] + (i / n_bands) * brange[1]
+                        y_hi = bmin[1] + ((i + 1) / n_bands) * brange[1]
+                        band_verts = verts[(verts[:, 1] >= y_lo) & (verts[:, 1] < y_hi)]
+                        if len(band_verts) < 10:
+                            continue
+                        xs = np.sort(band_verts[:, 0])
+                        total_span = xs[-1] - xs[0]
+                        if total_span <= 0:
+                            continue
+                        gaps = np.diff(xs)
+                        split_idx = np.where(gaps / total_span >= GAP_FRAC_THRESHOLD)[0]
+                        if len(split_idx) == 0:
+                            continue
+                        boundaries = [0] + (split_idx + 1).tolist() + [len(xs)]
+                        clusters = [xs[boundaries[j]:boundaries[j + 1]]
+                                    for j in range(len(boundaries) - 1)]
+                        has_arm_side = any(
+                            sign * ((c[0] + c[-1]) / 2 - mesh_center_x) > 0
+                            for c in clusters)
+                        has_trunk_side = any(
+                            sign * ((c[0] + c[-1]) / 2 - mesh_center_x) <= 0
+                            for c in clusters)
+                        if has_arm_side and has_trunk_side:
+                            merge_y = (i + 1) / n_bands  # top edge of last band still split
+                    if merge_y is not None:
+                        mesh_bounds[f'shoulder_y_detected_{side}'] = merge_y
+                        log.info(f"Detected shoulder_y ({side}) from arm/trunk "
+                                 f"merge: {merge_y:.3f}")
+
             except Exception as e:
                 log.warning(f"Could not extract mesh bounds: {e}")
                 mesh = None
@@ -2500,16 +2634,25 @@ def snap_joints_to_mesh(joints_data: dict, mesh) -> dict:
         is_shoulder = 'shoulder' in hint['name'].lower()
 
         if is_shoulder:
-            # Snap X and Y to arm attachment surface within Y band.
-            # Real shoulders sit near chest/neck height, not at the waist —
-            # the old 0.30-0.65 band excluded normal shoulder height
-            # entirely. neck_y (and shoulder_y = neck_y) is now measured per
-            # mesh in utils.py (mesh_bounds['neck_y_detected']) instead of a
-            # fixed 0.72-0.76, so a big-headed/short-body mesh can push neck
-            # well above 0.82 — the ceiling needs enough headroom to never
-            # exclude wherever neck_y actually landed for THIS mesh.
-            y_lo = bmin[1] + 0.45 * brange[1]
-            y_hi = bmin[1] + 0.92 * brange[1]
+            # Snap X and Y to arm attachment surface within a Y band
+            # centered on the CURRENT guess's own Y, not a fixed absolute
+            # range. A fixed range doesn't work: it used to be 0.30-0.65
+            # (excluded normal shoulder height on some meshes), then
+            # widened to 0.45-0.92 once shoulder_y started tracking
+            # neck_y (which can land above 0.82 for a big-headed/
+            # short-body mesh) — but shoulder_y can now ALSO land well
+            # BELOW 0.45 for a body plan where the arms attach near the
+            # waist/collar rather than the neck (e.g. a large head/crown
+            # mass on a short torso), which a fixed floor would exclude
+            # just as badly as the old ceiling did. Centering on the
+            # guess itself (already a real geometric estimate — see
+            # mesh_bounds['shoulder_y_detected_left/right'] in
+            # /infer_joints) means this step can only refine it against
+            # nearby real geometry, not drag it back to some fixed range.
+            guess_y = pos_norm.get('y', 0.5)
+            band_half = 0.20
+            y_lo = bmin[1] + max(0.0, guess_y - band_half) * brange[1]
+            y_hi = bmin[1] + min(1.0, guess_y + band_half) * brange[1]
             mask = (verts[:, 1] >= y_lo) & (verts[:, 1] <= y_hi)
             candidates = verts[mask]
 
