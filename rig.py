@@ -568,11 +568,33 @@ def build_segment_weights(mesh_obj, armature_obj, skeleton_joints_data):
     # over-excluding foot/knee (more central, so a tighter bound than
     # their own real position). Each bone's own X naturally scales the
     # right way in both directions.
+    #
+    # Arms and legs still need different fractions of that same idea. An
+    # arm chain only ever gets farther from center as it extends, so its
+    # tie-with-the-spine ambiguity is concentrated right at the shoulder
+    # itself -- pushing the fraction up (tighter exclusion) keeps cutting
+    # into that same remaining ambiguity without much further downside.
+    # A leg's own fraction has to stay conservative because a compact/
+    # wide body (the tomato) can have its knee and foot sit closer to
+    # center than the hip, and those are real, legitimate vertices, not
+    # ambiguity to exclude -- pushing the leg fraction up the same way
+    # reopened both a leg-coverage regression (tomato) and, independently,
+    # cut into genuine shoulder-adjacent mesh on the broccoli (its own
+    # inner boundary excluding real arm surface, not just the ambiguous
+    # leaf) once pushed as far as legs can tolerate. So: keep the
+    # conservative, broadly-verified fraction for hip/knee/foot, and use
+    # a more aggressive one for shoulder/elbow/hand specifically, since
+    # arms have no analogous "narrows back toward center" failure mode.
+    ARM_INNER_FRACTION = 0.9
+    LEG_INNER_FRACTION = 0.75
+    ARM_KEYWORDS = ('shoulder', 'elbow', 'hand', 'wing_base', 'wing_mid', 'wing_tip')
     chain_inner_bound_by_bone = {}
     for bi, (side, _side_margin) in chain_side_by_bone.items():
         head, tail = bone_segments[bi]
         bone_x = (head[SIDE_AXIS] + tail[SIDE_AXIS]) / 2
-        chain_inner_bound_by_bone[bi] = (side, abs(bone_x) * 0.75)
+        is_arm = any(k in bone_names_list[bi].lower() for k in ARM_KEYWORDS)
+        fraction = ARM_INNER_FRACTION if is_arm else LEG_INNER_FRACTION
+        chain_inner_bound_by_bone[bi] = (side, abs(bone_x) * fraction)
 
     effective_len_by_bone = {}
     for bi in range(len(bone_names_list)):
