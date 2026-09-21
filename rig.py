@@ -582,13 +582,39 @@ def build_segment_weights(mesh_obj, armature_obj, skeleton_joints_data):
     # bone specifically.
     SIGMA_FACTOR = 0.4
 
+    # Add the excess-above-ceiling (or excess-past-the-midline) as EXTRA
+    # distance, rather than hard-excluding with infinity. A hard cutoff
+    # creates a cliff exactly AT the boundary: a vertex a fraction of a
+    # millimeter below the ceiling can still blend across several leg
+    # bones (each near-equidistant, ~25% apiece), while its neighbor a
+    # fraction above drops to 0% leg weight outright, since every leg
+    # bone in the chain is excluded at once, all at the same threshold.
+    # That's a harder, more abrupt cliff than the one this whole approach
+    # was built to avoid -- confirmed visually as a jagged, serrated tear
+    # right at the hip/body boundary. Treating "how far past the
+    # boundary" as additional distance lets the Gaussian decay it away
+    # smoothly instead, the same way ordinary distance already decays
+    # everything else.
+    # The excess is added at a multiple of its own value, not 1:1 -- a
+    # flat 1x addition was too gentle to suppress anything on a character
+    # whose bones have a larger sigma relative to how far past the
+    # boundary a typical nearby vertex actually sits (the tomato): the
+    # excess ended up small relative to sigma, barely denting the
+    # Gaussian, so contamination came right back (confirmed: a whole
+    # neighborhood collapsed to a near-uniform blend across pelvis, hip,
+    # knee, and foot at once). Multiplying it up first makes the same
+    # physical distance past the boundary count for more in the decay,
+    # without reintroducing a hard, infinite-at-the-line cliff.
+    EXCESS_PENALTY = 5.0
     for bi, ceiling in chain_ceiling_by_bone.items():
-        seg_dists[verts[:, UP_AXIS] > ceiling, bi] = np.inf
+        excess = np.maximum(0.0, verts[:, UP_AXIS] - ceiling)
+        seg_dists[:, bi] += excess * EXCESS_PENALTY
     for bi, (side, side_margin) in chain_side_by_bone.items():
         if side > 0:
-            seg_dists[verts[:, SIDE_AXIS] < -side_margin, bi] = np.inf
+            excess = np.maximum(0.0, -side_margin - verts[:, SIDE_AXIS])
         else:
-            seg_dists[verts[:, SIDE_AXIS] > side_margin, bi] = np.inf
+            excess = np.maximum(0.0, verts[:, SIDE_AXIS] - side_margin)
+        seg_dists[:, bi] += excess * EXCESS_PENALTY
 
     nearest_dist = seg_dists.min(axis=1, keepdims=True)
     gap          = seg_dists - nearest_dist
