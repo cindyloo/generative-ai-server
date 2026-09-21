@@ -438,8 +438,9 @@ def build_segment_weights(mesh_obj, armature_obj, skeleton_joints_data):
     terminal_bone_indices = {i for i, name in enumerate(bone_names_list)
                               if name not in all_parent_names}
 
-    chain_length_by_bone = {}
-    chain_root_by_bone   = {}
+    chain_length_by_bone   = {}
+    chain_root_by_bone     = {}
+    chain_terminal_by_bone = {}
     for bi in limb_bone_indices:
         # Chain root: walk up while the parent is ALSO a limb bone --
         # stops at the first limb bone whose parent attaches to the main
@@ -460,7 +461,8 @@ def build_segment_weights(mesh_obj, armature_obj, skeleton_joints_data):
             if not children:
                 break
             cur = children[0]
-        chain_length_by_bone[bi] = total
+        chain_length_by_bone[bi]   = total
+        chain_terminal_by_bone[bi] = cur
 
     # A limb chain attaches to the body at its root (hip for a leg,
     # shoulder for an arm) and only ever extends outward/downward from
@@ -538,6 +540,40 @@ def build_segment_weights(mesh_obj, armature_obj, skeleton_joints_data):
         # else: this chain's root sits within its own pair's crossover
         # margin of the midline -- no side to restrict to.
 
+    # A limb's raw 3D distance to a vertex isn't just "distance to its own
+    # joint position" -- point_to_segment_distance measures to the
+    # CLOSEST point on the whole bone segment, and a spine bone's segment
+    # (pelvis reaching up toward spine, spine reaching up toward chest)
+    # extends toward the body's center too. That can make an arm chain
+    # genuinely tie with several spine bones in raw distance for a vertex
+    # sitting well medial of the arm itself -- confirmed on a real record:
+    # a broccoli's leaf, roughly half as far from center as the shoulder
+    # itself, came out ~27% each across shoulder_left, pelvis, AND spine,
+    # simultaneously. The side-exclusion above only stops a chain from
+    # reaching the OPPOSITE side; it says nothing about reaching too far
+    # in from its OWN side toward the centerline. So: a limb chain
+    # shouldn't claim a vertex closer to the midline than the chain's own
+    # attachment point already is -- if the vertex is more central than
+    # the shoulder itself, it isn't arm territory no matter how the raw
+    # segment distances happen to compare.
+    # Each bone gets a bound from its OWN position, not its chain root's --
+    # a chain doesn't necessarily get farther from center as it extends
+    # (the arm does: shoulder->elbow->hand each sit farther out, so using
+    # the root alone would have under-restricted hand, which is exactly
+    # what still tied with a static spine bone for the leaf's 4th weight
+    # slot), but a leg can narrow back in (the tomato's knee and foot sit
+    # CLOSER to center than its own hip). Using the root's X as a shared
+    # bound for the whole chain got both wrong at once: it under-excluded
+    # hand/elbow (farther out, so a looser bound than they need) while
+    # over-excluding foot/knee (more central, so a tighter bound than
+    # their own real position). Each bone's own X naturally scales the
+    # right way in both directions.
+    chain_inner_bound_by_bone = {}
+    for bi, (side, _side_margin) in chain_side_by_bone.items():
+        head, tail = bone_segments[bi]
+        bone_x = (head[SIDE_AXIS] + tail[SIDE_AXIS]) / 2
+        chain_inner_bound_by_bone[bi] = (side, abs(bone_x) * 0.75)
+
     effective_len_by_bone = {}
     for bi in range(len(bone_names_list)):
         head, tail = bone_segments[bi]
@@ -614,6 +650,15 @@ def build_segment_weights(mesh_obj, armature_obj, skeleton_joints_data):
             excess = np.maximum(0.0, -side_margin - verts[:, SIDE_AXIS])
         else:
             excess = np.maximum(0.0, verts[:, SIDE_AXIS] - side_margin)
+        seg_dists[:, bi] += excess * EXCESS_PENALTY
+    for bi, (side, inner_bound) in chain_inner_bound_by_bone.items():
+        # signed_x > inner_bound: comfortably out on this chain's own
+        # side, past its own attachment point -- no penalty. Anything
+        # less (including the wrong side entirely, already penalized
+        # above) gets an additional excess proportional to how far
+        # inside the boundary it sits.
+        signed_x = side * verts[:, SIDE_AXIS]
+        excess = np.maximum(0.0, inner_bound - signed_x)
         seg_dists[:, bi] += excess * EXCESS_PENALTY
 
     nearest_dist = seg_dists.min(axis=1, keepdims=True)
