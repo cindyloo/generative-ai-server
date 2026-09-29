@@ -1,0 +1,476 @@
+{
+  "classify_id": "60964d1d",
+  "mesh_sha256": "c3418f7dcefac4d4",
+  "classify": {
+    "object_type": "sad tomato character with body and legs",
+    "category": "other",
+    "rig_type": "biped",
+    "style": "photograph of real tomato with marker-drawn sad face, glossy surface, amateur drawing on organic object",
+    "rigid_parts": [],
+    "needs_augmentation": true,
+    "augment_prompt": "Keep the exact same sad tomato character appearance with marker-drawn sad face, glossy red-orange surface, and double-lobed top. Repose standing upright facing forward with two stubby legs spread slightly apart and visible below the body, arms or small stubs extended outward if present, full body visible against plain background.",
+    "created_at": "2026-09-17T15:10:34+00:00"
+  },
+  "joints": {
+    "joint_hints": [
+      {
+        "name": "joint_root",
+        "body_part": "torso",
+        "deforms_mesh": false,
+        "position_normalized": {
+          "x": 0.5,
+          "y": 0.15833098840860127,
+          "z": 0.5
+        },
+        "animations": [
+          {
+            "clip": "idle",
+            "property": "location",
+            "axis": "y",
+            "keyframes": [
+              [
+                1,
+                0.0
+              ],
+              [
+                23,
+                0.012
+              ],
+              [
+                45,
+                0.0
+              ],
+              [
+                68,
+                -0.012
+              ],
+              [
+                90,
+                0.0
+              ]
+            ],
+            "loop": true
+          }
+        ]
+      },
+      {
+        "name": "joint_pelvis",
+        "body_part": "pelvis",
+        "deforms_mesh": false,
+        "position_normalized": {
+          "x": 0.5002788293235524,
+          "y": 0.15833098840860127,
+          "z": 0.5
+        },
+        "animations": [
+          {
+            "clip": "idle",
+            "property": "location",
+            "axis": "y",
+            "keyframes": [
+              [
+                1,
+                0.0
+              ],
+              [
+                23,
+                0.012
+              ],
+              [
+                45,
+                0.0
+              ],
+              [
+                68,
+                -0.012
+              ],
+              [
+                90,
+                0.0
+              ]
+            ],
+            "loop": true
+          }
+        ]
+      },
+      {
+        "name": "joint_spine",
+        "body_part": "spine",
+        "deforms_mesh": false,
+        "position_normalized": {
+          "x": 0.5,
+          "y": 0.52,
+          "z": 0.5
+        },
+        "animations": []
+      },
+      {
+        "name": "joint_chest",
+        "body_part": "chest",
+        "deforms_mesh": false,
+        "position_normalized": {
+          "x": 0.5,
+          "y": 0.62,
+          "z": 0.5
+        },
+        "animations": []
+      },
+      {
+        "name": "joint_neck",
+        "body_part": "neck",
+        "deforms_mesh": false,
+        "position_normalized": {
+          "x": 0.5,
+          "y": 0.72,
+          "z": 0.5
+        },
+        "animations": []
+      },
+      {
+        "name": "joint_head",
+        "body_part": "head",
+        "deforms_mesh": false,
+        "position_normalized": {
+          "x": 0.5,
+          "y": 0.88,
+          "z": 0.5
+        },
+        "animations": [
+          {
+            "clip": "idle",
+            "property": "rotation_euler",
+            "axis": "x",
+            "keyframes": [
+              [
+                1,
+                0.0
+              ],
+              [
+                23,
+                0.04
+              ],
+              [
+                45,
+                0.0
+              ],
+              [
+                68,
+                -0.04
+              ],
+              [
+                90,
+                0.0
+              ]
+            ],
+            "loop": true
+          }
+        ]
+      },
+      {
+        "name": "joint_hip_left",
+        "body_part": "hip",
+        "deforms_mesh": true,
+        "position_normalized": {
+          "x": 0.28816700387025146,
+          "y": 0.16174591474683736,
+          "z": 0.5
+        },
+        "animations": [
+          {
+            "clip": "walk",
+            "property": "rotation_euler",
+            "axis": "x",
+            "keyframes": [
+              [
+                1,
+                0.0
+              ],
+              [
+                15,
+                0.675
+              ],
+              [
+                30,
+                0.0
+              ],
+              [
+                45,
+                -0.675
+              ],
+              [
+                60,
+                0.0
+              ]
+            ],
+            "loop": true
+          }
+        ]
+      },
+      {
+        "name": "joint_hip_right",
+        "body_part": "hip",
+        "deforms_mesh": true,
+        "position_normalized": {
+          "x": 0.7068504059530278,
+          "y": 0.15491606207036518,
+          "z": 0.5
+        },
+        "animations": [
+          {
+            "clip": "walk",
+            "property": "rotation_euler",
+            "axis": "x",
+            "keyframes": [
+              [
+                1,
+                0.0
+              ],
+              [
+                15,
+                -0.675
+              ],
+              [
+                30,
+                0.0
+              ],
+              [
+                45,
+                0.675
+              ],
+              [
+                60,
+                0.0
+              ]
+            ],
+            "loop": true
+          }
+        ]
+      },
+      {
+        "name": "joint_knee_left",
+        "body_part": "leg",
+        "deforms_mesh": true,
+        "position_normalized": {
+          "x": 0.35,
+          "y": 0.09,
+          "z": 0.5
+        },
+        "animations": [
+          {
+            "clip": "walk",
+            "property": "rotation_euler",
+            "axis": "x",
+            "keyframes": [
+              [
+                1,
+                0.0
+              ],
+              [
+                15,
+                0.0
+              ],
+              [
+                30,
+                0.0
+              ],
+              [
+                45,
+                0.0
+              ],
+              [
+                50,
+                0.54
+              ],
+              [
+                55,
+                0.9
+              ],
+              [
+                60,
+                0.0
+              ]
+            ],
+            "loop": true
+          }
+        ]
+      },
+      {
+        "name": "joint_knee_right",
+        "body_part": "leg",
+        "deforms_mesh": true,
+        "position_normalized": {
+          "x": 0.65,
+          "y": 0.09,
+          "z": 0.5
+        },
+        "animations": [
+          {
+            "clip": "walk",
+            "property": "rotation_euler",
+            "axis": "x",
+            "keyframes": [
+              [
+                1,
+                0.0
+              ],
+              [
+                15,
+                0.0
+              ],
+              [
+                20,
+                0.54
+              ],
+              [
+                25,
+                0.9
+              ],
+              [
+                30,
+                0.0
+              ],
+              [
+                45,
+                0.0
+              ],
+              [
+                60,
+                0.0
+              ]
+            ],
+            "loop": true
+          }
+        ]
+      },
+      {
+        "name": "joint_foot_left",
+        "body_part": "foot",
+        "deforms_mesh": true,
+        "position_normalized": {
+          "x": 0.35,
+          "y": 0.07117125233693683,
+          "z": 0.5
+        },
+        "animations": [
+          {
+            "clip": "walk",
+            "property": "rotation_euler",
+            "axis": "x",
+            "keyframes": [
+              [
+                1,
+                0.0
+              ],
+              [
+                15,
+                0.2
+              ],
+              [
+                30,
+                0.0
+              ],
+              [
+                45,
+                -0.2
+              ],
+              [
+                60,
+                0.0
+              ]
+            ],
+            "loop": true
+          }
+        ]
+      },
+      {
+        "name": "joint_foot_right",
+        "body_part": "foot",
+        "deforms_mesh": true,
+        "position_normalized": {
+          "x": 0.65,
+          "y": 0.07333917071866239,
+          "z": 0.5
+        },
+        "animations": [
+          {
+            "clip": "walk",
+            "property": "rotation_euler",
+            "axis": "x",
+            "keyframes": [
+              [
+                1,
+                0.0
+              ],
+              [
+                15,
+                -0.2
+              ],
+              [
+                30,
+                0.0
+              ],
+              [
+                45,
+                0.2
+              ],
+              [
+                60,
+                0.0
+              ]
+            ],
+            "loop": true
+          }
+        ]
+      }
+    ],
+    "skeleton": [
+      {
+        "parent": "joint_root",
+        "child": "joint_pelvis"
+      },
+      {
+        "parent": "joint_pelvis",
+        "child": "joint_spine"
+      },
+      {
+        "parent": "joint_spine",
+        "child": "joint_chest"
+      },
+      {
+        "parent": "joint_chest",
+        "child": "joint_neck"
+      },
+      {
+        "parent": "joint_neck",
+        "child": "joint_head"
+      },
+      {
+        "parent": "joint_pelvis",
+        "child": "joint_hip_left"
+      },
+      {
+        "parent": "joint_pelvis",
+        "child": "joint_hip_right"
+      },
+      {
+        "parent": "joint_hip_left",
+        "child": "joint_knee_left"
+      },
+      {
+        "parent": "joint_hip_right",
+        "child": "joint_knee_right"
+      },
+      {
+        "parent": "joint_knee_left",
+        "child": "joint_foot_left"
+      },
+      {
+        "parent": "joint_knee_right",
+        "child": "joint_foot_right"
+      }
+    ],
+    "suggested_joints": 12,
+    "model_used": "claude",
+    "created_at": "2026-09-19T01:50:27+00:00"
+  }
+}
