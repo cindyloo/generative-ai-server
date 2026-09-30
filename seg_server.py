@@ -1674,6 +1674,39 @@ def run_vehicle_pipeline(classify_id: str, glb_path: str,
 # Rig pipeline (Blender only — mesh comes from /mesh)
 # ══════════════════════════════════════════════════════════════════════════════
 
+def skeleton_from_joints(joints_data: dict, glb_path: str,
+                         rigid_parts: list) -> dict | None:
+    """
+    Build the skeleton dict rig.py consumes from stored joint hints, mapped
+    onto the mesh at glb_path. Returns None if no joint had a usable
+    position_normalized.
+    """
+    joints, hierarchy, hint_objects = joints_from_model(joints_data, glb_path)
+    if not joints:
+        return None
+
+    def _hint_name(h, i):
+        return h.get('name', f'joint_{i}') if isinstance(h, dict) else f'joint_{i}'
+
+    return {
+        'joints': [
+            {'id': i,
+             'name': _hint_name(hint_objects[i], i),
+             'position': list(joints[i]),
+             'hint': hint_objects[i]}
+            for i in range(len(joints))
+        ],
+        'bones': [
+            {'parent': p, 'child': c,
+             'name': (f"{_hint_name(hint_objects[p], p)}"
+                      f"_to_{_hint_name(hint_objects[c], c)}")}
+            for p, c in hierarchy
+            if p < len(hint_objects) and c < len(hint_objects)
+        ],
+        'rigid_parts': rigid_parts,
+    }
+
+
 def run_rig_pipeline(task_id: str, classify_id: str, user_id: str, host: str):
     """
     Runs Blender rigging using mesh and joints already stored for classify_id.
@@ -1758,32 +1791,8 @@ def run_rig_pipeline(task_id: str, classify_id: str, user_id: str, host: str):
                 # Do NOT call run_skeleton_inference here — that runs geometric
                 # inference which writes its own 4-joint skeleton JSON and
                 # overwrites the vision model's joints before we can use them.
-                joints, hierarchy, hint_objects = joints_from_model(
-                    joints_data, active_glb
-                )
-
-                def _hint_name(h, i):
-                    return h.get('name', f'joint_{i}') if isinstance(h, dict) else f'joint_{i}'
-
-                if joints:
-                    skel = {
-                        'joints': [
-                            {'id': i,
-                             'name': _hint_name(hint_objects[i], i),
-                             'position': list(joints[i]),
-                             'hint': hint_objects[i]}
-                            for i in range(len(joints))
-                        ],
-                        'bones': [
-                            {'parent': p, 'child': c,
-                             'name': (f"{_hint_name(hint_objects[p], p)}"
-                                      f"_to_{_hint_name(hint_objects[c], c)}")}
-                            for p, c in hierarchy
-                            if p < len(hint_objects) and c < len(hint_objects)
-                        ],
-                        'rigid_parts': rigid_parts,
-                    }
-                else:
+                skel = skeleton_from_joints(joints_data, active_glb, rigid_parts)
+                if skel is None:
                     # position_normalized was missing/malformed — fall back to
                     # geometric inference as a last resort
                     log.warning("joints_from_model returned no positions — "
@@ -2234,6 +2243,173 @@ def augment_image_confirm():
 
 # ── /infer_joints ─────────────────────────────────────────────────────────────
 
+def compute_mesh_bounds(mesh) -> dict:
+    """
+    Measure the mesh's bounding box plus the geometric landmarks the
+    joint pipeline relies on (trunk width, neck/pelvis narrowing,
+    per-side arm/trunk merge height). Pure geometry, no vision model,
+    so it's deterministic for a given mesh (see regression/).
+    """
+    verts  = np.array(mesh.vertices)
+    bmin   = verts.min(axis=0)
+    bmax   = verts.max(axis=0)
+    brange = bmax - bmin
+    # Meshy exports Y-up. x=left/right, y=bottom/top, z=front/back.
+    # The y axis should be the tallest — log all three so we can
+    # spot if the mesh has an unexpected up-axis.
+    mesh_bounds = {
+        'width':  float(brange[0]),   # x: left→right
+        'height': float(brange[1]),   # y: bottom→top (up)
+        'depth':  float(brange[2]),   # z: front→back
+        'bmin':   bmin.tolist(),
+        'bmax':   bmax.tolist(),
+    }
+    tallest = max(enumerate(brange), key=lambda t: t[1])
+    axis_names = ['x', 'y', 'z']
+    if tallest[0] != 1:
+        log.warning(f"Mesh up-axis may not be Y: tallest axis is "
+                    f"{axis_names[tallest[0]]} ({tallest[1]:.3f}), "
+                    f"y={brange[1]:.3f}")
+    log.info(f"Mesh bounds: x={brange[0]:.3f} y={brange[1]:.3f} "
+             f"z={brange[2]:.3f} (tallest={axis_names[tallest[0]]})")
+
+    # Trunk width at waist/lower-chest height — reliably below
+    # where arms reach in a T-pose, but an A-pose's arm angles
+    # down through this region too. See _measure_trunk_x_edges
+    # for how arm-crossing contamination is filtered out via
+    # gap detection across multiple height bands, rather than a
+    # fixed width assumption (which would misfire on a body
+    # shape with no slim waist at all, e.g. a round/tomato-like
+    # character).
+    trunk_edges = _measure_trunk_x_edges(verts, bmin, bmax, brange)
+    if trunk_edges is not None:
+        trunk_x_left  = float((trunk_edges[0] - bmin[0]) / brange[0])
+        trunk_x_right = float((trunk_edges[1] - bmin[0]) / brange[0])
+        mesh_bounds['trunk_x_left']  = trunk_x_left
+        mesh_bounds['trunk_x_right'] = trunk_x_right
+        log.info(f"Trunk width at waist height: x=[{trunk_x_left:.3f}, "
+                 f"{trunk_x_right:.3f}]")
+
+    # Neck height = local minimum of the cross-sectional width
+    # profile between shoulders (wide) and head (wide again) —
+    # a real geometric landmark, unlike a fixed fraction of
+    # total height. Head-to-body ratio varies a lot per mesh
+    # (e.g. a chibi/big-head character vs. adult proportions),
+    # so a single fixed neck_y is wrong for one or the other.
+    # Not attempted for the pelvis/waist the same way — an
+    # A-pose arm passes through that height range and
+    # contaminates the profile (same failure mode as the old
+    # trunk-width measurement above).
+    n_slices = 60
+    width_profile = []
+    for i in range(n_slices):
+        y_lo = bmin[1] + (i / n_slices) * brange[1]
+        y_hi = bmin[1] + ((i + 1) / n_slices) * brange[1]
+        sv = verts[(verts[:, 1] >= y_lo) & (verts[:, 1] < y_hi)]
+        if len(sv) > 5:
+            w = float((sv[:, 0].max() - sv[:, 0].min()) / brange[0])
+            width_profile.append((i / n_slices + 0.5 / n_slices, w))
+
+    neck_candidates = [(y, w) for y, w in width_profile if 0.55 <= y <= 0.92]
+    if neck_candidates:
+        neck_y_detected, neck_w = min(neck_candidates, key=lambda t: t[1])
+        boundary_w = max(
+            neck_candidates[0][1], neck_candidates[-1][1]
+        )
+        # Require a genuine narrowing, not just the edge of the
+        # search window (which would mean no real minimum exists).
+        if boundary_w > 0 and neck_w < 0.7 * boundary_w:
+            mesh_bounds['neck_y_detected'] = neck_y_detected
+            log.info(f"Detected neck_y from mesh profile: "
+                     f"{neck_y_detected:.3f} (width={neck_w:.3f})")
+
+    # Pelvis/hip height = same local-minimum technique, applied to
+    # the LOWER body — the waist narrowing between the legs and
+    # the main body mass. A fixed pelvis_y (e.g. 0.42) assumes
+    # legs take up a "normal" fraction of total height; for a
+    # squatty character with very short legs relative to a large
+    # round body, the real waist sits much lower, and hip was
+    # otherwise left entirely to Claude's own guess (see
+    # snap_joints_to_mesh, which only ever snapped hip X).
+    #
+    # Computed for ALL rig types now (not just biped) — a real
+    # A-pose humanoid (aaf17890) confirmed an arm can pass
+    # through this height range and mildly contaminate the
+    # profile, but the resulting candidate still differs from
+    # that character's fixed default by only ~0.1, well under
+    # the ~0.27 seen on a genuinely broken case (broccoli) —
+    # see verify_and_snap_joints's magnitude-gated override,
+    # which uses that gap to apply this value only when it's
+    # clearly needed, not on borderline/already-fine cases.
+    # This mesh_bounds value itself is still only injected into
+    # the PROMPT as an authoritative override for biped (see
+    # _build_joints_prompt) — this broader computation exists so
+    # the code-side safety net has a value to check against
+    # regardless of rig_type.
+    pelvis_candidates = [(y, w) for y, w in width_profile if 0.05 <= y <= 0.35]
+    if pelvis_candidates:
+        pelvis_y_detected, pelvis_w = min(pelvis_candidates, key=lambda t: t[1])
+        boundary_w = max(
+            pelvis_candidates[0][1], pelvis_candidates[-1][1]
+        )
+        if boundary_w > 0 and pelvis_w < 0.85 * boundary_w:
+            mesh_bounds['pelvis_y_detected'] = pelvis_y_detected
+            log.info(f"Detected pelvis_y from mesh profile: "
+                     f"{pelvis_y_detected:.3f} (width={pelvis_w:.3f})")
+
+    # Shoulder height = where each arm's own vertex cluster
+    # actually merges into the main body mass, scanned bottom-up.
+    # neck_y (used as shoulder_y's default/fallback above) is
+    # only a good proxy for shoulder height on a normal
+    # humanoid, where "narrow neck between wide shoulders and
+    # wide head" and "where the arms attach" happen to sit at
+    # about the same height. That assumption breaks for a body
+    # plan where a large head/crown mass sits on a short torso
+    # (e.g. broccoli) — the arms can attach much lower, near
+    # the waist/collar, well below where the neck-narrowing
+    # search (confined to y=0.55-0.92) ever looks. Tracing each
+    # arm's own cluster directly answers "where does this
+    # specific limb visually merge with the body" — the exact
+    # question the vision prompt already asks, done
+    # geometrically instead of trusting vision to trace it.
+    mesh_center_x = (bmin[0] + bmax[0]) / 2
+    n_bands = 48
+    GAP_FRAC_THRESHOLD = 0.12
+    for side, sign in [('left', -1.0), ('right', 1.0)]:
+        merge_y = None
+        for i in range(n_bands):
+            y_lo = bmin[1] + (i / n_bands) * brange[1]
+            y_hi = bmin[1] + ((i + 1) / n_bands) * brange[1]
+            band_verts = verts[(verts[:, 1] >= y_lo) & (verts[:, 1] < y_hi)]
+            if len(band_verts) < 10:
+                continue
+            xs = np.sort(band_verts[:, 0])
+            total_span = xs[-1] - xs[0]
+            if total_span <= 0:
+                continue
+            gaps = np.diff(xs)
+            split_idx = np.where(gaps / total_span >= GAP_FRAC_THRESHOLD)[0]
+            if len(split_idx) == 0:
+                continue
+            boundaries = [0] + (split_idx + 1).tolist() + [len(xs)]
+            clusters = [xs[boundaries[j]:boundaries[j + 1]]
+                        for j in range(len(boundaries) - 1)]
+            has_arm_side = any(
+                sign * ((c[0] + c[-1]) / 2 - mesh_center_x) > 0
+                for c in clusters)
+            has_trunk_side = any(
+                sign * ((c[0] + c[-1]) / 2 - mesh_center_x) <= 0
+                for c in clusters)
+            if has_arm_side and has_trunk_side:
+                merge_y = (i + 1) / n_bands  # top edge of last band still split
+        if merge_y is not None:
+            mesh_bounds[f'shoulder_y_detected_{side}'] = merge_y
+            log.info(f"Detected shoulder_y ({side}) from arm/trunk "
+                     f"merge: {merge_y:.3f}")
+
+    return mesh_bounds
+
+
 @app.route('/infer_joints', methods=['GET', 'POST'])
 def infer_joints():
     """
@@ -2320,162 +2496,7 @@ def infer_joints():
             try:
                 import trimesh
                 mesh   = trimesh.load(glb_path, force='mesh')
-                verts  = np.array(mesh.vertices)
-                bmin   = verts.min(axis=0)
-                bmax   = verts.max(axis=0)
-                brange = bmax - bmin
-                # Meshy exports Y-up. x=left/right, y=bottom/top, z=front/back.
-                # The y axis should be the tallest — log all three so we can
-                # spot if the mesh has an unexpected up-axis.
-                mesh_bounds = {
-                    'width':  float(brange[0]),   # x: left→right
-                    'height': float(brange[1]),   # y: bottom→top (up)
-                    'depth':  float(brange[2]),   # z: front→back
-                    'bmin':   bmin.tolist(),
-                    'bmax':   bmax.tolist(),
-                }
-                tallest = max(enumerate(brange), key=lambda t: t[1])
-                axis_names = ['x', 'y', 'z']
-                if tallest[0] != 1:
-                    log.warning(f"Mesh up-axis may not be Y: tallest axis is "
-                                f"{axis_names[tallest[0]]} ({tallest[1]:.3f}), "
-                                f"y={brange[1]:.3f}")
-                log.info(f"Mesh bounds: x={brange[0]:.3f} y={brange[1]:.3f} "
-                         f"z={brange[2]:.3f} (tallest={axis_names[tallest[0]]})")
-
-                # Trunk width at waist/lower-chest height — reliably below
-                # where arms reach in a T-pose, but an A-pose's arm angles
-                # down through this region too. See _measure_trunk_x_edges
-                # for how arm-crossing contamination is filtered out via
-                # gap detection across multiple height bands, rather than a
-                # fixed width assumption (which would misfire on a body
-                # shape with no slim waist at all, e.g. a round/tomato-like
-                # character).
-                trunk_edges = _measure_trunk_x_edges(verts, bmin, bmax, brange)
-                if trunk_edges is not None:
-                    trunk_x_left  = float((trunk_edges[0] - bmin[0]) / brange[0])
-                    trunk_x_right = float((trunk_edges[1] - bmin[0]) / brange[0])
-                    mesh_bounds['trunk_x_left']  = trunk_x_left
-                    mesh_bounds['trunk_x_right'] = trunk_x_right
-                    log.info(f"Trunk width at waist height: x=[{trunk_x_left:.3f}, "
-                             f"{trunk_x_right:.3f}]")
-
-                # Neck height = local minimum of the cross-sectional width
-                # profile between shoulders (wide) and head (wide again) —
-                # a real geometric landmark, unlike a fixed fraction of
-                # total height. Head-to-body ratio varies a lot per mesh
-                # (e.g. a chibi/big-head character vs. adult proportions),
-                # so a single fixed neck_y is wrong for one or the other.
-                # Not attempted for the pelvis/waist the same way — an
-                # A-pose arm passes through that height range and
-                # contaminates the profile (same failure mode as the old
-                # trunk-width measurement above).
-                n_slices = 60
-                width_profile = []
-                for i in range(n_slices):
-                    y_lo = bmin[1] + (i / n_slices) * brange[1]
-                    y_hi = bmin[1] + ((i + 1) / n_slices) * brange[1]
-                    sv = verts[(verts[:, 1] >= y_lo) & (verts[:, 1] < y_hi)]
-                    if len(sv) > 5:
-                        w = float((sv[:, 0].max() - sv[:, 0].min()) / brange[0])
-                        width_profile.append((i / n_slices + 0.5 / n_slices, w))
-
-                neck_candidates = [(y, w) for y, w in width_profile if 0.55 <= y <= 0.92]
-                if neck_candidates:
-                    neck_y_detected, neck_w = min(neck_candidates, key=lambda t: t[1])
-                    boundary_w = max(
-                        neck_candidates[0][1], neck_candidates[-1][1]
-                    )
-                    # Require a genuine narrowing, not just the edge of the
-                    # search window (which would mean no real minimum exists).
-                    if boundary_w > 0 and neck_w < 0.7 * boundary_w:
-                        mesh_bounds['neck_y_detected'] = neck_y_detected
-                        log.info(f"Detected neck_y from mesh profile: "
-                                 f"{neck_y_detected:.3f} (width={neck_w:.3f})")
-
-                # Pelvis/hip height = same local-minimum technique, applied to
-                # the LOWER body — the waist narrowing between the legs and
-                # the main body mass. A fixed pelvis_y (e.g. 0.42) assumes
-                # legs take up a "normal" fraction of total height; for a
-                # squatty character with very short legs relative to a large
-                # round body, the real waist sits much lower, and hip was
-                # otherwise left entirely to Claude's own guess (see
-                # snap_joints_to_mesh, which only ever snapped hip X).
-                #
-                # Computed for ALL rig types now (not just biped) — a real
-                # A-pose humanoid (aaf17890) confirmed an arm can pass
-                # through this height range and mildly contaminate the
-                # profile, but the resulting candidate still differs from
-                # that character's fixed default by only ~0.1, well under
-                # the ~0.27 seen on a genuinely broken case (broccoli) —
-                # see verify_and_snap_joints's magnitude-gated override,
-                # which uses that gap to apply this value only when it's
-                # clearly needed, not on borderline/already-fine cases.
-                # This mesh_bounds value itself is still only injected into
-                # the PROMPT as an authoritative override for biped (see
-                # _build_joints_prompt) — this broader computation exists so
-                # the code-side safety net has a value to check against
-                # regardless of rig_type.
-                pelvis_candidates = [(y, w) for y, w in width_profile if 0.05 <= y <= 0.35]
-                if pelvis_candidates:
-                    pelvis_y_detected, pelvis_w = min(pelvis_candidates, key=lambda t: t[1])
-                    boundary_w = max(
-                        pelvis_candidates[0][1], pelvis_candidates[-1][1]
-                    )
-                    if boundary_w > 0 and pelvis_w < 0.85 * boundary_w:
-                        mesh_bounds['pelvis_y_detected'] = pelvis_y_detected
-                        log.info(f"Detected pelvis_y from mesh profile: "
-                                 f"{pelvis_y_detected:.3f} (width={pelvis_w:.3f})")
-
-                # Shoulder height = where each arm's own vertex cluster
-                # actually merges into the main body mass, scanned bottom-up.
-                # neck_y (used as shoulder_y's default/fallback above) is
-                # only a good proxy for shoulder height on a normal
-                # humanoid, where "narrow neck between wide shoulders and
-                # wide head" and "where the arms attach" happen to sit at
-                # about the same height. That assumption breaks for a body
-                # plan where a large head/crown mass sits on a short torso
-                # (e.g. broccoli) — the arms can attach much lower, near
-                # the waist/collar, well below where the neck-narrowing
-                # search (confined to y=0.55-0.92) ever looks. Tracing each
-                # arm's own cluster directly answers "where does this
-                # specific limb visually merge with the body" — the exact
-                # question the vision prompt already asks, done
-                # geometrically instead of trusting vision to trace it.
-                mesh_center_x = (bmin[0] + bmax[0]) / 2
-                n_bands = 48
-                GAP_FRAC_THRESHOLD = 0.12
-                for side, sign in [('left', -1.0), ('right', 1.0)]:
-                    merge_y = None
-                    for i in range(n_bands):
-                        y_lo = bmin[1] + (i / n_bands) * brange[1]
-                        y_hi = bmin[1] + ((i + 1) / n_bands) * brange[1]
-                        band_verts = verts[(verts[:, 1] >= y_lo) & (verts[:, 1] < y_hi)]
-                        if len(band_verts) < 10:
-                            continue
-                        xs = np.sort(band_verts[:, 0])
-                        total_span = xs[-1] - xs[0]
-                        if total_span <= 0:
-                            continue
-                        gaps = np.diff(xs)
-                        split_idx = np.where(gaps / total_span >= GAP_FRAC_THRESHOLD)[0]
-                        if len(split_idx) == 0:
-                            continue
-                        boundaries = [0] + (split_idx + 1).tolist() + [len(xs)]
-                        clusters = [xs[boundaries[j]:boundaries[j + 1]]
-                                    for j in range(len(boundaries) - 1)]
-                        has_arm_side = any(
-                            sign * ((c[0] + c[-1]) / 2 - mesh_center_x) > 0
-                            for c in clusters)
-                        has_trunk_side = any(
-                            sign * ((c[0] + c[-1]) / 2 - mesh_center_x) <= 0
-                            for c in clusters)
-                        if has_arm_side and has_trunk_side:
-                            merge_y = (i + 1) / n_bands  # top edge of last band still split
-                    if merge_y is not None:
-                        mesh_bounds[f'shoulder_y_detected_{side}'] = merge_y
-                        log.info(f"Detected shoulder_y ({side}) from arm/trunk "
-                                 f"merge: {merge_y:.3f}")
+                mesh_bounds = compute_mesh_bounds(mesh)
 
             except Exception as e:
                 log.warning(f"Could not extract mesh bounds: {e}")
