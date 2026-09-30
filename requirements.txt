@@ -5,7 +5,7 @@ Werkzeug==3.1.7
 
 # Image Processing
 Pillow==12.1.1
-rembg==2.0.74
+rembg[gpu]==2.0.74
 
 # HTTP & APIs
 requests==2.33.1
