@@ -81,7 +81,8 @@ def infer_skeleton_geometric(mesh_path: str, n_joints: int = None) -> tuple:
     print(f"Mesh: {len(mesh.vertices)} vertices, {len(mesh.faces)} faces")
 
     n_samples         = min(10000, len(mesh.vertices) * 3)
-    surface_points, _ = trimesh.sample.sample_surface(mesh, n_samples)
+    # Fixed seeds keep the fallback deterministic: same mesh → same joints.
+    surface_points, _ = trimesh.sample.sample_surface(mesh, n_samples, seed=0)
 
     tree      = cKDTree(surface_points)
     k         = min(20, len(surface_points) - 1)
@@ -98,7 +99,7 @@ def infer_skeleton_geometric(mesh_path: str, n_joints: int = None) -> tuple:
         print(f"Auto joint count: {n_joints} (aspect {aspect:.2f})")
 
     n_joints  = min(n_joints, len(skeleton_candidates))
-    centroids, _ = kmeans(skeleton_candidates.astype(np.float64), n_joints)
+    centroids, _ = kmeans(skeleton_candidates.astype(np.float64), n_joints, rng=0)
     joints    = [tuple(c) for c in centroids]
 
     n = len(joints)
