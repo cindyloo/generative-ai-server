@@ -155,6 +155,108 @@ def taubin_pivot(verts_3d, hint_x=None):
     return pivot, np.array([0.0, 0.0, 1.0]), radius, half_thick
 
 
+# ── Geometric wheel measurement (car/truck) ──────────────────────────────────
+# The Taubin fit above runs on a colour cluster cropped around the Gemini hint,
+# so it is pulled toward the hint and picks up fender / frame verts: the centre
+# lands off the tyre and the hint's axle position ± half_thick reaches into the
+# chassis. refine_wheel re-measures each wheel from the mesh itself:
+#   1. outer face  = outermost verts near the wheel along the axle (trimesh Z)
+#   2. centre + R  = in the outer slab (chassis sits further inboard), grid-search
+#                    the centre whose fully-covered annulus reaches furthest out —
+#                    from the true centre every circle up to the tyre edge is
+#                    complete, from a centre off by d only up to R - d
+#   3. inner face  = walk inward while the tread band still forms a full ring;
+#                    chassis parts inside the wheel arch never do
+N_ANGLE_BINS = 36
+
+
+def _shell_coverage(pts_xy, centre, shell_w, n_shells):
+    """Fraction of angular bins occupied, per radial shell of width shell_w."""
+    d     = pts_xy - centre
+    shell = (np.hypot(d[:, 0], d[:, 1]) / shell_w).astype(int)
+    abin  = ((np.arctan2(d[:, 1], d[:, 0]) + np.pi) / (2 * np.pi)
+             * N_ANGLE_BINS).astype(int) % N_ANGLE_BINS
+    keep  = shell < n_shells
+    occ   = np.zeros((n_shells, N_ANGLE_BINS), dtype=bool)
+    occ[shell[keep], abin[keep]] = True
+    return occ.mean(axis=1)
+
+
+def _full_radius(cov, shell_w, band_shells, thr):
+    """Outer edge of the outermost run of band_shells consecutive shells with cov >= thr."""
+    run, best = 0, 0.0
+    for i, ok in enumerate(cov >= thr):
+        run = run + 1 if ok else 0
+        if run >= band_shells:
+            best = (i + 1) * shell_w
+    return best
+
+
+def fit_wheel_face(pts_xy, centre0, r0, thr=0.8):
+    """Coarse-then-fine grid search for the centre with the widest full annulus."""
+    shell_w  = 0.04 * r0
+    n_shells = int(1.6 * r0 / shell_w)
+    best_r, best_c = -1.0, np.asarray(centre0, dtype=float)
+    for span, step in ((0.5 * r0, 0.05 * r0), (0.06 * r0, 0.01 * r0)):
+        c0   = best_c
+        offs = np.arange(-span, span + 1e-12, step)
+        for dx in offs:
+            for dy in offs:
+                c = c0 + (dx, dy)
+                r = _full_radius(_shell_coverage(pts_xy, c, shell_w, n_shells),
+                                 shell_w, band_shells=4, thr=thr)
+                if r > best_r:
+                    best_r, best_c = r, c
+    return best_c, best_r
+
+
+def refine_wheel(centre_xy, r0, side, min_cov=0.6):
+    """
+    Measure one wheel from geometry. side = +1/-1 selects which end of the
+    axle (trimesh Z) the wheel is on. Returns (dict, None) on success or
+    (None, reason) when no tyre is found near the hint.
+    """
+    centre_xy = np.asarray(centre_xy, dtype=float)
+    o    = positions[:, 2] * side                     # + = outward along axle
+    rad0 = np.hypot(positions[:, 0] - centre_xy[0], positions[:, 1] - centre_xy[1])
+    near = (rad0 < 1.5 * r0) & (o > 0)
+    if near.sum() < 50:
+        return None, "no geometry near hint"
+
+    outer = float(np.percentile(o[near], 99.5))
+    slab  = near & (o > outer - 0.4 * r0)
+    face  = slab & tire_color_mask
+    if face.sum() < 200:
+        face = slab
+    cxy, R = fit_wheel_face(positions[face, :2], centre_xy, r0)
+    if R < 0.4 * r0 or np.linalg.norm(cxy - centre_xy) > 0.6 * r0:
+        return None, f"no wheel face found (R={R:.3f}, hint R={r0:.3f})"
+
+    d    = positions[:, :2] - cxy
+    rad  = np.hypot(d[:, 0], d[:, 1])
+    abin = ((np.arctan2(d[:, 1], d[:, 0]) + np.pi) / (2 * np.pi)
+            * N_ANGLE_BINS).astype(int) % N_ANGLE_BINS
+    band = (rad > 0.75 * R) & (rad < 1.05 * R)       # tread
+    dz   = 0.05 * R
+    z, tire_outer, inner, misses = outer, None, None, 0
+    while z > outer - 3 * R:
+        s   = band & (o <= z) & (o > z - dz)
+        cov = len(np.unique(abin[s])) / N_ANGLE_BINS
+        if cov >= min_cov:
+            tire_outer = z if tire_outer is None else tire_outer
+            inner, misses = z - dz, 0
+        elif tire_outer is not None:
+            misses += 1
+            if misses >= 2:
+                break
+        z -= dz
+    if tire_outer is None or tire_outer - inner < 2 * dz:
+        return None, "no tyre ring along axle"
+
+    return {'centre_xy': cxy, 'radius': float(R),
+            'outer': outer, 'inner': float(inner)}, None
+
+
 output_centroids = {}
 
 if wheel_joints:
@@ -331,6 +433,43 @@ if wheel_joints:
               f"radius={radius:.4f}  half_thick={half_thick:.4f}  "
               f"capture={pass1_capture[name]:.4f}  verts={len(cluster)}")
 
+    # ── Geometric refinement (car/truck) ──────────────────────────────────────
+    # Every wheel, left side included, is measured on its own side of the mesh,
+    # starting from its Taubin (right) or mirrored (left) estimate. Wheels
+    # where no tyre is found keep the Taubin / mirror result below.
+    refined = {}
+    if is_paired:
+        print("\nGeometric wheel refinement:")
+        for wj in wheel_joints:
+            name = wj['name']
+            src  = name if name in pass1_results else mirror_wheel_name(name)
+            if src not in pass1_results:
+                continue
+            pivot, _, radius, _, _ = pass1_results[src]
+            axle_z = pivot[2] if src == name else -pivot[2]
+            if axle_z == 0:
+                continue
+            side = float(np.sign(axle_z))
+            res, err = refine_wheel(pivot[:2], radius, side)
+            if err:
+                print(f"  {name}: kept Taubin estimate ({err})")
+                continue
+            half_thick = (res['outer'] - res['inner']) / 2
+            centroid   = [float(res['centre_xy'][0]), float(res['centre_xy'][1]),
+                          side * (res['outer'] + res['inner']) / 2]
+            refined[name] = {
+                'centroid':       centroid,
+                'radius':         res['radius'],
+                'half_thick':     float(half_thick),
+                'capture_radius': res['radius'] * 1.1,
+                'name':           name,
+                'axis':           [1.0, 0.0, 0.0],
+            }
+            print(f"  {name}: pivot={np.round(centroid, 4).tolist()} "
+                  f"radius={res['radius']:.4f} (was {radius:.4f})  "
+                  f"tyre |Z| {res['inner']:.3f}..{res['outer']:.3f}  "
+                  f"(was {abs(axle_z) - pass1_results[src][3]:.3f}..)")
+
     # ── Output centroids ──────────────────────────────────────────────────────
     print("\nTaubin fits:")
 
@@ -340,6 +479,10 @@ if wheel_joints:
 
     for wj, wp in zip(wheel_joints, wheel_world_positions):
         name    = wj['name']
+
+        if name in refined:
+            output_centroids[name] = refined[name]
+            continue
 
         if is_paired:
             is_right = 'fr' in name or 'right' in name or 'rr' in name
@@ -403,7 +546,9 @@ if wheel_joints:
             }
 
 else:
-    # No wheel joints — fall back to quadrant split + Taubin
+    # No wheel joints — fall back to quadrant split + Taubin.
+    # trimesh axes: X = length (front/rear), Y = height, Z = axle (left/right).
+    # Same naming as the hint path: left = low Z, front = low X.
     x_range  = positions[:, 0].max() - positions[:, 0].min()
     y_range  = positions[:, 1].max() - positions[:, 1].min()
     outer_x  = (
@@ -414,14 +559,18 @@ else:
     centroid_mask = tire_color_mask_centroid & outer_x & bottom_y
     wheel_positions = positions[centroid_mask]
 
-    left_verts  = wheel_positions[wheel_positions[:, 0] < 0]
-    right_verts = wheel_positions[wheel_positions[:, 0] >= 0]
+    z_mid       = (positions[:, 2].min() + positions[:, 2].max()) / 2
+    left_verts  = wheel_positions[wheel_positions[:, 2] < z_mid]
+    right_verts = wheel_positions[wheel_positions[:, 2] >= z_mid]
+
+    # Split at the length midpoint, not the median: wheels are rarely set in
+    # equally from both ends, so the median lands inside one wheel's cluster.
+    x_mid = (positions[:, 0].min() + positions[:, 0].max()) / 2
 
     def split_front_rear(verts):
         if len(verts) == 0:
             return np.zeros((0, 3)), np.zeros((0, 3))
-        median = np.median(verts[:, 2])
-        return verts[verts[:, 2] < median], verts[verts[:, 2] >= median]
+        return verts[verts[:, 0] < x_mid], verts[verts[:, 0] >= x_mid]
 
     lf, lr = split_front_rear(left_verts)
     rf, rr = split_front_rear(right_verts)
