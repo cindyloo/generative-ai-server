@@ -1,0 +1,22 @@
+.git
+.gitignore
+venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+.DS_Store
+
+# Local outputs and scratch data
+results/
+results copy/
+backups/
+checkpoints/
+path/
+
+# Large local meshes and renders
+*.usdz
+*.usdc
+*.glb
+*.png
+*.jpg
+!assets/**
