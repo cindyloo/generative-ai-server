@@ -10,11 +10,13 @@ wheel into its own mesh object, and exports a separated GLB.
 
 Coordinate systems
 ------------------
-  trimesh (find_tire_verts): X=left/right  Y=height  Z=depth
-  Blender world:             X=left/right  Y=depth   Z=height   (Y↔Z swapped)
+  trimesh (find_tire_verts): X=length (front/rear)  Y=height         Z=axle (left/right)
+  Blender world:             X=length (front/rear)  Y=axle, = -trimesh Z   Z=height
 
-The Y/Z swap is applied once, at load time, when reading centroids from the
-*_centroids.json file (line tagged # ← Y/Z SWAP).
+The glTF importer maps trimesh (x, y, z) → Blender (x, -z, y). That mapping is
+applied once, at load time, when reading centroids from the *_centroids.json
+file (line tagged # ← Y/Z SWAP). Wheel naming follows the hints: front = low X,
+left = low trimesh Z = high Blender Y.
 
 What changed vs the previous version
 --------------------------------------
@@ -90,9 +92,11 @@ if os.path.exists(centroids_path):
 
         # trimesh: X=front/rear, Y=height, Z=axle(left/right)
         # Blender: X=front/rear, Y=axle(left/right), Z=height
-        # Blender X = trimesh X, Blender Y = trimesh Z, Blender Z = trimesh Y
+        # The glTF importer maps (x, y, z) → (x, -z, y), so Blender Y = -trimesh Z.
+        # Without the sign flip each wheel was gated around its mirror-image
+        # position and the left/right names came out swapped.
         true_centroids[name] = {
-            'centroid':       np.array([pos[0], pos[2], pos[1]]),   # X unchanged, Y↔Z swap
+            'centroid':       np.array([pos[0], -pos[2], pos[1]]),  # ← Y/Z SWAP
             'radius':         radius,
             'axis':           axis,
             'half_thick':     v.get('half_thick', 0) if isinstance(v, dict) else 0,
@@ -116,15 +120,17 @@ if not true_centroids:
                       if k.startswith('wheel_')])
     print(f"Vehicle has {num_wheels} wheels")
 
+    x_mid = (bmin[0] + bmax[0]) / 2   # X = length; midpoint, not median (uneven overhangs)
+
     def split_front_rear(side_verts):
         if len(side_verts) == 0:
             return np.zeros((0, 3)), np.zeros((0, 3))
-        median = np.median(side_verts[:, 1])   # Y = depth in Blender
-        return side_verts[side_verts[:, 1] < median], side_verts[side_verts[:, 1] >= median]
+        return side_verts[side_verts[:, 0] < x_mid], side_verts[side_verts[:, 0] >= x_mid]
 
     if num_wheels == 4:
-        left_verts  = tire_verts_np[tire_verts_np[:, 0] < 0]
-        right_verts = tire_verts_np[tire_verts_np[:, 0] >= 0]
+        y_mid       = (bmin[1] + bmax[1]) / 2       # Y = axle; left = high Y
+        left_verts  = tire_verts_np[tire_verts_np[:, 1] >= y_mid]
+        right_verts = tire_verts_np[tire_verts_np[:, 1] < y_mid]
         lf, lr = split_front_rear(left_verts)
         rf, rr = split_front_rear(right_verts)
         for wname, cluster in [('wheel_fl', lf), ('wheel_fr', rf),
@@ -134,9 +140,7 @@ if not true_centroids:
                 'radius':   0.2,
             }
     elif num_wheels == 2:
-        median = np.median(tire_verts_np[:, 1])
-        lf = tire_verts_np[tire_verts_np[:, 1] < median]
-        lr = tire_verts_np[tire_verts_np[:, 1] >= median]
+        lf, lr = split_front_rear(tire_verts_np)
         for wname, cluster in [('wheel_fl', lf), ('wheel_rl', lr)]:
             true_centroids[wname] = {
                 'centroid': cluster.mean(axis=0) if len(cluster) > 0 else None,
@@ -256,7 +260,6 @@ is_paired_vehicle = classify_data.get('category', '') == 'vehicle' and \
 
 for name, pos, radius, half_thick, capture_r in centroid_list:
     pivot    = np.array(pos)
-    is_left  = pivot[1] < 0   # Blender Y < 0 = left side (toward user)
 
     # Choose vertex pool: ALL verts for both left and right wheels.
     # Color filter applied within the box gate for all wheels.
