@@ -3226,6 +3226,120 @@ def mesh_status(task_id: str):
         return jsonify({'error': 'Task not found'}), 404
     return jsonify(task)
 
+
+# ── /mesh/upload ──────────────────────────────────────────────────────────────
+
+_RENDER_BACKGROUND = (235, 235, 235)
+
+
+def front_view_cutout(mesh) -> bytes:
+    """
+    Front-view render of a mesh as a transparent PNG cropped to the mesh.
+
+    Stands in for the segmented drawing that /classify normally stores: the
+    vision models classify it, and /infer_joints crops the active image to its
+    alpha bounding box and maps that box onto the mesh's x/y bounds. Cropping
+    the render to the mesh's own silhouette keeps those two boxes identical.
+    """
+    render = Image.open(io.BytesIO(render_mesh_front_view(mesh))).convert('RGBA')
+    pixels = np.array(render)
+    background = np.all(pixels[:, :, :3] == _RENDER_BACKGROUND, axis=2)
+    pixels[background, 3] = 0
+    cutout = Image.fromarray(pixels)
+    bbox = cutout.getchannel('A').getbbox()
+    if bbox:
+        cutout = cutout.crop(bbox)
+    buf = io.BytesIO()
+    cutout.save(buf, format='PNG')
+    return buf.getvalue()
+
+
+@app.route('/mesh/upload', methods=['GET', 'POST'])
+def mesh_upload():
+    """
+    Start a pipeline record from an existing, unrigged GLB instead of a drawing.
+
+    Body: raw GLB bytes. ?tag= and ?user_id= as for /classify.
+
+    Saves the GLB as the record's mesh, renders its front view as the active
+    image, and classifies that render — so /infer_joints and /rig then run on
+    the returned classify_id exactly as they do after /classify + /mesh.
+    Cached by content: the same GLB and tag return the same classify_id.
+    """
+    if request.method == 'GET':
+        return jsonify({'status': 'ok'}), 200
+    try:
+        tag     = request.args.get('tag', '').strip()
+        user_id = request.args.get('user_id', '').strip() or dummy_user_id
+
+        glb_bytes = request.stream.read()
+        if not glb_bytes:
+            return jsonify({'error': 'No data received'}), 400
+        if glb_bytes[:4] != b'glTF':
+            return jsonify({'error': 'Body is not a binary glTF (GLB) file'}), 400
+
+        classify_id = hashlib.md5(glb_bytes + tag.encode()).hexdigest()[:8]
+
+        record = hydrate(_store.get(classify_id))
+        glb_path = ps._resolve_path(classify_id, 'mesh.glb')
+        if (record and record.get('classify') and record.get('mesh')
+                and os.path.exists(glb_path)):
+            log.info(f"mesh upload cache hit: {classify_id}")
+            return jsonify({
+                **record['classify'],
+                'classify_id':       classify_id,
+                'active_image_path': record.get('active_image_path'),
+                'glb_local_url':     _local_url(glb_path, request.host),
+            })
+
+        import trimesh
+        try:
+            mesh = trimesh.load(io.BytesIO(glb_bytes), file_type='glb',
+                                force='mesh')
+        except Exception as e:
+            return jsonify({'error': f'Could not read GLB: {e}'}), 400
+        if mesh is None or len(getattr(mesh, 'faces', [])) == 0:
+            return jsonify({'error': 'GLB contains no mesh geometry'}), 400
+
+        _rd = _rdir(classify_id)
+        glb_path = os.path.join(_rd, f"{classify_id}_mesh.glb")
+        with open(glb_path, 'wb') as f:
+            f.write(glb_bytes)
+
+        png_bytes = front_view_cutout(mesh)
+        seg_path = os.path.join(_rd, f"{classify_id}_segmented.png")
+        with open(seg_path, 'wb') as f:
+            f.write(png_bytes)
+
+        info = classify_with_vision(png_bytes, 'image/png', tag or None)
+        # The pose is whatever the uploaded mesh already has; there's no
+        # drawing to repose, and /augment_image would only redraw the render.
+        info['needs_augmentation'] = False
+        info['source'] = 'mesh_upload'
+        log.info(f"mesh upload {classify_id}: {info.get('object_type', '?')} "
+                 f"({len(mesh.faces)} faces)")
+
+        _store.upsert_classify(classify_id, tag, info)
+        _store.upsert_mesh(classify_id, {
+            'mesh_hash': hashlib.md5(glb_bytes).hexdigest()[:12],
+            'source':    'upload',
+            'user_id':   user_id,
+            'glb_path':  glb_path,
+        })
+
+        return jsonify({
+            **info,
+            'classify_id':       classify_id,
+            'active_image_path': seg_path,
+            'glb_local_url':     _local_url(glb_path, request.host),
+        })
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error(f"/mesh/upload error: {e}")
+        return jsonify({'error': str(e)}), 500
+
 def _run_meshy_rig_task(task_id: str, classify_id: str, user_id: str, host: str):
     try:
         _rig_tasks[task_id] = {'status': 'rigging', 'progress': 10}
