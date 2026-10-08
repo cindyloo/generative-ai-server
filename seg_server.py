@@ -80,6 +80,7 @@ import shutil
 import stat
 
 import numpy as np
+import trimesh
 import requests
 import urllib3
 from flask import Flask, request, jsonify, send_file, make_response
@@ -901,7 +902,6 @@ def joints_from_model(joints_data: dict, glb_path: str):
     The Y-up → Blender Z-up conversion happens later, in rig.py's
     --from-json branch (`(x, -z, y)`), not here.
     """
-    import trimesh
 
     hint_objects = joints_data.get('joint_hints', [])
     if not hint_objects or isinstance(hint_objects[0], str):
@@ -2494,7 +2494,6 @@ def infer_joints():
 
         if glb_path and os.path.exists(glb_path):
             try:
-                import trimesh
                 mesh   = trimesh.load(glb_path, force='mesh')
                 mesh_bounds = compute_mesh_bounds(mesh)
 
@@ -2536,7 +2535,6 @@ def infer_joints():
             # map them back correctly.
             if mesh_bounds is None:
                 if mesh is None:
-                    import trimesh
                     mesh = trimesh.load(glb_path, force='mesh')
                 verts  = np.array(mesh.vertices)
                 bmin   = np.array(verts.min(axis=0))
@@ -2573,7 +2571,6 @@ def infer_joints():
         log.info(f"GLB processing")
         if glb_path and os.path.exists(glb_path):
             if mesh is None:
-                import trimesh
                 mesh = trimesh.load(glb_path, force='mesh')
             try:
                 joints_data = snap_joints_to_mesh(joints_data, mesh)
@@ -2741,7 +2738,6 @@ def _build_joint_spheres(joints_data: dict, mesh):
     are guaranteed to be looking at the same joint placements, not two
     independently-implemented approximations of it.
     """
-    import trimesh
 
     mesh_size = np.linalg.norm(mesh.bounds[1] - mesh.bounds[0])
     verts     = np.array(mesh.vertices)
@@ -2775,7 +2771,6 @@ def visualize_normalized_joints(joints_data: dict, mesh,
       Claude z (depth)      → Blender Y [1]  (always ~0.5 = center)
       Claude y (up/down)    → Blender Z [2]
     """
-    import trimesh
 
     scene = trimesh.Scene()
     scene.add_geometry(mesh, node_name='mesh')
@@ -3292,7 +3287,6 @@ def mesh_upload():
                 'glb_local_url':     _local_url(glb_path, request.host),
             })
 
-        import trimesh
         try:
             mesh = trimesh.load(io.BytesIO(glb_bytes), file_type='glb',
                                 force='mesh')
