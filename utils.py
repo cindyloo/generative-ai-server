@@ -515,8 +515,8 @@ def build_swim_keyframes(body_part: str, joint_name: str) -> list:
     is_fin = 'fin' in name or part in ('fin', 'wing_base', 'wing_mid', 'wing_tip')
     if is_fin:
         if part == 'wing_base' or 'base' in name:
-            return clip("x", _sweep(0.30))
-        return clip("x", _sweep(0.20, lag=True))
+            return clip("x", _sweep(0.50))
+        return clip("x", _sweep(0.30, lag=True))
 
     return []
 
