@@ -506,6 +506,7 @@ def _try_claude(img_base64: str, mime_type: str, prompt: str,
     import anthropic
     api_key = os.environ.get('CLAUDE_API_KEY')
     if not api_key:
+        log.warning("Claude: CLAUDE_API_KEY not set")
         return None
     img_base64 = img_base64.replace('\n', '').replace('\r', '').replace(' ', '')
     try:
@@ -535,6 +536,8 @@ def _try_claude(img_base64: str, mime_type: str, prompt: str,
                 result = _extract_json(resp.content[0].text)
                 if result:
                     return result
+                log.warning(f"Claude {model}: no JSON in reply: "
+                            f"{resp.content[0].text[:200]!r}")
             except anthropic.NotFoundError:
                 break
             except anthropic.RateLimitError:
@@ -556,6 +559,7 @@ def _try_gemini(img_bytes: bytes, mime_type: str, prompt: str) -> dict | None:
     from google.genai import types
     api_key = os.environ.get('GEMINI_API_KEY')
     if not api_key:
+        log.warning("Gemini: GEMINI_API_KEY not set")
         return None
     client = genai.Client(api_key=api_key)
     for model in ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash']:
@@ -574,6 +578,7 @@ def _try_gemini(img_bytes: bytes, mime_type: str, prompt: str) -> dict | None:
                 result = _extract_json(raw)
                 if result:
                     return result
+                log.warning(f"Gemini {model}: no JSON in reply: {raw[:200]!r}")
             except Exception as e:
                 err = str(e)
                 if '429' in err or 'RESOURCE_EXHAUSTED' in err:
@@ -594,6 +599,7 @@ def _try_openai(img_base64: str, mime_type: str, prompt: str,
     import openai
     api_key = os.environ.get('OPENAI_API_KEY')
     if not api_key:
+        log.warning("OpenAI: OPENAI_API_KEY not set")
         return None
     client = openai.OpenAI(api_key=api_key)
     for attempt in range(2):
@@ -612,6 +618,7 @@ def _try_openai(img_base64: str, mime_type: str, prompt: str,
             result = _extract_json(raw)
             if result:
                 return result
+            log.warning(f"OpenAI: no JSON in reply: {raw[:200]!r}")
         except openai.RateLimitError:
             if attempt == 0:
                 time.sleep(30)
