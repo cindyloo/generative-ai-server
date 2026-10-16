@@ -1369,6 +1369,111 @@ def mesh_guided_joint_correction(joints_data: dict, mesh,
     return joints_data
 
 
+#: object_type words for creatures with a tail behind the body: fish and
+#: birds. (Not every flyer: a bee has no tail.)
+TAILED_KEYWORDS = frozenset({
+    'fish', 'shark', 'whale', 'dolphin', 'eel', 'koi', 'guppy', 'salmon',
+    'trout', 'tuna', 'minnow', 'tadpole', 'seahorse',
+    'bird', 'parrot', 'chicken', 'hen', 'rooster', 'duck', 'goose', 'swan',
+    'owl', 'penguin', 'eagle', 'hawk', 'pigeon', 'dove', 'sparrow', 'robin',
+    'crow', 'raven', 'flamingo', 'toucan', 'peacock', 'turkey', 'chick',
+})
+
+
+def has_tail(object_type: str) -> bool:
+    """Whole words only — 'eel' must not match a wheel, nor 'hen' a kitchen.
+    Plurals and compounds count: goldfish, pufferfish, blackbird, ducks."""
+    for word in re.findall(r'[a-z]+', (object_type or '').lower()):
+        if len(word) > 3 and word.endswith('s'):
+            word = word[:-1]
+        if word in TAILED_KEYWORDS or word.endswith(('fish', 'bird')):
+            return True
+    return False
+
+
+def add_tail(joints_data: dict, mesh, object_type: str) -> dict:
+    """
+    Give a fish or a bird a two-joint tail: joint_tail_base -> joint_tail_tip,
+    parented to the pelvis (or, for the pelvis-less flying skeleton, root).
+
+    The joints model sees the creature from the front, where its tail is
+    hidden behind the body, and depth is pinned to 0.5 — so it never places
+    one.
+    The mesh knows. Behind the body (mesh -Z; the face is +Z) the tip goes
+    in the middle of the back end, and the base where the body narrows most
+    on the way there — the join between body and tail fin. (The single
+    furthest vertex is no good for the tip: it is the corner of a fin lobe.)
+    Skinning goes by distance to bone segments, so the tail's vertices then
+    follow these joints.
+
+    Does nothing for anything else, for a skeleton that already has a tail
+    joint, and for a mesh with nothing substantial behind the body (a flat
+    drawing).
+    """
+    if not has_tail(object_type):
+        return joints_data
+    hints = joints_data.get('joint_hints', [])
+    names = {h.get('name') for h in hints if isinstance(h, dict)}
+    if any('tail' in (n or '') for n in names):
+        return joints_data
+    parent = next((n for n in ('joint_pelvis', 'joint_hips', 'joint_root')
+                   if n in names), None)
+    if parent is None:
+        return joints_data
+
+    verts  = np.asarray(mesh.vertices)
+    bmin   = verts.min(axis=0)
+    brange = verts.max(axis=0) - bmin
+    brange[brange == 0] = 1.0
+
+    def to_world(p):
+        return bmin + np.array([p.get('x', 0.5), p.get('y', 0.5),
+                                p.get('z', 0.5)]) * brange
+
+    def to_norm(w):
+        n = np.clip((w - bmin) / brange, 0.0, 1.0)
+        return {'x': round(float(n[0]), 4), 'y': round(float(n[1]), 4),
+                'z': round(float(n[2]), 4)}
+
+    hint_map = {h['name']: h for h in hints if isinstance(h, dict)}
+    centre = to_world(hint_map[parent].get('position_normalized', {}))
+
+    depth = brange[2]
+    back = bmin[2]
+    # A tail sticks out a good way: compared with the model's biggest
+    # dimension, not its depth, so a flat drawing isn't mistaken for a fish
+    # that's all tail.
+    if centre[2] - back < 0.25 * brange.max():
+        log.info("  Tail: back of the mesh too short for a tail, skipping")
+        return joints_data
+    tip = verts[verts[:, 2] < back + 0.08 * depth].mean(axis=0)
+
+    # Slice from just behind the centre to near the back; the slice with the
+    # smallest cross-section is where the tail starts.
+    base, smallest = None, np.inf
+    slab = 0.04 * depth
+    for z in np.arange(centre[2] - 0.2 * depth, back + 0.1 * depth, -slab / 2):
+        part = verts[(verts[:, 2] < z) & (verts[:, 2] >= z - slab)]
+        if len(part) < 20:
+            continue
+        area = np.ptp(part[:, 0]) * np.ptp(part[:, 1])
+        if area < smallest:
+            base, smallest = part.mean(axis=0), area
+    if base is None:
+        base = centre + 0.6 * (tip - centre)
+
+    for name, where in (('joint_tail_base', base), ('joint_tail_tip', tip)):
+        hints.append({'name': name, 'body_part': 'tail', 'deforms_mesh': True,
+                      'position_normalized': to_norm(where)})
+    skeleton = joints_data.setdefault('skeleton', [])
+    skeleton.append({'parent': parent, 'child': 'joint_tail_base'})
+    skeleton.append({'parent': 'joint_tail_base', 'child': 'joint_tail_tip'})
+    joints_data['joint_hints'] = hints
+    log.info(f"  Tail: base {to_norm(base)} tip {to_norm(tip)} "
+             f"under {parent}")
+    return joints_data
+
+
 def enforce_bilateral_symmetry(joints_data: dict) -> dict:
     """
     For paired joints (left/right), if one side is missing, mirror the other.
@@ -2596,6 +2701,12 @@ def infer_joints():
             except Exception as e:
                 log.warning(f"Vision-based joint verification failed (non-fatal): {e}")
             log.info(f"Verified")
+            # After verification, which judges joints against the front view
+            # and would see a tail behind the body as misplaced.
+            try:
+                joints_data = add_tail(joints_data, mesh, object_type)
+            except Exception as e:
+                log.warning(f"Tail failed (non-fatal): {e}")
             try:
                 viz_path = os.path.join(_rdir(classify_id), f"{classify_id}_joints_normalized_viz.glb")
                 visualize_normalized_joints(joints_data, mesh, viz_path)

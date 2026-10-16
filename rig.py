@@ -982,6 +982,80 @@ def _validate_heat_weights(mesh_objects, armature_obj,
     return bad_fraction <= leak_fraction
 
 
+def tail_keep_fraction(along, bone_length, blend=0.25):
+    """
+    How much of a tail bone's weight a vertex keeps, from how far `along` the
+    bone's direction it sits from the bone's head: all of it behind the head
+    (along >= 0), none further forward than `blend` of the bone's length, and
+    a linear ramp between so the join doesn't crease. Pure numpy, so it can
+    be tested outside Blender.
+    """
+    import numpy as np
+    margin = max(blend * bone_length, 1e-6)
+    return np.clip((np.asarray(along) + margin) / margin, 0.0, 1.0)
+
+
+def confine_tail_weights(mesh_objects, armature_obj):
+    """
+    Keep a tail's weights on the tail.
+
+    Skinning gives each vertex to the nearest bone. On a round body — a
+    pufferfish — the spine runs up the middle while the body bulges out
+    behind, so the back of the body is nearer the tail than the spine, and
+    the tail took 59% of the fish: wag it and half the body went with it.
+    Here a tail bone keeps only the vertices behind its own head (plus a
+    short blend); the rest of its weight goes to its parent bone.
+    """
+    import numpy as np
+
+    tail_bones = [b for b in armature_obj.data.bones
+                  if 'tail' in b.name.lower() and b.parent is not None]
+    if not tail_bones:
+        return
+    world = armature_obj.matrix_world
+    for mesh_obj in mesh_objects:
+        groups = mesh_obj.vertex_groups
+        mat = mesh_obj.matrix_world
+        coords = np.array([tuple(mat @ v.co) for v in mesh_obj.data.vertices])
+        moved = 0.0
+        # Root-most first, so weight passed up from a tip can't land on a
+        # tail base that has already been confined.
+        for bone in sorted(tail_bones, key=lambda b: len(b.parent_recursive)):
+            group = groups.get(bone.name)
+            parent = groups.get(bone.parent.name) or groups.new(name=bone.parent.name)
+            if group is None:
+                continue
+            head = np.array(tuple(world @ bone.head_local))
+            tail = np.array(tuple(world @ bone.tail_local))
+            length = float(np.linalg.norm(tail - head))
+            # The cut is square to the way the tail leaves its parent (body
+            # centre -> tail base), not to the tail bone itself: a tail that
+            # angles upward would otherwise tilt the cut through the top of
+            # the back and take that too.
+            outward = head - np.array(tuple(world @ bone.parent.head_local))
+            reach = float(np.linalg.norm(outward))
+            if length < 1e-6 or reach < 1e-6:
+                continue
+            along = (coords - head) @ (outward / reach)
+            keep = tail_keep_fraction(along, length)
+            for v in mesh_obj.data.vertices:
+                if keep[v.index] >= 1.0:
+                    continue
+                try:
+                    w = group.weight(v.index)
+                except RuntimeError:
+                    continue   # not in this group
+                give = w * (1.0 - keep[v.index])
+                if keep[v.index] <= 0.0:
+                    group.remove([v.index])
+                else:
+                    group.add([v.index], w - give, 'REPLACE')
+                parent.add([v.index], give, 'ADD')
+                moved += give
+        print(f"  Tail weights confined on {mesh_obj.name}: "
+              f"{moved:.1f} vertex-weight moved to parent bones")
+
+
 def skin_mesh(mesh_objects, armature_obj, skeleton_joints_data):
     """
     Try heat weighting first, fall back to segment weighting.
@@ -1289,6 +1363,7 @@ def rig_in_blender(mesh_path: str, joints: list, hierarchy: list,
 
         # ── Skin mesh to armature ─────────────────────────────────
         skin_mesh(mesh_objects, armature_obj, skeleton_joints_data)
+        confine_tail_weights(mesh_objects, armature_obj)
 
         # ── Animations ────────────────────────────────────────────
         joint_hints = [j.get('hint') for j in skeleton_joints_data] if skeleton_joints_data else []
