@@ -1927,7 +1927,7 @@ def run_rig_pipeline(task_id: str, classify_id: str, user_id: str, host: str):
 
             # ── Inject keyframes ──────────────────────────────────────────────
             _rig_tasks[task_id] = {'status': 'injecting_keyframes', 'progress': 40}
-            skel = utils.inject_keyframes(skel)
+            skel = utils.inject_keyframes(skel, object_type)
             with open(skeleton_json_path, 'w') as f:
                 json.dump(skel, f, indent=2)
 

@@ -28,6 +28,7 @@ import sys
 import io
 import base64
 import logging
+import re
 import numpy as np
 import requests
 from PIL import Image
@@ -450,7 +451,118 @@ def build_wave_keyframes(body_part: str, joint_name: str) -> list:
     return []
 
 
-def inject_keyframes(skel: dict) -> dict:
+#: object_type words for creatures that swim rather than walk or fly.
+SWIM_KEYWORDS = frozenset({
+    'fish', 'shark', 'whale', 'dolphin', 'eel', 'koi', 'guppy', 'salmon',
+    'trout', 'tuna', 'minnow', 'tadpole', 'seahorse', 'orca', 'stingray',
+})
+
+
+def is_swimmer(object_type: str) -> bool:
+    """Whole words only — 'eel' must not match a wheel. Plurals and
+    compounds count: goldfish, pufferfish, sharks."""
+    for word in re.findall(r'[a-z]+', (object_type or '').lower()):
+        if len(word) > 3 and word.endswith('s'):
+            word = word[:-1]
+        if word in SWIM_KEYWORDS or word.endswith('fish'):
+            return True
+    return False
+
+
+def _sweep(amp: float, lag: bool = False) -> list:
+    """60-frame side-to-side cycle; lag delays it a quarter cycle."""
+    if lag:
+        return [[1, -amp], [15, 0.0], [30, amp], [45, 0.0], [60, -amp]]
+    return [[1, 0.0], [15, amp], [30, 0.0], [45, -amp], [60, 0.0]]
+
+
+def build_swim_keyframes(body_part: str, joint_name: str) -> list:
+    """
+    'swim' clip for a fish: the tail sweeps side to side with its tip a
+    quarter cycle behind the base, so the beat travels down the tail; the
+    pectoral fins paddle; a dorsal fin sways with the body.
+
+    Axes (see build_wave_keyframes for the remap): the tail points back, so
+    after _align_bone_roll local X is world left-right and rotating about it
+    would pitch the tail up and down. JSON 'y' (local Z) sweeps it sideways.
+    A pectoral fin points sideways, so local X is world up and JSON 'x'
+    sweeps it front to back — a paddle. Left and right fins have mirrored
+    local axes, so the same values move them symmetrically.
+
+    The joints model labels fins 'wing_*' (it has no fin label), so fins are
+    found by body part or by name.
+    """
+    part = (body_part or '').lower()
+    name = (joint_name or '').lower()
+
+    def clip(axis, keyframes):
+        return [{
+            "clip":      "swim",
+            "property":  "rotation_euler",
+            "axis":      axis,
+            "keyframes": [[f, round(v, 4)] for f, v in keyframes],
+            "loop":      True,
+        }]
+
+    if part == 'tail' or 'tail' in name:
+        if 'tip' in name:
+            return clip("y", _sweep(0.45, lag=True))
+        return clip("y", _sweep(0.35))
+
+    if 'dorsal' in name:
+        return clip("y", _sweep(0.10)) if 'tip' not in name else []
+
+    is_fin = 'fin' in name or part in ('fin', 'wing_base', 'wing_mid', 'wing_tip')
+    if is_fin:
+        if part == 'wing_base' or 'base' in name:
+            return clip("x", _sweep(0.30))
+        return clip("x", _sweep(0.20, lag=True))
+
+    return []
+
+
+def build_fly_keyframes(body_part: str, joint_name: str) -> list:
+    """
+    'fly' clip for a winged creature: the wings flap (the same tip-trailing
+    flap as the wing 'wave'), the legs tuck back and stay there, and the
+    tail pitches gently for balance.
+
+    Legs and tail use JSON 'x' (local X, world left-right after
+    _align_bone_roll): a front-back swing for a leg pointing down, an
+    up-down pitch for a tail pointing back.
+    """
+    part = (body_part or '').lower()
+    name = (joint_name or '').lower()
+
+    if part.startswith('wing'):
+        return [dict(a, clip='fly')
+                for a in build_wave_keyframes(body_part, joint_name)
+                if a['clip'] == 'wave']
+
+    tuck = {'hip': 0.9, 'leg': 0.6, 'knee': 0.6, 'foot': 0.5}.get(part)
+    if tuck is not None:
+        return [{
+            "clip":      "fly",
+            "property":  "rotation_euler",
+            "axis":      "x",
+            "keyframes": [[1, tuck], [60, tuck]],
+            "loop":      True,
+        }]
+
+    if part == 'tail' or 'tail' in name:
+        amp = 0.15 if 'tip' in name else 0.10
+        return [{
+            "clip":      "fly",
+            "property":  "rotation_euler",
+            "axis":      "x",
+            "keyframes": _sweep(amp, lag='tip' in name),
+            "loop":      True,
+        }]
+
+    return []
+
+
+def inject_keyframes(skel: dict, object_type: str = '') -> dict:
     """
     Inject procedural animations into every joint's hint.animations list.
     Produces clips:
@@ -458,8 +570,18 @@ def inject_keyframes(skel: dict) -> dict:
       - 'idle'  — gentle bob + head nod (root/pelvis and head only)
       - 'wave'  — left arm wave OR both wings flap with phase offsets
       - 'fold'  — wings fold against body (flying objects only)
+      - 'fly'   — wing flap, legs tucked, tail balancing (anything with wings)
+      - 'swim'  — tail sweep and fin paddle (object_type names a fish etc.)
+    A swimmer gets only 'idle' and 'swim': the joints model labels fins as
+    wings, which would otherwise give a fish bird clips. A winged creature's
+    'walk' is legs only, and its flap is 'fly' rather than 'wave'.
     Called after skel is assembled, before run_blender_rig().
     """
+    swimmer = is_swimmer(object_type)
+    flyer   = not swimmer and any(
+        ((j.get('hint') or {}).get('body_part') or '').lower().startswith('wing')
+        for j in skel['joints'])
+
     positions = {j['id']: np.array(j['position']) for j in skel['joints']}
     children  = {}
     for bone in skel['bones']:
@@ -481,16 +603,23 @@ def inject_keyframes(skel: dict) -> dict:
                 ))
 
         animations = []
+        is_wing    = (body_part or '').lower().startswith('wing')
 
-        # Walk — only deforming bones (limbs)
-        if deforms:
+        # Walk — only deforming bones (limbs); a flyer walks on its legs
+        if deforms and not swimmer and not (flyer and is_wing):
             animations += build_walk_keyframes(body_part, name, bone_length)
 
         # Idle — root bob and head nod only
         animations += build_idle_keyframes(body_part, name)
 
-        # Wave — left arm only or both wings
-        animations += build_wave_keyframes(body_part, name)
+        if swimmer:
+            animations += build_swim_keyframes(body_part, name)
+        else:
+            # Wave — left arm only or both wings; a flyer's flap is 'fly'
+            animations += [a for a in build_wave_keyframes(body_part, name)
+                           if not (flyer and a['clip'] == 'wave')]
+            if flyer:
+                animations += build_fly_keyframes(body_part, name)
 
         if joint.get('hint') is None:
             joint['hint'] = {}
