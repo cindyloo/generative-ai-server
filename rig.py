@@ -1041,9 +1041,12 @@ def confine_tail_weights(mesh_objects, armature_obj):
             for v in mesh_obj.data.vertices:
                 if keep[v.index] >= 1.0:
                     continue
-                try:
-                    w = group.weight(v.index)
-                except RuntimeError:
+                # Read membership from the vertex: group.weight() on a vertex
+                # outside the group raises, and Blender logs every one of
+                # those as "Error: Vertex not in group" even when caught.
+                w = next((g.weight for g in v.groups
+                          if g.group == group.index), None)
+                if w is None:
                     continue   # not in this group
                 give = w * (1.0 - keep[v.index])
                 if keep[v.index] <= 0.0:
