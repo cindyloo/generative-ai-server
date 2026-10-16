@@ -21,6 +21,7 @@ import os
 import numpy as np
 import trimesh
 
+import seg_server
 from seg_server import add_tail, has_tail
 
 
@@ -121,7 +122,61 @@ def check_pufferfish():
     print('pufferfish: ok', world(mesh, base).round(2), tip_w.round(2))
 
 
+class FakeStore:
+    """Stands in for the pipeline store, so these checks never write the
+    real results/_pipeline_store.json."""
+
+    def __init__(self, records):
+        self.records, self.joints, self.rig = records, {}, {}
+
+    def get(self, classify_id):
+        return copy.deepcopy(self.records.get(classify_id))
+
+    def upsert_joints(self, classify_id, joints):
+        self.joints[classify_id] = joints
+
+    def set_rig_status(self, classify_id, status, error=None):
+        self.rig[classify_id] = status
+
+
+def check_cached_records():
+    """An old fish record gets its tail on a cache hit, with no model call,
+    and its rig is marked stale; cached_only never runs the vision model."""
+    mesh_path = 'results/865fee5d/865fee5d_mesh.glb'
+    if not os.path.exists(mesh_path):
+        print('cached records: pufferfish mesh not in results/, skipped')
+        return
+    old_joints = _joints(0.5)                    # no tail, as before today
+    fish = {'classify': {'object_type': 'cartoon pufferfish'}, 'joints': old_joints}
+    bee = {'classify': {'object_type': 'cartoon bee toy'}, 'joints': _joints(0.5)}
+    empty = {'classify': {'object_type': 'cartoon pufferfish'}}
+    store = FakeStore({'865fee5d': fish, 'bee1': bee, 'new1': empty})
+
+    real_store, real_vision = seg_server._store, seg_server.classify_joints_with_vision
+    def no_vision(*a, **k):
+        raise AssertionError('the vision model must not be called')
+    seg_server._store = store
+    seg_server.classify_joints_with_vision = no_vision
+    try:
+        client = seg_server.app.test_client()
+        fish_out = client.post('/infer_joints?classify_id=865fee5d').get_json()
+        assert any(h['name'] == 'joint_tail_base' for h in fish_out['joint_hints']), fish_out
+        assert store.rig.get('865fee5d') == 'stale'
+        assert 'joint_tail_tip' in {h['name'] for h in store.joints['865fee5d']['joint_hints']}
+
+        bee_out = client.post('/infer_joints?classify_id=bee1').get_json()
+        assert not any('tail' in h['name'] for h in bee_out['joint_hints'])
+        assert 'bee1' not in store.rig, 'a bee has no tail, so its rig stays'
+
+        missing = client.post('/infer_joints?classify_id=new1&cached_only=true')
+        assert missing.status_code == 404
+    finally:
+        seg_server._store, seg_server.classify_joints_with_vision = real_store, real_vision
+    print('cached records: ok')
+
+
 if __name__ == '__main__':
     check_synthetic()
     check_bird_and_words()
     check_pufferfish()
+    check_cached_records()

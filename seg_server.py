@@ -65,6 +65,7 @@ import os
 import sys
 import io
 import re
+import copy
 import base64
 import json
 import logging
@@ -1376,6 +1377,37 @@ def mesh_guided_joint_correction(joints_data: dict, mesh,
     return joints_data
 
 
+def _upgrade_cached_tail(classify_id: str, record: dict) -> dict:
+    """
+    Stored joints for a fish or bird made before tails existed: add the tail
+    from the mesh (no model call), store it, and mark the rig stale so the
+    next /rig rebuilds it with the tail. Anything else comes back untouched.
+    """
+    joints = record.get('joints') or {}
+    object_type = (record.get('classify') or {}).get('object_type', '')
+    names = {h.get('name', '') for h in joints.get('joint_hints', [])
+             if isinstance(h, dict)}
+    if not has_tail(object_type) or any('tail' in n for n in names):
+        return joints
+    _dec = ps._resolve_path(classify_id, 'decimated.glb')
+    _full = ps._resolve_path(classify_id, 'mesh.glb')
+    glb_path = _dec if os.path.exists(_dec) else _full
+    if not os.path.exists(glb_path):
+        return joints
+    try:
+        upgraded = add_tail(copy.deepcopy(joints),
+                            trimesh.load(glb_path, force='mesh'), object_type)
+    except Exception as e:
+        log.warning(f"Tail upgrade failed for {classify_id} (non-fatal): {e}")
+        return joints
+    if len(upgraded.get('joint_hints', [])) == len(joints.get('joint_hints', [])):
+        return joints   # add_tail found nothing behind the body
+    _store.upsert_joints(classify_id, upgraded)
+    _store.set_rig_status(classify_id, 'stale')
+    log.info(f"Tail added to cached joints of {classify_id}; rig marked stale")
+    return upgraded
+
+
 #: object_type words for creatures with a tail behind the body: fish and
 #: birds. (Not every flyer: a bee has no tail.)
 TAILED_KEYWORDS = frozenset({
@@ -2532,6 +2564,12 @@ def infer_joints():
     ?classify_id=  required
     ?joints=N      optional hint (3–16), passed to vision model as suggestion
     ?force=true    bypass cache, re-run vision model
+    ?cached_only=true  never run the vision model: return the stored joints,
+                   or 404 if there are none (for a client checking an old rig)
+
+    A cached fish or bird stored before tails existed gets one added from
+    its mesh (add_tail, no model call), and its rig is marked stale so the
+    next /rig rebuilds it.
 
     If a mesh already exists for this classify_id, its bounding box dimensions
     are extracted and injected into the vision prompt so the model can reason
@@ -2544,6 +2582,7 @@ def infer_joints():
     try:
         classify_id      = request.args.get('classify_id', '').strip()
         force            = request.args.get('force', '').lower() in ('1', 'true', 'yes')
+        cached_only      = request.args.get('cached_only', '').lower() in ('1', 'true', 'yes')
         requested_joints = request.args.get('joints', '').strip() or None
 
         if not classify_id:
@@ -2555,11 +2594,16 @@ def infer_joints():
 
         if not force and record.get('joints'):
             log.info(f"joints cache hit: {classify_id}")
+            record['joints'] = _upgrade_cached_tail(classify_id, record)
             return jsonify({
                 **record['joints'],
                 'classify_id':       classify_id,
                 'active_image_path': record.get('active_image_path'),
             })
+
+        if cached_only:
+            return jsonify({'error': f"no stored joints for '{classify_id}'",
+                            'classify_id': classify_id}), 404
 
         classify_data = record.get('classify') or {}
         active_path   = record.get('active_image_path')
