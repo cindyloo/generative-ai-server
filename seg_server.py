@@ -1739,7 +1739,13 @@ def health():
 
 @app.route('/segment', methods=['GET', 'POST'])
 def segment():
-    """Remove background via rembg. Stateless — client holds the bytes."""
+    """
+    Remove the background. Stateless — client holds the bytes.
+
+    A flat single-colour background (a render) is cut out by colour
+    (utils.flat_background_cutout); anything else goes to rembg's u2net.
+    The X-Segment-Method response header says which: 'flat' or 'u2net'.
+    """
     if request.method == 'GET':
         return jsonify({'status': 'ok'}), 200
     try:
@@ -1748,11 +1754,17 @@ def segment():
             return jsonify({'error': 'No data received'}), 400
         img    = Image.open(io.BytesIO(img_bytes)).convert('RGBA')
         img    = utils.resize_if_needed(img, max_size=1024)
-        output = remove(img, session=rembg_session)
+        output = utils.flat_background_cutout(img)
+        method = 'flat'
+        if output is None:
+            output, method = remove(img, session=rembg_session), 'u2net'
+        log.info(f"/segment: {method}")
         buf    = io.BytesIO()
         output.save(buf, format='PNG')
         buf.seek(0)
-        return send_file(buf, mimetype='image/png')
+        resp = send_file(buf, mimetype='image/png')
+        resp.headers['X-Segment-Method'] = method
+        return resp
     except HTTPException:
         raise
     except Exception as e:

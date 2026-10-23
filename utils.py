@@ -47,6 +47,50 @@ ANIMAL_KEYWORDS = {'dog', 'cat', 'bird', 'fish', 'shark', 'whale', 'wolf', 'anim
 MECHANICAL_KEYWORDS = {'gear', 'mechanical', 'hinged', 'lever', 'gadget', 'tool'}
 # ── Image helpers ─────────────────────────────────────────────────────────────
 
+def flat_background_cutout(img: Image.Image, tol: int = 6, uniform: float = 0.98,
+                           remove_holes: bool = False) -> Image.Image | None:
+    """
+    Cut an object out of a flat, single-colour background (a render or a
+    studio shot), or return None if the background isn't flat.
+
+    The background counts as flat when `uniform` of the border pixels are
+    within `tol` (per channel, 0-255) of their median colour. Pixels of that
+    colour are removed where they connect to the border, so nothing inside
+    the object's outline is touched.
+
+    remove_holes also clears enclosed patches of that colour bigger than
+    0.2% of the image: right for a window or the gaps between a wheel's
+    spokes in a render, wrong for a drawing, whose white fill is the same
+    colour as the paper (it cut a figure down to its outline, and the whites
+    out of a bee's eyes). Off by default; enclosed patches then stay
+    background-coloured, as u2net leaves them.
+
+    u2net, which /segment otherwise uses, can lose most of an object on a
+    plain background: on a LEGO car render it kept the tyres and made the
+    whole blue and red body translucent.
+    """
+    from scipy import ndimage
+
+    rgba = np.array(img.convert('RGBA'))
+    px   = rgba[:, :, :3].astype(int)
+    edge = np.concatenate([px[0], px[-1], px[:, 0], px[:, -1]])
+    bg   = np.median(edge, axis=0)
+    if (np.abs(edge - bg).max(axis=1) <= tol).mean() < uniform:
+        return None
+
+    near   = np.abs(px - bg).max(axis=2) <= tol
+    lab, n = ndimage.label(near)
+    sizes  = ndimage.sum(near, lab, range(1, n + 1))
+    border = set(np.unique(np.concatenate([lab[0], lab[-1], lab[:, 0], lab[:, -1]]))) - {0}
+    holes  = [i + 1 for i, sz in enumerate(sizes)
+              if remove_holes and (i + 1) not in border and sz > 0.002 * near.size]
+    keep   = ndimage.binary_opening(~np.isin(lab, list(border) + holes), iterations=1)
+    if keep.mean() < 0.01:
+        return None   # nothing left: not an object on a background
+    rgba[:, :, 3] = np.minimum(rgba[:, :, 3], keep * 255)
+    return Image.fromarray(rgba, 'RGBA')
+
+
 def resize_if_needed(img: Image.Image, max_size: int = 1024) -> Image.Image:
     if max(img.size) > max_size:
         ratio    = max_size / max(img.size)
