@@ -36,6 +36,7 @@ What changed vs the previous version
 
 import bpy, sys, math, json, os
 import numpy as np
+from mathutils import Matrix, Vector
 
 input_path    = sys.argv[sys.argv.index('--') + 1]
 output_path   = sys.argv[sys.argv.index('--') + 2]
@@ -273,6 +274,9 @@ END     = 61
 
 def add_clip(obj, clip, curves, interpolation='LINEAR'):
     """curves: [(data_path, index, [(frame, value), ...]), ...]"""
+    # The glTF importer leaves objects in quaternion mode, where Euler
+    # keyframes are ignored: the body would slide round a turn without yawing.
+    obj.rotation_mode = 'XYZ'
     act = bpy.data.actions.new(name=f"{clip}__{obj.name}")
     for path, idx, keys in curves:
         fc = act.fcurves.new(data_path=path, index=idx)
@@ -316,14 +320,94 @@ if road_wheels:
 
         front = [w for w, _ in road_wheels if '_f' in w.name] or \
                 [min(road_wheels, key=lambda wr: fwd * -wr[0].location.x)[0]]
+        front_names = {w.name for w in front}
+        rear = [w for w, _ in road_wheels if w.name not in front_names] or front
+
+        def mean_loc(ws):
+            return sum((w.location for w in ws), Vector()) / len(ws)
+
+        rear_c, front_c = mean_loc(rear), mean_loc(front)
+        wheelbase = max(abs(front_c.x - rear_c.x), 1e-6)
+
+        def wheel_steer(wheel, delta):
+            """
+            Ackermann steering: the bicycle-model angle delta at the front
+            axle's centre becomes, for each front wheel, the angle that points
+            it along its own circle round the turn centre, so the inner wheel
+            turns more and neither scrubs. Left of the vehicle is +Y·fwd.
+            """
+            t    = math.tan(delta)
+            left = fwd * (wheel.location.y - rear_c.y)
+            return math.atan2(wheelbase * t, wheelbase - left * t)
+
         for clip, sign in (('steer_left', 1.0), ('steer_right', -1.0)):
-            a = sign * STEER
             for wheel in front:
+                a = wheel_steer(wheel, sign * STEER)
                 add_clip(wheel, clip, [('rotation_euler', 2,
                                         [(1, 0.0), (21, a), (41, a), (END, 0.0)])],
                          interpolation='BEZIER')
-        print(f"  clips: drive, drive_forward, drive_backward, steer_left, steer_right "
-              f"(steering {[w.name for w in front]})")
+
+        # ── Turning while driving: bicycle model, integrated per frame ────────
+        # The rear axle's centre P moves along the heading psi; psi turns at
+        # tan(delta) / wheelbase per unit distance (reversing with the wheel
+        # left yaws the other way, as a real car does). Every object keeps its
+        # rest offset from P, rotated by psi. Each wheel rolls the distance its
+        # own centre moves along the way it points, over its radius: outer
+        # wheels turn more than inner ones. Steering eases in over 15 frames
+        # and back out over the last 15. Assumes the imported objects have no
+        # rest rotation (the glTF importer bakes the axis change into the mesh).
+        TURN_END  = 91
+        turn_dist = 2 * distance
+        rest      = {o.name: o.location.copy() for o in movers}
+        radius    = {w.name: r for w, r in road_wheels}
+
+        def ease(f, a, b):
+            t = min(max((f - a) / (b - a), 0.0), 1.0)
+            return t * t * (3 - 2 * t)
+
+        for clip, steer_sign, direction in (('turn_left_forward',   1.0,  1.0),
+                                            ('turn_right_forward', -1.0,  1.0),
+                                            ('turn_left_backward',  1.0, -1.0),
+                                            ('turn_right_backward', -1.0, -1.0)):
+            ds   = direction * turn_dist / (TURN_END - 1)
+            P    = rear_c.copy()
+            psi  = 0.0
+            roll = {n: 0.0 for n in radius}
+            prev = {n: rest[n].copy() for n in radius}
+            keys = {o.name: {'x': [], 'y': [], 'roll': [], 'yaw': []} for o in movers}
+            for f in range(1, TURN_END + 1):
+                delta = steer_sign * STEER * (ease(f, 1, 16) - ease(f, TURN_END - 15, TURN_END))
+                if f > 1:
+                    dpsi = ds * math.tan(delta) / wheelbase
+                    mid  = psi + dpsi / 2
+                    P   += Vector((fwd * math.cos(mid), fwd * math.sin(mid), 0.0)) * ds
+                    psi += dpsi
+                yaw = Matrix.Rotation(psi, 3, 'Z')
+                for o in movers:
+                    loc   = P + yaw @ (rest[o.name] - rear_c)
+                    steer = wheel_steer(o, delta) if o.name in front_names else 0.0
+                    if o.name in radius and f > 1:
+                        heading = Matrix.Rotation(psi + steer, 3, 'Z') @ Vector((1.0, 0.0, 0.0))
+                        roll[o.name] += (loc - prev[o.name]).dot(heading) / radius[o.name]
+                        prev[o.name] = loc.copy()
+                    k = keys[o.name]
+                    k['x'].append((f, loc.x))
+                    k['y'].append((f, loc.y))
+                    k['yaw'].append((f, psi + steer))
+                    if o.name in radius:
+                        k['roll'].append((f, roll[o.name]))
+            for o in movers:
+                k = keys[o.name]
+                curves = [('location', 0, k['x']), ('location', 1, k['y']),
+                          ('rotation_euler', 2, k['yaw'])]
+                if k['roll']:
+                    curves.append(('rotation_euler', rotation_axis, k['roll']))
+                add_clip(o, clip, curves)
+            print(f"  {clip}: yaw {math.degrees(psi):+.1f} deg over {turn_dist:.3f}")
+
+        print(f"  clips: drive, drive_forward/backward, steer_left/right, "
+              f"turn_left/right_forward/backward (steering {sorted(front_names)}, "
+              f"wheelbase {wheelbase:.3f})")
 
 # ── Export ────────────────────────────────────────────────────────────────────
 bpy.ops.export_scene.gltf(

@@ -1640,7 +1640,10 @@ def run_rig_pipeline(task_id: str, classify_id: str, user_id: str, host: str):
             run_blender_rig(active_glb, skeleton_json_path, rigged_path)
 
         _rig_tasks[task_id] = {'status': 'exporting_usdz', 'progress': 85}
-        rigged_usdz_path = export_rigged_usdz(rigged_path)
+        # Vehicle and mechanical rigs keep the full-resolution mesh in the GLB;
+        # the USDZ gets the same 10% the creature rigs are built on.
+        rigged_usdz_path = export_rigged_usdz(
+            rigged_path, 0.1 if (is_vehicle or is_mechanical) else None)
 
         # ── Update mesh record (paths are not stored — reconstructed at read time)
         if decimated_path:
@@ -3442,7 +3445,8 @@ def decimate_usdz():
 USDZ_CLIP_ORDER = ('swim', 'fly', 'walk', 'drive', 'idle')
 
 
-def convert_glb_to_usdz(glb_path: str, usdz_path: str) -> str:
+def convert_glb_to_usdz(glb_path: str, usdz_path: str,
+                        decimate_ratio: float | None = None) -> str:
     """
     Convert GLB to USDZ using Blender's USD exporter, Y-up like glTF (and
     like the USDZ Meshy returns) rather than Blender's Z-up.
@@ -3451,6 +3455,11 @@ def convert_glb_to_usdz(glb_path: str, usdz_path: str) -> str:
     USD takes only each object's active action, so the first of
     USDZ_CLIP_ORDER it has becomes the animation, looping over its frames,
     on the armature or on each animated object of a vehicle.
+
+    decimate_ratio (0-1) collapses every mesh to that fraction of its faces
+    before export, for rigs built on a full-resolution mesh (vehicles and
+    mechanical objects). Creature rigs are built on the decimated mesh
+    already and pass None.
     """
     script = textwrap.dedent(f"""
         import bpy
@@ -3471,6 +3480,15 @@ def convert_glb_to_usdz(glb_path: str, usdz_path: str) -> str:
             bpy.context.scene.frame_start = int(start)
             bpy.context.scene.frame_end   = int(end)
             print(f'USDZ clip: {{clip.name}}')
+        ratio = {decimate_ratio!r}
+        if ratio:
+            for obj in [o for o in bpy.data.objects if o.type == 'MESH']:
+                mod = obj.modifiers.new('usdz_decimate', 'DECIMATE')
+                mod.ratio = ratio
+                with bpy.context.temp_override(object=obj, active_object=obj):
+                    bpy.ops.object.modifier_move_to_index(modifier=mod.name, index=0)
+                    bpy.ops.object.modifier_apply(modifier=mod.name)
+            print(f'USDZ decimated to {{ratio:.0%}} of faces')
         bpy.ops.wm.usd_export(
             filepath=r'{usdz_path}',
             export_animation=clip is not None,
@@ -3503,12 +3521,13 @@ def convert_glb_to_usdz(glb_path: str, usdz_path: str) -> str:
     return usdz_path
 
 
-def export_rigged_usdz(rigged_path: str) -> str | None:
+def export_rigged_usdz(rigged_path: str,
+                       decimate_ratio: float | None = None) -> str | None:
     """Write {classify_id}_rigged.usdz next to the rigged GLB. Non-fatal: the
     GLB is the rig's main output, so a failed export only logs."""
     usdz_path = rigged_path[:-len('.glb')] + '.usdz'
     try:
-        return convert_glb_to_usdz(rigged_path, usdz_path)
+        return convert_glb_to_usdz(rigged_path, usdz_path, decimate_ratio)
     except Exception as e:
         log.warning(f"Rigged USDZ export failed (non-fatal): {e}")
         return None
