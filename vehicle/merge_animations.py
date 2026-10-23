@@ -18,27 +18,24 @@ print(f"Input animations: {len(anims)}")
 for a in anims:
     print(f"  {a['name']}: {len(a['channels'])} channels")
 
-# Merge all into one animation named "drive"
-merged_channels = []
-merged_samplers = []
-
+# Merge into one animation per clip. animatesam.py names each action
+# "{clip}__{object}"; older per-wheel actions (wheel_0_rot, ...) are "drive".
+clips = {}
 for anim in anims:
-    sampler_offset = len(merged_samplers)
-    merged_samplers.extend(anim['samplers'])
+    clip = anim['name'].split('__', 1)[0] if '__' in anim['name'] else 'drive'
+    merged = clips.setdefault(clip, {'name': clip, 'channels': [], 'samplers': []})
+    sampler_offset = len(merged['samplers'])
+    merged['samplers'].extend(anim['samplers'])
     for ch in anim['channels']:
-        new_ch = {
+        merged['channels'].append({
             'sampler': ch['sampler'] + sampler_offset,
-            'target':  ch['target']
-        }
-        merged_channels.append(new_ch)
+            'target':  ch['target'],
+        })
 
-j['animations'] = [{
-    'name':     'drive',
-    'channels': merged_channels,
-    'samplers': merged_samplers,
-}]
+j['animations'] = list(clips.values())
 
-print(f"\nMerged into 1 animation 'drive' with {len(merged_channels)} channels")
+print(f"\nMerged into {len(clips)} animations: "
+      + ", ".join(f"{c['name']} ({len(c['channels'])} channels)" for c in clips.values()))
 
 # Write output GLB
 json_bytes = json.dumps(j, separators=(',', ':')).encode('utf-8')

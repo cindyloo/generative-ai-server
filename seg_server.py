@@ -3870,23 +3870,25 @@ def convert_glb_to_usdz(glb_path: str, usdz_path: str) -> str:
     like the USDZ Meshy returns) rather than Blender's Z-up.
 
     A rigged GLB keeps its skeleton and skinning. Its clips are NLA tracks;
-    USD takes only the armature's active action, so the first of
-    USDZ_CLIP_ORDER it has becomes the animation, looping over its frames.
+    USD takes only each object's active action, so the first of
+    USDZ_CLIP_ORDER it has becomes the animation, looping over its frames,
+    on the armature or on each animated object of a vehicle.
     """
     script = textwrap.dedent(f"""
         import bpy
         bpy.ops.wm.read_factory_settings(use_empty=True)
         bpy.ops.import_scene.gltf(filepath=r'{glb_path}')
-        clip = None
-        arm = next((o for o in bpy.data.objects if o.type == 'ARMATURE'), None)
-        if arm and arm.animation_data:
-            actions = {{a.name: a for a in bpy.data.actions}}
-            clip = next((actions[n] for n in {USDZ_CLIP_ORDER!r} if n in actions),
-                        None)
+        # The clip plays on every animated object: the armature of a rig,
+        # or each wheel and the body of a vehicle (rigid objects, no bones).
+        actions = {{a.name: a for a in bpy.data.actions}}
+        clip = next((actions[n] for n in {USDZ_CLIP_ORDER!r} if n in actions), None)
         if clip:
-            for track in arm.animation_data.nla_tracks:
-                track.mute = True
-            arm.animation_data.action = clip
+            for obj in bpy.data.objects:
+                if obj.animation_data is None:
+                    continue
+                for track in obj.animation_data.nla_tracks:
+                    track.mute = True
+                obj.animation_data.action = clip
             start, end = clip.frame_range
             bpy.context.scene.frame_start = int(start)
             bpy.context.scene.frame_end   = int(end)
