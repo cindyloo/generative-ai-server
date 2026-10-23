@@ -193,21 +193,59 @@ def _full_radius(cov, shell_w, band_shells, thr):
 
 
 def fit_wheel_face(pts_xy, centre0, r0, thr=0.8):
-    """Coarse-then-fine grid search for the centre with the widest full annulus."""
+    """
+    Coarse-then-fine grid search for the centre with the widest full annulus.
+
+    The radius moves in whole shells, so a patch of neighbouring centres ties
+    for the widest; the true centre is the middle of that patch. Keeping the
+    first tie instead took its low corner (the scan runs low to high), which
+    put every wheel's pivot about a shell low and made it hop as it turned.
+    """
     shell_w  = 0.04 * r0
     n_shells = int(1.6 * r0 / shell_w)
     best_r, best_c = -1.0, np.asarray(centre0, dtype=float)
     for span, step in ((0.5 * r0, 0.05 * r0), (0.06 * r0, 0.01 * r0)):
         c0   = best_c
         offs = np.arange(-span, span + 1e-12, step)
+        best_r, ties = -1.0, []
         for dx in offs:
             for dy in offs:
                 c = c0 + (dx, dy)
                 r = _full_radius(_shell_coverage(pts_xy, c, shell_w, n_shells),
                                  shell_w, band_shells=4, thr=thr)
-                if r > best_r:
-                    best_r, best_c = r, c
+                if r > best_r + 1e-12:
+                    best_r, ties = r, [c]
+                elif abs(r - best_r) <= 1e-12:
+                    ties.append(c)
+        if ties:
+            best_c = np.mean(ties, axis=0)
     return best_c, best_r
+
+
+def fit_outline_centre(pts_xy, centre, R, iters=4):
+    """
+    Centre of the tyre's outline: a least-squares circle through the
+    outermost point in each angle bin, re-binned around each new centre.
+    The annulus search lands within a shell of it; this pins it down, so
+    the wheel turns without hopping. Keeps the input if the fit wanders
+    more than a fifth of the radius (no clean outline).
+    """
+    start = c = np.asarray(centre, dtype=float)
+    for _ in range(iters):
+        d    = pts_xy - c
+        rad  = np.hypot(d[:, 0], d[:, 1])
+        abin = ((np.arctan2(d[:, 1], d[:, 0]) + np.pi) / (2 * np.pi)
+                * N_ANGLE_BINS).astype(int) % N_ANGLE_BINS
+        keep = rad < 1.3 * R
+        rim  = np.array([pts_xy[keep & (abin == b)][np.argmax(rad[keep & (abin == b)])]
+                         for b in range(N_ANGLE_BINS) if (keep & (abin == b)).any()])
+        if len(rim) < N_ANGLE_BINS * 0.75:
+            return start
+        # x² + y² + Dx + Ey + F = 0
+        A = np.c_[rim, np.ones(len(rim))]
+        D, E, _ = np.linalg.lstsq(A, -(rim ** 2).sum(axis=1), rcond=None)[0]
+        c = np.array([-D / 2, -E / 2])
+    return c if np.linalg.norm(c - start) < 0.2 * R else start
 
 
 def refine_wheel(centre_xy, r0, side, min_cov=0.6):
@@ -231,6 +269,7 @@ def refine_wheel(centre_xy, r0, side, min_cov=0.6):
     cxy, R = fit_wheel_face(positions[face, :2], centre_xy, r0)
     if R < 0.4 * r0 or np.linalg.norm(cxy - centre_xy) > 0.6 * r0:
         return None, f"no wheel face found (R={R:.3f}, hint R={r0:.3f})"
+    cxy = fit_outline_centre(positions[face, :2], cxy, R)
 
     d    = positions[:, :2] - cxy
     rad  = np.hypot(d[:, 0], d[:, 1])
