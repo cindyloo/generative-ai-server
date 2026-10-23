@@ -496,13 +496,20 @@ def edit_image_fal(img: Image.Image, prompt: str) -> tuple[Image.Image, Image.Im
 # Meshy / file helpers
 # ══════════════════════════════════════════════════════════════════════════════
 
-def meshy_reconstruct(img: Image.Image, object_type: str) -> tuple[str, str, str | None]:
-    """Submit to Meshy, poll until done. Returns (task_id, glb_url, usdz_url)."""
+class MeshyTaskFailed(RuntimeError):
+    """Meshy reported the task FAILED: polling it again won't help."""
+
+
+def _meshy_headers() -> dict:
     meshy_key = os.environ.get('MESHY_API_KEY')
     if not meshy_key:
         raise RuntimeError("MESHY_API_KEY not set")
+    return {"Authorization": f"Bearer {meshy_key}"}
 
-    headers  = {"Authorization": f"Bearer {meshy_key}"}
+
+def meshy_submit(img: Image.Image, object_type: str) -> str:
+    """Submit an image-to-3D task to Meshy (spends a credit). Returns its task id."""
+    headers  = _meshy_headers()
     ot_lower = object_type.lower()
     pose_mode = (
         "t-pose" if any(w in ot_lower for w in ['human', 'person', 'humanoid'])
@@ -527,7 +534,12 @@ def meshy_reconstruct(img: Image.Image, object_type: str) -> tuple[str, str, str
     resp.raise_for_status()
     task_id = resp.json()["result"]
     log.info(f"Meshy task: {task_id}")
+    return task_id
 
+
+def meshy_poll(task_id: str) -> tuple[str, str | None]:
+    """Poll a Meshy task until done. Returns (glb_url, usdz_url)."""
+    headers = _meshy_headers()
     elapsed = 0
     while elapsed < 300:
         time.sleep(5)
@@ -543,9 +555,9 @@ def meshy_reconstruct(img: Image.Image, object_type: str) -> tuple[str, str, str
         log.info(f"Meshy {task_id}: {status} ({progress}%)")
         if status == "SUCCEEDED":
             urls = task["model_urls"]
-            return task_id, urls.get("glb"), urls.get("usdz")
+            return urls.get("glb"), urls.get("usdz")
         elif status == "FAILED":
-            raise RuntimeError(
+            raise MeshyTaskFailed(
                 f"Meshy failed: {task.get('task_error', {}).get('message', 'Unknown')}"
             )
 
@@ -1677,11 +1689,40 @@ def run_rig_pipeline(task_id: str, classify_id: str, user_id: str, host: str):
 # Mesh pipeline (Meshy — background thread)
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _pending_meshy_path(classify_id: str) -> str:
+    return os.path.join(_rdir(classify_id), f"{classify_id}_meshy_pending.json")
+
+
+def pending_meshy_task(classify_id: str, mesh_hash: str) -> str | None:
+    """The Meshy task submitted for this image and type that never finished
+    downloading (e.g. the server restarted mid-task), or None."""
+    try:
+        with open(_pending_meshy_path(classify_id)) as f:
+            pending = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return pending.get('meshy_task_id') if pending.get('mesh_hash') == mesh_hash else None
+
+
 def _run_mesh_task(task_id: str, classify_id: str, img: Image.Image,
-                   object_type: str, mesh_hash: str, host: str):
+                   object_type: str, mesh_hash: str, host: str,
+                   meshy_task_id: str | None = None):
+    """meshy_task_id resumes a task already submitted instead of paying for a
+    new one. A new task's id is saved to {id}_meshy_pending.json as soon as
+    Meshy accepts it, so a restart before the download finishes can resume
+    it; the file goes once the mesh is stored, or Meshy fails the task."""
+    pending_path = _pending_meshy_path(classify_id)
     try:
         _mesh_tasks[task_id] = {'status': 'meshy', 'progress': 10}
-        meshy_task_id, glb_url, usdz_url = meshy_reconstruct(img, object_type)
+        if meshy_task_id:
+            log.info(f"Resuming Meshy task {meshy_task_id} for {classify_id}")
+        else:
+            meshy_task_id = meshy_submit(img, object_type)
+            os.makedirs(_rdir(classify_id), exist_ok=True)
+            with open(pending_path, 'w') as f:
+                json.dump({'meshy_task_id': meshy_task_id, 'mesh_hash': mesh_hash,
+                           'submitted_at': ps._now()}, f)
+        glb_url, usdz_url = meshy_poll(meshy_task_id)
 
         _mesh_tasks[task_id] = {'status': 'downloading', 'progress': 70}
         _rd       = _rdir(classify_id)
@@ -1710,6 +1751,8 @@ def _run_mesh_task(task_id: str, classify_id: str, img: Image.Image,
             'usdz_url':           usdz_url,
             'decimated_glb_path': decimated_path,
         })
+        if os.path.exists(pending_path):
+            os.unlink(pending_path)
 
         _mesh_tasks[task_id] = {
             'status':              'ok',
@@ -1722,6 +1765,10 @@ def _run_mesh_task(task_id: str, classify_id: str, img: Image.Image,
         log.info(f"Mesh task {task_id} complete: {glb_path}")
 
     except Exception as e:
+        # Anything but Meshy failing the task (a timeout, a dropped download)
+        # leaves the pending file, so the next /mesh picks the task back up.
+        if isinstance(e, MeshyTaskFailed) and os.path.exists(pending_path):
+            os.unlink(pending_path)
         log.error(f"Mesh task {task_id} failed: {e}")
         _mesh_tasks[task_id] = {'status': 'error', 'error': str(e)}
 
@@ -2966,16 +3013,22 @@ def mesh():
                     'mesh_source':   src_id,
                 })
 
+        # A Meshy task already paid for this image and type, whose result
+        # never arrived (the server restarted mid-task): poll it, don't resubmit.
+        resume_id = None if force else pending_meshy_task(classify_id, mesh_hash)
+
         task_id = str(uuid.uuid4())[:8]
         _mesh_tasks[task_id] = {'status': 'started', 'progress': 0}
         threading.Thread(
             target=_run_mesh_task,
-            args=(task_id, classify_id, img, object_type, mesh_hash, request.host),
+            args=(task_id, classify_id, img, object_type, mesh_hash, request.host,
+                  resume_id),
             daemon=True,
         ).start()
 
         return jsonify({'status': 'processing', 'task_id': task_id,
-                        'classify_id': classify_id})
+                        'classify_id': classify_id,
+                        'resumed_meshy_task_id': resume_id})
 
     except HTTPException:
         raise
@@ -3163,7 +3216,7 @@ def meshy_rig(meshy_task_id: str) -> tuple[str, str, str]:
     """
     Submit a Meshy rigging task and poll until done.
     Returns (rig_task_id, rigged_glb_url, rigged_fbx_url).
-    Mirrors meshy_reconstruct's submit-then-poll pattern.
+    Mirrors meshy_submit + meshy_poll.
     """
     meshy_key = os.environ.get('MESHY_API_KEY')
     headers = {
