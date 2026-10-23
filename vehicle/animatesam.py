@@ -321,13 +321,19 @@ if road_wheels:
         front = [w for w, _ in road_wheels if '_f' in w.name] or \
                 [min(road_wheels, key=lambda wr: fwd * -wr[0].location.x)[0]]
         front_names = {w.name for w in front}
-        rear = [w for w, _ in road_wheels if w.name not in front_names] or front
+        rear = [w for w, _ in road_wheels if w.name not in front_names]
 
         def mean_loc(ws):
             return sum((w.location for w in ws), Vector()) / len(ws)
 
-        rear_c, front_c = mean_loc(rear), mean_loc(front)
-        wheelbase = max(abs(front_c.x - rear_c.x), 1e-6)
+        # Turning needs both axles. Without rear wheels (when separation
+        # found only the front ones) the rear axle is taken as the front one
+        # for the steering angles, and the turn clips are skipped: a
+        # near-zero wheelbase would spin the vehicle on the spot.
+        rear_c, front_c = mean_loc(rear or front), mean_loc(front)
+        wheelbase = abs(front_c.x - rear_c.x)
+        can_turn  = bool(rear) and wheelbase > 1e-3
+        wheelbase = max(wheelbase, 1e-6)
 
         def wheel_steer(wheel, delta):
             """
@@ -336,6 +342,8 @@ if road_wheels:
             it along its own circle round the turn centre, so the inner wheel
             turns more and neither scrubs. Left of the vehicle is +Y·fwd.
             """
+            if not can_turn:
+                return delta   # no rear axle to steer around
             t    = math.tan(delta)
             left = fwd * (wheel.location.y - rear_c.y)
             return math.atan2(wheelbase * t, wheelbase - left * t)
@@ -365,10 +373,13 @@ if road_wheels:
             t = min(max((f - a) / (b - a), 0.0), 1.0)
             return t * t * (3 - 2 * t)
 
-        for clip, steer_sign, direction in (('turn_left_forward',   1.0,  1.0),
-                                            ('turn_right_forward', -1.0,  1.0),
-                                            ('turn_left_backward',  1.0, -1.0),
-                                            ('turn_right_backward', -1.0, -1.0)):
+        turn_clips = (('turn_left_forward',   1.0,  1.0),
+                      ('turn_right_forward', -1.0,  1.0),
+                      ('turn_left_backward',  1.0, -1.0),
+                      ('turn_right_backward', -1.0, -1.0)) if can_turn else ()
+        if not can_turn:
+            print("  turn clips skipped: no separate front and rear wheels")
+        for clip, steer_sign, direction in turn_clips:
             ds   = direction * turn_dist / (TURN_END - 1)
             P    = rear_c.copy()
             psi  = 0.0
