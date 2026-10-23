@@ -1663,6 +1663,11 @@ def run_mechanical_pipeline(classify_id: str, glb_path: str,
     return rigged_path
 
 
+#: Per-step limit for the vehicle scripts. They run on the full-resolution
+#: mesh, and a 60 MB truck can take minutes in Blender.
+VEHICLE_STEP_TIMEOUT = 300
+
+
 def run_vehicle_pipeline(classify_id: str, glb_path: str,
                          classify_data: dict, host: str) -> str:
     seg_dir        = os.path.dirname(os.path.abspath(__file__))
@@ -1686,14 +1691,6 @@ def run_vehicle_pipeline(classify_id: str, glb_path: str,
         classify_data['wheel_colors_rgb'] = wheel_colors
         log.info(f"wheel_colors_rgb from joints: {wheel_colors}")
 
-    with open(classify_json, 'w') as f:
-        json.dump(classify_data, f, indent=2)
-        
-    # ADD THIS DEBUG:
-    log.info(f"DEBUG: joints_data from store: {len(joint_hints)} hints")
-    for jh in [j for j in joint_hints if j.get('body_part') == 'wheel']:
-        p = jh.get('position_normalized', {})
-        log.info(f"  {jh['name']}: x={p.get('x')}, y={p.get('y')}, z={p.get('z')}")
 
     TWO_WHEEL_KEYWORDS = ['bicycle', 'bike', 'motorcycle', 'motorbike', 'scooter', 'moped']
     is_two_wheel = any(kw in object_type.lower() for kw in TWO_WHEEL_KEYWORDS)
@@ -1727,11 +1724,9 @@ def run_vehicle_pipeline(classify_id: str, glb_path: str,
         if j.get('body_part') in ['wheel', 'gear']
     ]
 
-    log.info(f"DEBUG: classify_data['joint_hints'] about to write: {len(classify_data['joint_hints'])} hints")
     for jh in classify_data['joint_hints']:
         p = jh.get('position_normalized', {})
         log.info(f"  {jh['name']}: x={p.get('x')}, y={p.get('y')}, z={p.get('z')}")
-
 
     wheel_joints_out = [j for j in classify_data['joint_hints'] if j.get('body_part') == 'wheel']
     if len(wheel_joints_out) == 2:
@@ -1771,8 +1766,10 @@ def run_vehicle_pipeline(classify_id: str, glb_path: str,
         script = os.path.join(vehicle_dir, script_name)
         if runner == 'blender':
             extra = [tire_verts] if script_name == 'classify_wheels.py' else []
+            # --python-exit-code: a script that raises fails the step;
+            # Blender otherwise exits 0.
             cmd   = [_blender_bin(), '--background', '--factory-startup',
-                     '--python', script, '--',
+                     '--python-exit-code', '1', '--python', script, '--',
                      input_path, out_path, classify_json] + extra
         else:
             args = ([glb_path, classify_json, tire_verts, texture_path]
@@ -1780,11 +1777,13 @@ def run_vehicle_pipeline(classify_id: str, glb_path: str,
                     else [animated_path, rigged_path])
             cmd  = [sys.executable, script] + args
 
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                timeout=VEHICLE_STEP_TIMEOUT)
         log.info(result.stdout[-5000:])
-
-
-
+        log.info(f"{script_name} returncode: {result.returncode}")
+        if result.returncode != 0 or not os.path.exists(out_path):
+            raise RuntimeError(f"{script_name} failed (exit {result.returncode}): "
+                               f"{result.stderr[-300:]}")
 
         if script_name == 'find_tire_verts.py' and os.path.exists(tire_verts):
             try:
@@ -1802,13 +1801,6 @@ def run_vehicle_pipeline(classify_id: str, glb_path: str,
                     log.warning("Centroids file not found — pivot will use bbox fallback")
             except Exception as e:
                 log.warning(f"Centroid injection failed (non-fatal): {e}")
-
-        log.info(f"separated_path exists: {os.path.exists(separated_path)} → {separated_path}")
-        log.info(f"classify_wheels returncode: {result.returncode}")
-        log.info(f"classify_wheels stderr: {result.stderr[-300:] if result.stderr else ''}")
-
-        if not os.path.exists(out_path):
-            raise RuntimeError(f"{script_name} failed: {result.stderr[-200:]}")
 
     log.info(f"Vehicle pipeline complete: {rigged_path}")
     return rigged_path

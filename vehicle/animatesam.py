@@ -33,7 +33,6 @@ What changed vs the previous version
 """
 
 import bpy, sys, math, json, os
-sys.path.insert(0, '/tmp/blender_packages')
 import numpy as np
 
 input_path    = sys.argv[sys.argv.index('--') + 1]

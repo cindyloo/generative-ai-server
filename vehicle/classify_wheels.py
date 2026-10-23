@@ -35,7 +35,6 @@ What changed vs the previous version
 """
 
 import os, sys, re, struct
-sys.path.insert(0, '/tmp/blender_packages')
 
 import bpy, json
 import numpy as np

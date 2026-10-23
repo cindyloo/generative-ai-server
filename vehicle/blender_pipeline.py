@@ -1,8 +1,8 @@
 """
 blender_pipeline.py
 
-Shared script pipeline loop used by both run_vehicle_pipeline.py and
-run_mechanical_pipeline.py.  Import and call run_blender_pipeline().
+Script pipeline loop used by mechanical_pipeline.py.  Import and call
+run_blender_pipeline().
 """
 
 import os

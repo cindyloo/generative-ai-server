@@ -1,5 +1,4 @@
 import sys, math
-sys.path.insert(0, '/tmp/blender_packages')
 import struct, json
 
 input_path  = sys.argv[1]
