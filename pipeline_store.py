@@ -180,6 +180,17 @@ def _local_url(path: str | None, host: str) -> str | None:
     return f"http://{host}/results/{rel}"
 
 
+def rigged_usdz_clips(classify_id: str) -> list:
+    """Clip frame ranges on the rigged USDZ's timeline, [{'name', 'start',
+    'end'}], from the sidecar usdz_export wrote; [] if there is none."""
+    path = _resolve_path(classify_id, 'rigged_usdz_clips.json')
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return []
+
+
 def _rdir(classify_id: str) -> str:
     """Reconstruct the per-classify_id results subdirectory path."""
     return os.path.join(os.environ.get('RESULTS_DIR', 'results'), classify_id)
@@ -313,6 +324,7 @@ def _inject_urls(record: dict, host: str) -> dict:
     usdz = rig.get('rigged_usdz_path')
     rig['rigged_usdz_url'] = (_local_url(usdz, host)
                               if usdz and os.path.exists(usdz) else None)
+    rig['rigged_usdz_clips'] = rigged_usdz_clips(cid) if cid else []
     rig['viz_url']    = _local_url(rig.get('viz_glb_path'),    host)
 
     r['classify'] = cls    or None

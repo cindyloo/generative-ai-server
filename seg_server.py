@@ -1642,7 +1642,7 @@ def run_rig_pipeline(task_id: str, classify_id: str, user_id: str, host: str):
         _rig_tasks[task_id] = {'status': 'exporting_usdz', 'progress': 85}
         # Vehicle and mechanical rigs keep the full-resolution mesh in the GLB;
         # the USDZ gets the same 10% the creature rigs are built on.
-        rigged_usdz_path = export_rigged_usdz(
+        rigged_usdz_path, rigged_usdz_clips = export_rigged_usdz(
             rigged_path, 0.1 if (is_vehicle or is_mechanical) else None)
 
         # ── Update mesh record (paths are not stored — reconstructed at read time)
@@ -1661,6 +1661,7 @@ def run_rig_pipeline(task_id: str, classify_id: str, user_id: str, host: str):
             'progress':    100,
             'rigged_url':  _local_url(rigged_path, host),
             'rigged_usdz_url': _local_url(rigged_usdz_path, host),
+            'rigged_usdz_clips': rigged_usdz_clips,
             'glb_url':     glb_url,
             'classify_id': classify_id,
         }
@@ -3238,6 +3239,7 @@ def rig():
                     'rigged_url':  _local_url(rigged_path, request.host),
                     'rigged_usdz_url': _local_url(rigged_usdz_path, request.host)
                                        if os.path.exists(rigged_usdz_path) else None,
+                    'rigged_usdz_clips': ps.rigged_usdz_clips(classify_id),
                     'glb_url':     mesh_data.get('glb_url'),
                     'classify_id': classify_id,
                 })
@@ -3440,97 +3442,61 @@ def decimate_usdz():
 
 #── /convert_to_usdz ──────────────────────────────────────────────────────────
 
-#: A USD skeleton plays one animation (AR Quick Look plays only that one), so
-#: a rigged USDZ carries the first of these clips the GLB has.
+#: USD has one timeline per file, so a rigged USDZ carries every clip back to
+#: back on it; the first of these the GLB has leads (AR Quick Look loops the
+#: whole timeline from the start).
 USDZ_CLIP_ORDER = ('swim', 'fly', 'walk', 'drive', 'idle')
 
 
 def convert_glb_to_usdz(glb_path: str, usdz_path: str,
-                        decimate_ratio: float | None = None) -> str:
+                        decimate_ratio: float | None = None) -> tuple[str, list]:
     """
-    Convert GLB to USDZ using Blender's USD exporter, Y-up like glTF (and
-    like the USDZ Meshy returns) rather than Blender's Z-up.
-
-    A rigged GLB keeps its skeleton and skinning. Its clips are NLA tracks;
-    USD takes only each object's active action, so the first of
-    USDZ_CLIP_ORDER it has becomes the animation, looping over its frames,
-    on the armature or on each animated object of a vehicle.
+    Convert GLB to a Y-up USDZ with usdz_export.py in Blender. Every clip of
+    an animated GLB is baked onto the one timeline; returns (usdz_path,
+    clips), clips being [{'name', 'start', 'end'}] frame ranges, which are
+    also stored in the file's customLayerData under "clips".
 
     decimate_ratio (0-1) collapses every mesh to that fraction of its faces
-    before export, for rigs built on a full-resolution mesh (vehicles and
-    mechanical objects). Creature rigs are built on the decimated mesh
-    already and pass None.
+    first, for rigs built on a full-resolution mesh (vehicles and mechanical
+    objects). Creature rigs are built on the decimated mesh already and
+    pass None.
     """
-    script = textwrap.dedent(f"""
-        import bpy
-        bpy.ops.wm.read_factory_settings(use_empty=True)
-        bpy.ops.import_scene.gltf(filepath=r'{glb_path}')
-        # The clip plays on every animated object: the armature of a rig,
-        # or each wheel and the body of a vehicle (rigid objects, no bones).
-        actions = {{a.name: a for a in bpy.data.actions}}
-        clip = next((actions[n] for n in {USDZ_CLIP_ORDER!r} if n in actions), None)
-        if clip:
-            for obj in bpy.data.objects:
-                if obj.animation_data is None:
-                    continue
-                for track in obj.animation_data.nla_tracks:
-                    track.mute = True
-                obj.animation_data.action = clip
-            start, end = clip.frame_range
-            bpy.context.scene.frame_start = int(start)
-            bpy.context.scene.frame_end   = int(end)
-            print(f'USDZ clip: {{clip.name}}')
-        ratio = {decimate_ratio!r}
-        if ratio:
-            for obj in [o for o in bpy.data.objects if o.type == 'MESH']:
-                mod = obj.modifiers.new('usdz_decimate', 'DECIMATE')
-                mod.ratio = ratio
-                with bpy.context.temp_override(object=obj, active_object=obj):
-                    bpy.ops.object.modifier_move_to_index(modifier=mod.name, index=0)
-                    bpy.ops.object.modifier_apply(modifier=mod.name)
-            print(f'USDZ decimated to {{ratio:.0%}} of faces')
-        bpy.ops.wm.usd_export(
-            filepath=r'{usdz_path}',
-            export_animation=clip is not None,
-            export_armatures=True,
-            export_textures=True,
-            export_materials=True,
-            convert_orientation=True,
-            export_global_forward_selection='NEGATIVE_Z',
-            export_global_up_selection='Y',
-        )
-        print('USDZ export done')
-    """).strip()
-
-    with tempfile.NamedTemporaryFile('w', suffix='.py', delete=False) as f:
-        f.write(script)
-        sf = f.name
-    try:
-        result = subprocess.run(
-            [_blender_bin(), '--background', '--python', sf],
-            capture_output=True, text=True, timeout=300
-        )
-    finally:
-        os.unlink(sf)
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'usdz_export.py')
+    result = subprocess.run(
+        [_blender_bin(), '--background', '--python-exit-code', '1',
+         '--python', script, '--', os.path.abspath(glb_path),
+         os.path.abspath(usdz_path),
+         'none' if decimate_ratio is None else str(decimate_ratio),
+         ','.join(USDZ_CLIP_ORDER)],
+        capture_output=True, text=True, timeout=600
+    )
     log.info(result.stdout[-2000:])
-
-    if not os.path.exists(usdz_path):
+    if result.returncode != 0 or not os.path.exists(usdz_path):
         raise RuntimeError(f"USDZ export failed: {result.stderr[-300:]}")
 
-    log.info(f"Converted {glb_path} → {usdz_path}")
-    return usdz_path
+    line = next((l for l in result.stdout.splitlines() if l.startswith('USDZ_CLIPS ')), None)
+    clips = json.loads(line[len('USDZ_CLIPS '):]) if line else []
+    log.info(f"Converted {glb_path} → {usdz_path} ({len(clips)} clips)")
+    return usdz_path, clips
 
 
 def export_rigged_usdz(rigged_path: str,
-                       decimate_ratio: float | None = None) -> str | None:
-    """Write {classify_id}_rigged.usdz next to the rigged GLB. Non-fatal: the
-    GLB is the rig's main output, so a failed export only logs."""
+                       decimate_ratio: float | None = None) -> tuple[str | None, list]:
+    """
+    Write {classify_id}_rigged.usdz next to the rigged GLB, and its clip
+    frame ranges to {classify_id}_rigged_usdz_clips.json for the record.
+    Non-fatal: the GLB is the rig's main output, so a failed export only
+    logs and returns (None, []).
+    """
     usdz_path = rigged_path[:-len('.glb')] + '.usdz'
     try:
-        return convert_glb_to_usdz(rigged_path, usdz_path, decimate_ratio)
+        path, clips = convert_glb_to_usdz(rigged_path, usdz_path, decimate_ratio)
     except Exception as e:
         log.warning(f"Rigged USDZ export failed (non-fatal): {e}")
-        return None
+        return None, []
+    with open(rigged_path[:-len('.glb')] + '_usdz_clips.json', 'w') as f:
+        json.dump(clips, f, indent=2)
+    return path, clips
 
 @app.route('/convert_to_usdz', methods=['GET', 'POST'])
 def convert_to_usdz():
@@ -3549,10 +3515,11 @@ def convert_to_usdz():
         usdz_path = os.path.join(_ud, "converted.usdz")
         with open(glb_path, 'wb') as f:
             f.write(resp.content)
-        convert_glb_to_usdz(glb_path, usdz_path)
+        _, clips = convert_glb_to_usdz(glb_path, usdz_path)
         os.unlink(glb_path)
         return jsonify({'status': 'ok',
-                        'usdz_url': _local_url(usdz_path, request.host)})
+                        'usdz_url': _local_url(usdz_path, request.host),
+                        'clips':    clips})
     except Exception as e:
         log.error(f"/convert_to_usdz error: {e}")
         return jsonify({'error': str(e)}), 500
