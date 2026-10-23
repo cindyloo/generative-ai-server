@@ -5,9 +5,8 @@ Standalone script invoked by seg_server.py via subprocess:
 
     python mechanical_pipeline.py \
         <classify_id> <glb_path> <classify_json> \
-        <results_dir> <vehicle_scripts_dir> [mask_dir]
+        <results_dir> <vehicle_scripts_dir>
 
-seg_server.py runs SAM2 in-process and passes mask_dir as the last arg.
 This script just runs the Blender pipeline with mechanical=True.
 """
 
@@ -31,8 +30,7 @@ def _add_to_path(vehicle_dir: str) -> None:
 
 
 def run(classify_id: str, glb_path: str, classify_json: str,
-        results_dir: str, vehicle_dir: str,
-        mask_dir: str | None) -> str:
+        results_dir: str, vehicle_dir: str) -> str:
 
     _add_to_path(vehicle_dir)
     from blender_pipeline import run_blender_pipeline
@@ -67,12 +65,10 @@ def run(classify_id: str, glb_path: str, classify_json: str,
     with open(classify_json, 'w') as f:
         json.dump(classify_data, f, indent=2)
 
-    log.info(f"mask_dir: {mask_dir}")
-
     # ── Run shared Blender pipeline ───────────────────────────────────────────
     rigged_path = run_blender_pipeline(
         classify_id, glb_path, classify_json,
-        results_dir, vehicle_dir, mask_dir,
+        results_dir, vehicle_dir,
         mechanical=True,
     )
     log.info(f"Mechanical pipeline complete: {rigged_path}")
@@ -83,7 +79,7 @@ if __name__ == '__main__':
     if len(sys.argv) < 6:
         print("Usage: mechanical_pipeline.py "
               "<classify_id> <glb_path> <classify_json> "
-              "<results_dir> <vehicle_scripts_dir> [mask_dir]")
+              "<results_dir> <vehicle_scripts_dir>")
         sys.exit(1)
 
     rigged = run(
@@ -92,6 +88,5 @@ if __name__ == '__main__':
         classify_json = sys.argv[3],
         results_dir   = sys.argv[4],
         vehicle_dir   = sys.argv[5],
-        mask_dir      = sys.argv[6] if len(sys.argv) > 6 else None,
     )
     print(rigged)

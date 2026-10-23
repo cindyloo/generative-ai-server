@@ -43,12 +43,9 @@ glb_path        = os.path.abspath(sys.argv[sys.argv.index('--') + 1])
 output_path     = os.path.abspath(sys.argv[sys.argv.index('--') + 2])
 classify_json   = sys.argv[sys.argv.index('--') + 3]
 tire_verts_path = sys.argv[sys.argv.index('--') + 4]
-mask_dir        = sys.argv[sys.argv.index('--') + 5] \
-                  if len(sys.argv) > sys.argv.index('--') + 5 else None
 
 print("glb_path:", glb_path)
 print("output_path:", output_path)
-print("mask_dir:", mask_dir)
 
 with open(classify_json) as f:
     classify_data = json.load(f)
@@ -363,37 +360,6 @@ for nm, idxs in wheel_vert_groups_raw.items():
 
 # Outer-face Y correction removed — animatesam snaps pivot X to outer face
 # from the clean separated mesh verts, which is more accurate.
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SAM2 MASKS  (kept for future use — loaded but not used in Voronoi path)
-# ══════════════════════════════════════════════════════════════════════════════
-sam2_masks   = {}
-obj_top = obj_left = 0
-obj_h   = obj_w    = 1
-
-if mask_dir and os.path.isdir(mask_dir):
-    centers_path = os.path.join(mask_dir, 'wheel_centers.json')
-    if os.path.exists(centers_path):
-        with open(centers_path) as f:
-            wheel_centers = json.load(f)
-        img_bounds = wheel_centers.get('_image_bounds', {})
-        obj_top    = img_bounds.get('obj_top',    0)
-        obj_bottom = img_bounds.get('obj_bottom', 1)
-        obj_left   = img_bounds.get('obj_left',   0)
-        obj_right  = img_bounds.get('obj_right',  1)
-        obj_h      = max(obj_bottom - obj_top,  1)
-        obj_w      = max(obj_right  - obj_left, 1)
-
-    for name in true_centroids:
-        mask_path = os.path.join(mask_dir, f"{name}.png")
-        if os.path.exists(mask_path):
-            bpy_img  = bpy.data.images.load(os.path.abspath(mask_path))
-            px       = np.array(bpy_img.pixels[:])
-            mask_arr = (px[::4] > 0.5).reshape(bpy_img.size[1], bpy_img.size[0])
-            mask_arr = mask_arr[::-1, :]
-            bpy.data.images.remove(bpy_img)
-            sam2_masks[name] = mask_arr
-            print(f"  Loaded SAM2 mask '{name}': {mask_arr.shape} ({mask_arr.sum()} px)")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # VERTEX GROUP CREATION + MESH SEPARATION

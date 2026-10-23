@@ -202,268 +202,6 @@ def _make_workspace():
     return ws
  
 # ══════════════════════════════════════════════════════════════════════════════
-# SAM2 segmentation
-# ══════════════════════════════════════════════════════════════════════════════
-
-_sam2_predictor = None
-
-def _get_sam2():
-    global _sam2_predictor
-    if _sam2_predictor is None:
-        import torch
-        from sam2.build_sam import build_sam2
-        from sam2.sam2_image_predictor import SAM2ImagePredictor
-        import sam2 as sam2_pkg
-        sam2_dir        = os.path.dirname(sam2_pkg.__file__)
-        sam2_config     = os.environ.get('SAM2_CONFIG',
-            os.path.join(sam2_dir, 'configs/sam2.1/sam2.1_hiera_s.yaml'))
-        sam2_checkpoint = os.environ.get('SAM2_CHECKPOINT',
-            'checkpoints/sam2.1_hiera_small.pt')
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        model           = build_sam2(sam2_config, sam2_checkpoint, device=device)
-        _sam2_predictor = SAM2ImagePredictor(model)
-        log.info(f"SAM2 ready ({device}).")
-    return _sam2_predictor
-
-
-def segment_parts_with_sam2(img_path: str, joint_hints: list,
-                             classify_id: str, results_dir: str) -> dict:
-    """
-    Generate per-part SAM2 masks using Hough Circle detection to find the
-    true center/radius, then build anatomically-correct prompt points.
-
-    Saves masks to results_dir/<classify_id>_mask_<name>.png
-    Saves wheel_centers.json to results_dir/<classify_id>_masks/
-
-    Returns { hint_name: absolute_mask_path }
-    """
-    import torch
-    import cv2
-    from PIL import Image as PILImage, ImageDraw
-    print("loading sam2")
-    predictor = _get_sam2()
-
-    img         = PILImage.open(img_path).convert('RGB')
-    img_w, img_h = img.size
-    img_rgba    = np.array(PILImage.open(img_path).convert('RGBA'))
-    alpha       = img_rgba[:, :, 3]
-
-    rows = np.where(alpha.max(axis=1) > 0)[0]
-    cols = np.where(alpha.max(axis=0) > 0)[0]
-
-    obj_top    = int(rows.min())
-    obj_bottom = int(rows.max())
-    obj_left   = int(cols.min())
-    obj_right  = int(cols.max())
-    obj_h      = obj_bottom - obj_top
-    obj_w      = obj_right  - obj_left
-
-    log.info(f"Object bounds from alpha: "
-             f"top={obj_top} bottom={obj_bottom} "
-             f"left={obj_left} right={obj_right} "
-             f"obj_h={obj_h} obj_w={obj_w} "
-             f"img_h={img_h} img_w={img_w}")
-
-    img_np = np.array(img)
-    predictor.set_image(img_np)
-
-    wheel_hints = [h for h in joint_hints
-                   if h.get('body_part') in ('wheel', 'gear', 'hinge')]
-
-    mask_paths = {}
-    centers    = {}
-
-    centers['_image_bounds'] = {
-        'obj_top':    obj_top,
-        'obj_bottom': obj_bottom,
-        'obj_left':   obj_left,
-        'obj_right':  obj_right,
-        'img_w':      img_w,
-        'img_h':      img_h,
-    }
-
-    for hint in wheel_hints:
-        name      = hint['name']
-        p         = hint.get('position_normalized', {})
-        r_norm    = hint.get('wheel_radius_normalized', 0.15)
-        body_part = hint.get('body_part', 'wheel')
-        is_gear   = (body_part == 'gear')
-
-        # ── Step 1: rough bbox from normalized position ───────────────────────
-        r_px = r_norm * img_h   # not max(img_w, img_h)
-        pad  = 0.05 * img_h
-
-
-        cx_rough = p.get('x', 0.5) * img_w
-        cy_rough = (1.0 - p.get('y', 0.5)) * img_h
-
-        x1 = max(0,     int(cx_rough - r_px - pad))
-        y1 = max(0,     int(cy_rough - r_px - pad))
-        x2 = min(img_w, int(cx_rough + r_px + pad))
-        y2 = min(img_h, int(cy_rough + r_px + pad))
-
-        log.info(f"SAM2 [{name}] rough bbox=({x1},{y1},{x2},{y2}) "
-                 f"rough_center=({cx_rough:.0f},{cy_rough:.0f})")
-
-        # ── Step 2: Hough circle inside bbox ─────────────────────────────────
-        crop    = img_np[y1:y2, x1:x2]
-        gray    = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
-        blurred = cv2.GaussianBlur(gray, (9, 9), 2)
-
-        box_w, box_h = x2 - x1, y2 - y1
-        min_r    = int(min(box_w, box_h) * 0.28)
-        max_r    = int(min(box_w, box_h) * 0.62)
-        min_dist = 1 if is_gear else min(box_w, box_h)
-
-        circles = cv2.HoughCircles(
-            blurred, cv2.HOUGH_GRADIENT,
-            dp=1.2, minDist=min_dist,
-            param1=80, param2=35,
-            minRadius=min_r, maxRadius=max_r,
-        )
-        if circles is None:
-            circles = cv2.HoughCircles(
-                blurred, cv2.HOUGH_GRADIENT,
-                dp=1.5, minDist=min(box_w, box_h),
-                param1=60, param2=25,
-                minRadius=int(min_r * 0.7), maxRadius=int(max_r * 1.2),
-            )
-
-        if circles is not None:
-            bcx, bcy = box_w / 2, box_h / 2
-            best     = min(circles[0],
-                           key=lambda c: np.hypot(c[0] - bcx, c[1] - bcy))
-
-            # Validate: reject if Hough result is too far from hint (gear only)
-            cx_det = int(x1 + best[0])
-            cy_det = int(y1 + best[1])
-            if is_gear:
-                dist_from_hint = np.hypot(cx_det - cx_rough, cy_det - cy_rough)
-                if dist_from_hint > r_px * 2.0:
-                    log.warning(f"SAM2 [{name}] Hough result ({cx_det},{cy_det}) "
-                                f"is {dist_from_hint:.0f}px from hint — rejecting")
-                    cx = int(cx_rough); cy = int(cy_rough)
-                    radius = int(r_px * 0.9)
-                else:
-                    cx, cy, radius = cx_det, cy_det, int(best[2])
-            else:
-                cx, cy, radius = cx_det, cy_det, int(best[2])
-            log.info(f"SAM2 [{name}] Hough circle: center=({cx},{cy}) radius={radius}")
-        else:
-            cx     = int(cx_rough)
-            cy     = int(cy_rough)
-            radius = int(r_px * 0.9)
-            log.warning(f"SAM2 [{name}] Hough failed — using rough center ({cx},{cy}) r={radius}")
-
-        # ── Step 3: anatomical prompt points ─────────────────────────────────
-        def clamp_pt(x, y):
-            return (int(np.clip(x, 0, img_w - 1)),
-                    int(np.clip(y, 0, img_h - 1)))
-
-        point_list = [clamp_pt(cx, cy)]
-        label_list = [1]
-
-        for deg in (0, 90, 180, 270):
-            rad = np.radians(deg)
-            point_list.append(clamp_pt(cx + radius * 0.90 * np.cos(rad),
-                                       cy + radius * 0.90 * np.sin(rad)))
-            label_list.append(1)
-
-        for deg in (45, 135, 225, 315):
-            rad = np.radians(deg)
-            point_list.append(clamp_pt(cx + radius * 0.72 * np.cos(rad),
-                                       cy + radius * 0.72 * np.sin(rad)))
-            label_list.append(1)
-
-        point_list.append(clamp_pt(cx + radius * 1.25, cy))
-        label_list.append(0)
-
-        point_coords = np.array(point_list)
-        point_labels = np.array(label_list)
-
-        margin = int(radius * 0.15)
-        box = np.array([
-            max(0,     cx - radius - margin),
-            max(0,     cy - radius - margin),
-            min(img_w, cx + radius + margin),
-            min(img_h, cy + radius + margin),
-        ])
-
-        # ── Step 4: SAM2 predict ──────────────────────────────────────────────
-        with torch.inference_mode():
-            masks, scores, _ = predictor.predict(
-                point_coords=point_coords,
-                point_labels=point_labels,
-                box=box,
-                multimask_output=True,
-            )
-
-        best_idx  = int(np.argmax(scores))
-        best_mask = masks[best_idx].astype(bool)
-
-        ys, xs  = np.where(best_mask)
-        mask_cx = int(xs.mean()) if len(xs) > 0 else cx
-        mask_cy = int(ys.mean()) if len(ys) > 0 else cy
-
-        centers[name] = {
-            'hough_cx': cx,
-            'hough_cy': cy,
-            'hough_r':  radius,
-            'mask_cx':  mask_cx,
-            'mask_cy':  mask_cy,
-            'img_w':    img_w,
-            'img_h':    img_h,
-            'norm_cx':  mask_cx / img_w,
-            'norm_cy':  mask_cy / img_h,
-            'norm_r':   radius / max(img_w, img_h),
-        }
-        log.info(f"SAM2 [{name}] score={scores[best_idx]:.3f} "
-                 f"pixels={best_mask.sum()} "
-                 f"points={len(point_coords)} "
-                 f"box={box.tolist()}")
-
-        # ── Step 5: save mask ─────────────────────────────────────────────────
-        mask_path = os.path.join(results_dir, f"mask_{name}.png")
-        PILImage.fromarray((best_mask * 255).astype(np.uint8)).save(mask_path)
-        mask_paths[name] = mask_path
-
-        # ── Debug overlay ─────────────────────────────────────────────────────
-        debug_img = PILImage.fromarray(img_np.copy())
-        draw      = ImageDraw.Draw(debug_img)
-
-        mask_rgba = np.zeros((*best_mask.shape, 4), dtype=np.uint8)
-        mask_rgba[best_mask, 1] = 180
-        mask_rgba[best_mask, 3] = 80
-        overlay = PILImage.fromarray(mask_rgba, 'RGBA')
-        debug_img.paste(overlay, mask=overlay)
-
-        draw.ellipse([cx - radius, cy - radius, cx + radius, cy + radius],
-                     outline='cyan', width=2)
-        draw.rectangle([x1, y1, x2, y2], outline='red', width=2)
-
-        for (px_c, py_c), lbl in zip(point_list, label_list):
-            color = 'yellow' if lbl == 1 else 'red'
-            r_dot = 7
-            draw.ellipse([px_c - r_dot, py_c - r_dot,
-                          px_c + r_dot, py_c + r_dot],
-                         fill=color, outline='white', width=1)
-
-        debug_path = os.path.join(results_dir, f"sam2_debug_{name}.png")
-        debug_img.save(debug_path)
-        log.info(f"SAM2 debug image → {debug_path}")
-
-    # Save wheel_centers.json into mask_dir
-
-    mask_dir = os.path.abspath(os.path.join(results_dir, 'masks'))
-    centers_path = os.path.join(mask_dir, 'wheel_centers.json')
-    os.makedirs(mask_dir, exist_ok=True)
-    with open(centers_path, 'w') as f:
-        json.dump(centers, f, indent=2)
-
-    return mask_paths
-
-
-# ══════════════════════════════════════════════════════════════════════════════
 # Error handlers
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -962,48 +700,6 @@ def joints_from_model(joints_data: dict, glb_path: str):
          f"(Claude x→X, y→Y, z→Z)")
 
     return joints, hierarchy, hint_objects
-
-def mirror_wheel_centers(mask_dir, joint_hints):
-    centers_path = os.path.join(mask_dir, 'wheel_centers.json')
-    if not os.path.exists(centers_path):
-        return
-    with open(centers_path) as f:
-        centers = json.load(f)
-
-    updated = False
-    for hint in joint_hints:
-        if not hint.get('mirrored'):
-            continue
-        name        = hint['name']
-        source_name = hint.get('mirrored_from')
-        if not source_name or source_name not in centers or name in centers:
-            continue
-
-        src  = centers[source_name]
-        img_w = src['img_w']
-        mirrored_cx = img_w - src['mask_cx']
-
-        centers[name] = {
-            'hough_cx': img_w - src['hough_cx'],
-            'hough_cy': src['hough_cy'],
-            'hough_r':  src['hough_r'],
-            'mask_cx':  mirrored_cx,
-            'mask_cy':  src['mask_cy'],
-            'img_w':    img_w,
-            'img_h':    src['img_h'],
-            'norm_cx':  mirrored_cx / img_w,
-            'norm_cy':  src['norm_cy'],
-            'norm_r':   src['norm_r'],
-            'mirrored': True,
-        }
-        updated = True
-        log.info(f"Mirrored center: {source_name}→{name} "
-                 f"cx {src['mask_cx']}→{mirrored_cx}")
-
-    if updated:
-        with open(centers_path, 'w') as f:
-            json.dump(centers, f, indent=2)
-
 
 def _detect_trunk_x_edges(verts_in_band: np.ndarray, mesh_center_x: float):
     """
@@ -1582,7 +1278,6 @@ def run_mechanical_pipeline(classify_id: str, glb_path: str,
     vehicle_dir   = os.path.join(seg_dir, 'vehicle')
     _rd           = _rdir(classify_id)
     classify_json = os.path.abspath(os.path.join(_rd, f"{classify_id}_classify.json"))
-    mask_dir      = os.path.abspath(os.path.join(_rd, f"{classify_id}_masks"))
 
     record      = hydrate(_store.get(classify_id))
     joints_data = (record.get('joints') or {}) if record else {}
@@ -1615,42 +1310,11 @@ def run_mechanical_pipeline(classify_id: str, glb_path: str,
         json.dump(classify_data, f, indent=2)
     log.info(f"Injected {len(classify_data['joint_hints'])} mechanical joints")
 
-    # ── SAM2 segmentation ─────────────────────────────────────────────────────
-    active_path = record.get('active_image_path') if record else None
-    if active_path and os.path.exists(active_path):
-        try:
-            os.makedirs(mask_dir, exist_ok=True)
-            raw_mask_paths = segment_parts_with_sam2(
-                active_path, classify_data['joint_hints'], classify_id, mask_dir
-            )
-            import shutil
-            for hint_name, src_path in raw_mask_paths.items():
-                dst_path = os.path.join(mask_dir, f"{hint_name}.png")
-                if os.path.exists(dst_path):
-                    os.unlink(dst_path)
-                shutil.copy2(src_path, dst_path)
-                log.info(f"Mask → {dst_path}")
-            with open(classify_json, 'r') as f:
-                _cdata = json.load(f)
-            _cdata['sam2_masks']    = raw_mask_paths
-            _cdata['sam2_mask_dir'] = mask_dir
-            with open(classify_json, 'w') as f:
-                json.dump(_cdata, f, indent=2)
-            log.info(f"SAM2 masks ready: {list(raw_mask_paths.keys())}")
-        except Exception as e:
-            log.warning(f"SAM2 segmentation failed (non-fatal): {e}")
-            mask_dir = None
-    else:
-        log.warning("No active image — SAM2 skipped")
-        mask_dir = None
-
     # ── Invoke pipeline script ────────────────────────────────────────────────
     mech_script = os.path.join(seg_dir, 'vehicle', 'mechanical_pipeline.py')
     cmd = [sys.executable, mech_script,
            classify_id, glb_path, classify_json,
            _rd, vehicle_dir]
-    if mask_dir and os.path.isdir(mask_dir):
-        cmd.append(mask_dir)
 
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
     log.info(result.stdout)
@@ -1875,7 +1539,6 @@ def run_rig_pipeline(task_id: str, classify_id: str, user_id: str, host: str):
         vehicle_dir   = os.path.join(seg_dir, 'vehicle')
         _rd           = _rdir(classify_id)
         classify_json = os.path.join(_rd, f"{classify_id}_classify.json")
-        mask_dir      = os.path.join(_rd, f"{classify_id}_masks")
         active_path   = record.get('active_image_path', '')
 
         is_vehicle = (
@@ -2092,91 +1755,6 @@ def segment():
         log.error(f"/segment error: {e}")
         return jsonify({'error': str(e)}), 500
 
-# ── SAM ───────────────────────────────────────────────────────────────────────
-_sam2_predictor = None
-
-def _get_sam2():
-    global _sam2_predictor
-    if _sam2_predictor is None:
-        import torch
-        from sam2.build_sam import build_sam2
-        from sam2.sam2_image_predictor import SAM2ImagePredictor
-        import sam2 as sam2_pkg
-        sam2_dir    = os.path.dirname(sam2_pkg.__file__)
-        sam2_config = os.environ.get('SAM2_CONFIG',
-            os.path.join(sam2_dir, 'configs/sam2.1/sam2.1_hiera_s.yaml'))
-        sam2_checkpoint = os.environ.get('SAM2_CHECKPOINT',
-            'checkpoints/sam2.1_hiera_small.pt')
-        model           = build_sam2(sam2_config, sam2_checkpoint,
-                                     device='cpu')
-        _sam2_predictor = SAM2ImagePredictor(model)
-        log.info("SAM2 ready (CPU).")
-    return _sam2_predictor
-   
-# ── /segment_parts ────────────────────────────────────────────────────────────
-
-@app.route('/segment_parts', methods=['GET', 'POST'])
-def segment_parts():
-    """
-    Run SAM2 part segmentation on the active image using joint positions as prompts.
-    Requires /classify and /infer_joints to have run first.
-    Saves per-wheel masks to RESULTS_DIR and stores mask_paths in the record.
-    """
-    if request.method == 'GET':
-        return jsonify({'status': 'ok'}), 200
-    try:
-        classify_id = request.args.get('classify_id', '').strip()
-        force       = request.args.get('force', '').lower() in ('1', 'true', 'yes')
-
-        if not classify_id:
-            return jsonify({'error': 'Missing classify_id'}), 400
-
-        record = hydrate(_store.get(classify_id))
-        if not record:
-            return jsonify({'error': f"classify_id '{classify_id}' not found"}), 404
-
-        # Cache check
-        if not force and record.get('sam2_masks'):
-            log.info(f"SAM2 mask cache hit: {classify_id}")
-            return jsonify({
-                'status':      'ok',
-                'classify_id': classify_id,
-                'mask_paths':  record['sam2_masks'],
-            })
-
-        joints_data = record.get('joints') or {}
-        joint_hints = joints_data.get('joint_hints', [])
-        if not joint_hints:
-            return jsonify({'error': 'No joints found — run /infer_joints first'}), 422
-
-        active_path = record.get('active_image_path')
-        if not active_path or not os.path.exists(active_path):
-            return jsonify({'error': f"Active image not found: '{active_path}'"}), 404
-
-        log.info(f"Running SAM2 segmentation for {classify_id} "
-                 f"({len([h for h in joint_hints if h.get('body_part') in ('wheel','gear')])} wheel/gear hints)")
-
-        mask_paths = segment_parts_with_sam2(active_path, joint_hints, classify_id, _rdir(classify_id))
-
-        # Store mask paths in record
-        _store.upsert_classify(classify_id, record.get('tag', ''),
-                               {**record.get('classify', {}),
-                                'sam2_masks': mask_paths})
-
-        return jsonify({
-            'status':      'ok',
-            'classify_id': classify_id,
-            'mask_paths':  mask_paths,
-            'mask_urls':   {name: _local_url(path, request.host)
-                            for name, path in mask_paths.items()},
-        })
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        log.error(f"/segment_parts error: {e}")
-        return jsonify({'error': str(e)}), 500
-   
 # ── /classify ─────────────────────────────────────────────────────────────────
 @app.route('/classify', methods=['GET', 'POST'])
 def classify():
