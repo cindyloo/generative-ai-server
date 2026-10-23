@@ -1,4 +1,4 @@
-import sys, math
+import sys, math, re
 import struct, json
 
 input_path  = sys.argv[1]
@@ -18,11 +18,14 @@ print(f"Input animations: {len(anims)}")
 for a in anims:
     print(f"  {a['name']}: {len(a['channels'])} channels")
 
-# Merge into one animation per clip. animatesam.py names each action
-# "{clip}__{object}"; older per-wheel actions (wheel_0_rot, ...) are "drive".
+# Merge into one animation per clip. animatesam.py exports one animation per
+# NLA track, named for its clip; per-action names ("{clip}__{object}") and
+# older per-wheel actions (wheel_0_rot, ...) are folded in too.
 clips = {}
 for anim in anims:
-    clip = anim['name'].split('__', 1)[0] if '__' in anim['name'] else 'drive'
+    name = anim['name']
+    clip = (name.split('__', 1)[0] if '__' in name
+            else 'drive' if re.fullmatch(r'wheel_\d+_rot', name) else name)
     merged = clips.setdefault(clip, {'name': clip, 'channels': [], 'samplers': []})
     sampler_offset = len(merged['samplers'])
     merged['samplers'].extend(anim['samplers'])

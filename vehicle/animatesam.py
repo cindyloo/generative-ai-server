@@ -185,6 +185,9 @@ for i, wheel in enumerate(wheel_objects):
     # ── Set Blender origin to pivot ──────────────────────────────────────────
     # cursor.location is in world space — origin_set moves the object origin
     # to the cursor without transform_apply, which would shift the mesh.
+    # origin_set acts on every selected object, and the glTF import leaves
+    # them all selected: without this the body's origin moved with each wheel.
+    bpy.ops.object.select_all(action='DESELECT')
     bpy.context.view_layer.objects.active = wheel
     wheel.select_set(True)
     bpy.context.scene.cursor.location = (cx, cy, cz)
@@ -258,6 +261,12 @@ for i, wheel in enumerate(wheel_objects):
     wheel.animation_data.action = None
     print(f"  NLA strip 'drive' created")
 
+# Rest pose of every object, now that each wheel's origin is on its pivot.
+# Restored before export: see there.
+rest_pose = {o.name: (o.location.copy(), o.rotation_mode, o.rotation_euler.copy(),
+                      o.rotation_quaternion.copy())
+             for o in bpy.data.objects if o.type == 'MESH'}
+
 # ── Road-wheel clips ──────────────────────────────────────────────────────────
 # Actions are named "{clip}__{object}"; merge_animations.py joins each clip's
 # actions across objects into one animation named {clip}.
@@ -277,6 +286,16 @@ def add_clip(obj, clip, curves, interpolation='LINEAR'):
     # The glTF importer leaves objects in quaternion mode, where Euler
     # keyframes are ignored: the body would slide round a turn without yawing.
     obj.rotation_mode = 'XYZ'
+    # Key all six channels. One the clip doesn't move is held at rest:
+    # otherwise the exporter fills it from whatever the previous track it
+    # sampled left behind (a turn clip's 44 deg yaw ended up in drive).
+    loc, _, rot, _ = rest_pose[obj.name]
+    first = min(k[0][0] for _, _, k in curves)
+    last  = max(k[-1][0] for _, _, k in curves)
+    given = {(path, idx) for path, idx, _ in curves}
+    curves = list(curves) + [(path, i, [(first, base[i]), (last, base[i])])
+                             for path, base in (('location', loc), ('rotation_euler', rot))
+                             for i in range(3) if (path, i) not in given]
     act = bpy.data.actions.new(name=f"{clip}__{obj.name}")
     for path, idx, keys in curves:
         fc = act.fcurves.new(data_path=path, index=idx)
@@ -284,6 +303,7 @@ def add_clip(obj, clip, curves, interpolation='LINEAR'):
         for kp, (frame, value) in zip(fc.keyframe_points, keys):
             kp.co = (frame, value)
             kp.interpolation = interpolation
+        fc.update()   # recompute handles: else a held BEZIER key sags between keys
     obj.animation_data_create()
     track      = obj.animation_data.nla_tracks.new()
     track.name = clip
@@ -342,8 +362,8 @@ if road_wheels:
             it along its own circle round the turn centre, so the inner wheel
             turns more and neither scrubs. Left of the vehicle is +Y·fwd.
             """
-            if not can_turn:
-                return delta   # no rear axle to steer around
+            if not can_turn or len(front) < 2:
+                return delta   # no rear axle, or one front wheel (a bike)
             t    = math.tan(delta)
             left = fwd * (wheel.location.y - rear_c.y)
             return math.atan2(wheelbase * t, wheelbase - left * t)
@@ -421,10 +441,24 @@ if road_wheels:
               f"wheelbase {wheelbase:.3f})")
 
 # ── Export ────────────────────────────────────────────────────────────────────
+# A clip keys only the channels it moves (drive keys just the roll); the
+# rest come from each object's stored transform, which Blender overwrites
+# whenever it plays the NLA stack: a turn clip's final yaw ended up in
+# drive. Put every object back at rest, in Euler mode like the clips.
+for o in bpy.data.objects:
+    if o.name in rest_pose:
+        loc, _, rot, _ = rest_pose[o.name]
+        o.rotation_mode  = 'XYZ'
+        o.location       = loc
+        o.rotation_euler = rot
 bpy.ops.export_scene.gltf(
     filepath=output_path,
     export_format='GLB',
     export_animations=True,
+    # One animation per NLA track (= clip), each sampled with the object's
+    # other tracks muted. The default ACTIONS mode sampled each action with
+    # the other tracks still playing, so a turn clip's yaw leaked into drive.
+    export_animation_mode='NLA_TRACKS',
     export_nla_strips=True,
     export_current_frame=False,
     export_force_sampling=True,
