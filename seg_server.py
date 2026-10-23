@@ -1984,6 +1984,9 @@ def run_rig_pipeline(task_id: str, classify_id: str, user_id: str, host: str):
             _rig_tasks[task_id] = {'status': 'rigging_blender', 'progress': 60}
             run_blender_rig(active_glb, skeleton_json_path, rigged_path)
 
+        _rig_tasks[task_id] = {'status': 'exporting_usdz', 'progress': 85}
+        rigged_usdz_path = export_rigged_usdz(rigged_path)
+
         # ── Update mesh record (paths are not stored — reconstructed at read time)
         if decimated_path:
             _store.upsert_mesh(classify_id, {**mesh_data})
@@ -1999,6 +2002,7 @@ def run_rig_pipeline(task_id: str, classify_id: str, user_id: str, host: str):
             'status':      'ok',
             'progress':    100,
             'rigged_url':  _local_url(rigged_path, host),
+            'rigged_usdz_url': _local_url(rigged_usdz_path, host),
             'glb_url':     glb_url,
             'classify_id': classify_id,
         }
@@ -3636,10 +3640,13 @@ def rig():
             rigged_path = ps._resolve_path(classify_id, 'rigged.glb')
             if os.path.exists(rigged_path):
                 log.info(f"Rig cache hit: {classify_id}")
+                rigged_usdz_path = ps._resolve_path(classify_id, 'rigged.usdz')
                 return jsonify({
                     'status':      'ok',
                     'task_id':     None,
                     'rigged_url':  _local_url(rigged_path, request.host),
+                    'rigged_usdz_url': _local_url(rigged_usdz_path, request.host)
+                                       if os.path.exists(rigged_usdz_path) else None,
                     'glb_url':     mesh_data.get('glb_url'),
                     'classify_id': classify_id,
                 })
@@ -3842,39 +3849,80 @@ def decimate_usdz():
 
 #── /convert_to_usdz ──────────────────────────────────────────────────────────
 
+#: A USD skeleton plays one animation (AR Quick Look plays only that one), so
+#: a rigged USDZ carries the first of these clips the GLB has.
+USDZ_CLIP_ORDER = ('swim', 'fly', 'walk', 'drive', 'idle')
+
+
 def convert_glb_to_usdz(glb_path: str, usdz_path: str) -> str:
-    """Convert GLB to USDZ using Blender's USD exporter."""
-    import textwrap, tempfile, subprocess
-    
+    """
+    Convert GLB to USDZ using Blender's USD exporter, Y-up like glTF (and
+    like the USDZ Meshy returns) rather than Blender's Z-up.
+
+    A rigged GLB keeps its skeleton and skinning. Its clips are NLA tracks;
+    USD takes only the armature's active action, so the first of
+    USDZ_CLIP_ORDER it has becomes the animation, looping over its frames.
+    """
     script = textwrap.dedent(f"""
         import bpy
         bpy.ops.wm.read_factory_settings(use_empty=True)
         bpy.ops.import_scene.gltf(filepath=r'{glb_path}')
+        clip = None
+        arm = next((o for o in bpy.data.objects if o.type == 'ARMATURE'), None)
+        if arm and arm.animation_data:
+            actions = {{a.name: a for a in bpy.data.actions}}
+            clip = next((actions[n] for n in {USDZ_CLIP_ORDER!r} if n in actions),
+                        None)
+        if clip:
+            for track in arm.animation_data.nla_tracks:
+                track.mute = True
+            arm.animation_data.action = clip
+            start, end = clip.frame_range
+            bpy.context.scene.frame_start = int(start)
+            bpy.context.scene.frame_end   = int(end)
+            print(f'USDZ clip: {{clip.name}}')
         bpy.ops.wm.usd_export(
             filepath=r'{usdz_path}',
-            export_animation=True,
+            export_animation=clip is not None,
+            export_armatures=True,
             export_textures=True,
             export_materials=True,
+            convert_orientation=True,
+            export_global_forward_selection='NEGATIVE_Z',
+            export_global_up_selection='Y',
         )
         print('USDZ export done')
     """).strip()
-    
-    sf = tempfile.mktemp(suffix='.py')
-    with open(sf, 'w') as f:
+
+    with tempfile.NamedTemporaryFile('w', suffix='.py', delete=False) as f:
         f.write(script)
-    result = subprocess.run(
-        [_blender_bin(), '--background', '--python', sf],
-        capture_output=True, text=True, timeout=120
-    )
-    log.info(result.stdout)
-    os.unlink(sf)
-    
+        sf = f.name
+    try:
+        result = subprocess.run(
+            [_blender_bin(), '--background', '--python', sf],
+            capture_output=True, text=True, timeout=300
+        )
+    finally:
+        os.unlink(sf)
+    log.info(result.stdout[-2000:])
+
     if not os.path.exists(usdz_path):
         raise RuntimeError(f"USDZ export failed: {result.stderr[-300:]}")
-    
+
     log.info(f"Converted {glb_path} → {usdz_path}")
     return usdz_path
-    
+
+
+def export_rigged_usdz(rigged_path: str) -> str | None:
+    """Write {classify_id}_rigged.usdz next to the rigged GLB. Non-fatal: the
+    GLB is the rig's main output, so a failed export only logs."""
+    usdz_path = rigged_path[:-len('.glb')] + '.usdz'
+    try:
+        return convert_glb_to_usdz(rigged_path, usdz_path)
+    except Exception as e:
+        log.warning(f"Rigged USDZ export failed (non-fatal): {e}")
+        return None
+
 @app.route('/convert_to_usdz', methods=['GET', 'POST'])
 def convert_to_usdz():
     if request.method == 'GET':

@@ -163,6 +163,11 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec='seconds')
 
 
+#: Rig file paths: reconstructed from classify_id at read time, never stored.
+_RIG_LOCAL_PATHS = ('rigged_glb_path', 'rigged_usdz_path', 'viz_glb_path',
+                    'skeleton_json_path')
+
+
 def _local_url(path: str | None, host: str) -> str | None:
     if not path:
         return None
@@ -301,9 +306,13 @@ def _inject_urls(record: dict, host: str) -> dict:
     # rig — resolve local paths across all layouts
     if cid:
         rig['rigged_glb_path']    = _resolve_path(cid, 'rigged.glb')
+        rig['rigged_usdz_path']   = _resolve_path(cid, 'rigged.usdz')
         rig['viz_glb_path']       = _resolve_path(cid, 'viz.glb')
         rig['skeleton_json_path'] = _resolve_path(cid, 'skeleton.json')
     rig['rigged_url'] = _local_url(rig.get('rigged_glb_path'), host)
+    usdz = rig.get('rigged_usdz_path')
+    rig['rigged_usdz_url'] = (_local_url(usdz, host)
+                              if usdz and os.path.exists(usdz) else None)
     rig['viz_url']    = _local_url(rig.get('viz_glb_path'),    host)
 
     r['classify'] = cls    or None
@@ -485,7 +494,7 @@ class JsonStore:
         with self._lock:
             record = self._get_or_create(classify_id)
             clean = {k: v for k, v in rig_data.items()
-                     if k not in ('rigged_glb_path', 'viz_glb_path', 'skeleton_json_path')}
+                     if k not in _RIG_LOCAL_PATHS}
             record['rig'] = {
                 'status':     'ok',
                 'error':      None,
@@ -623,7 +632,7 @@ class TinyDbStore:
     def upsert_rig(self, classify_id: str, rig_data: dict):
         with self._lock:
             rig_data = {k: v for k, v in rig_data.items()
-                        if k not in ('rigged_glb_path', 'viz_glb_path', 'skeleton_json_path')}
+                        if k not in _RIG_LOCAL_PATHS}
             rig_data.setdefault('status', 'ok')
             rig_data.setdefault('error',  None)
             rig_data.setdefault('created_at', _now())
@@ -817,7 +826,7 @@ class CloudDbStore:
         with self._lock:
             record = self._load_or_blank(classify_id)
             clean = {k: v for k, v in rig_data.items()
-                     if k not in ('rigged_glb_path', 'viz_glb_path', 'skeleton_json_path')}
+                     if k not in _RIG_LOCAL_PATHS}
             clean.setdefault('status', 'ok')
             clean.setdefault('error',  None)
             clean.setdefault('created_at', _now())
