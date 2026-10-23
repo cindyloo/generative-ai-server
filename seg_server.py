@@ -3345,13 +3345,31 @@ def mesh():
             cached = _store.get_mesh_by_hash(mesh_hash)
             if cached:
                 log.info(f"Mesh hash cache hit: {mesh_hash}")
+                # Paths are rebuilt from classify_id, so the matching record's
+                # files must be copied under this one or /infer_joints and
+                # /rig find no mesh. copyfile, not copy2: a copy with the
+                # source's old mtime would look older than this record's
+                # image, and the next /mesh would pay to regenerate it.
+                # results/{id}/{id}_mesh.glb, results/{id}/mesh.glb or the
+                # old flat results/{id}_mesh.glb
+                fname  = os.path.basename(cached['glb_path'])
+                src_id = (fname[:-len('_mesh.glb')] if fname.endswith('_mesh.glb')
+                          else os.path.basename(os.path.dirname(cached['glb_path'])))
+                os.makedirs(_rdir(classify_id), exist_ok=True)
+                for name in ('mesh.glb', 'mesh.usdz', 'decimated.glb'):
+                    src = ps._resolve_path(src_id, name)
+                    if os.path.exists(src):
+                        dst = os.path.join(_rdir(classify_id), f"{classify_id}_{name}")
+                        shutil.copyfile(src, dst)
+                glb_path = ps._resolve_path(classify_id, 'mesh.glb')
                 _store.upsert_mesh(classify_id, cached)
                 return jsonify({
                     'status':        'ok',
                     'task_id':       None,
                     'glb_url':       cached.get('glb_url'),
-                    'glb_local_url': _local_url(cached['glb_path'], request.host),
+                    'glb_local_url': _local_url(glb_path, request.host),
                     'classify_id':   classify_id,
+                    'mesh_source':   src_id,
                 })
 
         task_id = str(uuid.uuid4())[:8]
@@ -3965,7 +3983,7 @@ def list_assets():
                 rel = os.path.relpath(os.path.join(root, f), EXAMPLES_DIR)
                 glbs.append({
                     'filename': rel,
-                    'url': _local_url(os.path.join(ASSETS_DIR, rel), request.host),
+                    'url': f"http://{request.host}/examples/{rel}",
                     'size_kb': round(os.path.getsize(os.path.join(root, f)) / 1024, 1),
                 })
     return jsonify(glbs)
