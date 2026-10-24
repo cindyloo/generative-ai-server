@@ -5,15 +5,17 @@ Step 3 of the vehicle pipeline.
 
 Loads the separated GLB (one mesh per wheel + body), sets each wheel's
 origin to the Taubin-computed pivot stored in blender_wheel_centroids,
-then adds a one-full-rotation NLA animation strip to every wheel object.
+then adds NLA clips: road wheels get drive (spin in place), drive_forward
+and drive_backward (the whole vehicle rolls one wheel-turn) and steer_left /
+steer_right (front wheels); gears and hinges get drive.
 
 Coordinate system (Blender world space after GLB import)
 ---------------------------------------------------------
-  X = left ↔ right
-  Y = depth (front ↔ rear)
+  X = vehicle length (front ↔ rear)
+  Y = axle (left ↔ right)
   Z = height (up)
 
-Wheels on a vehicle (side view) rotate around the Y axis (front-rear).
+Wheels on a vehicle (side view) rotate around the Y axis (the axle).
 Gears in a mechanical assembly use the rotation axis stored in classify JSON.
 
 What changed vs the previous version
@@ -33,8 +35,8 @@ What changed vs the previous version
 """
 
 import bpy, sys, math, json, os
-sys.path.insert(0, '/tmp/blender_packages')
 import numpy as np
+from mathutils import Matrix, Vector
 
 input_path    = sys.argv[sys.argv.index('--') + 1]
 output_path   = sys.argv[sys.argv.index('--') + 2]
@@ -113,30 +115,24 @@ bpy.context.scene.frame_start = 1
 bpy.context.scene.frame_end   = 61
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CLAUDE CONVENTION (fixed, never detected at runtime)
-# Claude ALWAYS uses:
-#   axis 0 (X) = left-right
-#   axis 1 (Y) = front-rear
-#   axis 2 (Z) = height
-#
-# This maps 1:1 to Blender world space after GLB import.
-# trimesh and Blender have opposite Y/Z conventions but that swap is handled
-# in classify_wheels.py when loading centroids; by the time we get here the
-# Blender centroid coords are already in Blender space.
+# Blender world axes after GLB import (see classify_wheels.py):
+#   X = vehicle length (front ↔ rear)
+#   Y = axle (left ↔ right)
+#   Z = height (up)
+# Wheels turn about Y, their axle. The index names below are historical:
+# fr_idx (1) is the axle, not front-rear.
 # ══════════════════════════════════════════════════════════════════════════════
-lr_idx = 0   # left-right
-fr_idx = 1   # front-rear
+lr_idx = 0
+fr_idx = 1
 h_idx  = 2   # height
 
-# Wheels rotate around the front-rear axis (Y) — spinning in place as the
-# vehicle moves forward.
 rotation_axis = fr_idx
 
-print(f"\nClaude convention axes: lr=0  fr=1  h=2")
 print(f"Wheel rotation axis: {['X','Y','Z'][rotation_axis]} (index={rotation_axis})")
 
 # ── Animate each wheel object ─────────────────────────────────────────────────
 wheel_objects = sorted(mesh_objects, key=lambda o: o.name)
+road_wheels   = []   # (object, radius): standard wheels, animated after the loop
 
 for i, wheel in enumerate(wheel_objects):
     verts_np     = np.array([wheel.matrix_world @ v.co for v in wheel.data.vertices])
@@ -189,6 +185,9 @@ for i, wheel in enumerate(wheel_objects):
     # ── Set Blender origin to pivot ──────────────────────────────────────────
     # cursor.location is in world space — origin_set moves the object origin
     # to the cursor without transform_apply, which would shift the mesh.
+    # origin_set acts on every selected object, and the glTF import leaves
+    # them all selected: without this the body's origin moved with each wheel.
+    bpy.ops.object.select_all(action='DESELECT')
     bpy.context.view_layer.objects.active = wheel
     wheel.select_set(True)
     bpy.context.scene.cursor.location = (cx, cy, cz)
@@ -243,14 +242,15 @@ for i, wheel in enumerate(wheel_objects):
               f"ratio={speed_ratio:.2f} angle={math.degrees(total_angle):.1f}°")
 
     else:
-        # Standard vehicle wheel: one full forward rotation
-        fc = action.fcurves.new(data_path='rotation_euler', index=rotation_axis)
-        fc.keyframe_points.add(2)
-        fc.keyframe_points[0].co = (1,  0.0)
-        fc.keyframe_points[1].co = (61, math.pi * 2)
-        for kp in fc.keyframe_points:
-            kp.interpolation = 'LINEAR'
-        print(f"  wheel: one full rotation around {['X','Y','Z'][rotation_axis]}")
+        # Standard vehicle wheel: its clips are built after this loop, once
+        # every wheel's pivot is known — which way is forward comes from
+        # where the front wheels sit relative to the rear ones.
+        bpy.data.actions.remove(action)
+        radius = pivot_entry.get('radius') if isinstance(pivot_entry, dict) else None
+        road_wheels.append((wheel, float(radius) if radius else
+                            float(np.ptp(verts_np[:, h_idx])) / 2))
+        print(f"  wheel: radius {road_wheels[-1][1]:.3f}, clips built below")
+        continue
 
     # ── Push to NLA ──────────────────────────────────────────────────────────
     wheel.animation_data_create()
@@ -261,11 +261,204 @@ for i, wheel in enumerate(wheel_objects):
     wheel.animation_data.action = None
     print(f"  NLA strip 'drive' created")
 
+# Rest pose of every object, now that each wheel's origin is on its pivot.
+# Restored before export: see there.
+rest_pose = {o.name: (o.location.copy(), o.rotation_mode, o.rotation_euler.copy(),
+                      o.rotation_quaternion.copy())
+             for o in bpy.data.objects if o.type == 'MESH'}
+
+# ── Road-wheel clips ──────────────────────────────────────────────────────────
+# Actions are named "{clip}__{object}"; merge_animations.py joins each clip's
+# actions across objects into one animation named {clip}.
+#
+# Rolling: wheels turn about Blender Y (the axle) and the vehicle runs along
+# X. Turning +θ about +Y moves a wheel's contact point toward -X, so rolling
+# a distance D along +X without slipping is +D/R, and along -X it is -D/R.
+# Steering: +θ about the vertical (Z) turns any heading toward the vehicle's
+# left (up × forward), whichever way it faces. Euler XYZ applies the roll
+# about the axle first and the steer after it, as a real front wheel does.
+STEER   = math.radians(25)
+END     = 61
+
+
+def add_clip(obj, clip, curves, interpolation='LINEAR'):
+    """curves: [(data_path, index, [(frame, value), ...]), ...]"""
+    # The glTF importer leaves objects in quaternion mode, where Euler
+    # keyframes are ignored: the body would slide round a turn without yawing.
+    obj.rotation_mode = 'XYZ'
+    # Key all six channels. One the clip doesn't move is held at rest:
+    # otherwise the exporter fills it from whatever the previous track it
+    # sampled left behind (a turn clip's 44 deg yaw ended up in drive).
+    loc, _, rot, _ = rest_pose[obj.name]
+    first = min(k[0][0] for _, _, k in curves)
+    last  = max(k[-1][0] for _, _, k in curves)
+    given = {(path, idx) for path, idx, _ in curves}
+    curves = list(curves) + [(path, i, [(first, base[i]), (last, base[i])])
+                             for path, base in (('location', loc), ('rotation_euler', rot))
+                             for i in range(3) if (path, i) not in given]
+    act = bpy.data.actions.new(name=f"{clip}__{obj.name}")
+    for path, idx, keys in curves:
+        fc = act.fcurves.new(data_path=path, index=idx)
+        fc.keyframe_points.add(len(keys))
+        for kp, (frame, value) in zip(fc.keyframe_points, keys):
+            kp.co = (frame, value)
+            kp.interpolation = interpolation
+        fc.update()   # recompute handles: else a held BEZIER key sags between keys
+    obj.animation_data_create()
+    track      = obj.animation_data.nla_tracks.new()
+    track.name = clip
+    track.strips.new(clip, 1, act)
+
+
+if road_wheels:
+    def axle_x(names):
+        xs = [w.location.x for w, _ in road_wheels if any(n in w.name for n in names)]
+        return sum(xs) / len(xs) if xs else None
+
+    front_x, rear_x = axle_x(('_fl', '_fr', '_f')), axle_x(('_rl', '_rr', '_r'))
+    # Image left becomes -X, and most photos have the vehicle facing left
+    fwd = (1.0 if front_x > rear_x else -1.0) if None not in (front_x, rear_x) else -1.0
+    distance = 2 * math.pi * sum(r for _, r in road_wheels) / len(road_wheels)
+    print(f"\nRoad wheels: forward is {'+' if fwd > 0 else '-'}X, "
+          f"drive_forward travels {distance:.3f} (one turn)")
+
+    for wheel, r in road_wheels:
+        roll = fwd * distance / r
+        add_clip(wheel, 'drive', [('rotation_euler', rotation_axis, [(1, 0.0), (END, roll)])])
+
+    if not is_mechanical:
+        movers = [o for o in bpy.data.objects if o.type == 'MESH']
+        road   = {w.name: r for w, r in road_wheels}
+        for clip, sign in (('drive_forward', 1.0), ('drive_backward', -1.0)):
+            for obj in movers:
+                x0 = obj.location.x
+                curves = [('location', 0, [(1, x0), (END, x0 + sign * fwd * distance)])]
+                if obj.name in road:
+                    roll = sign * fwd * distance / road[obj.name]
+                    curves.append(('rotation_euler', rotation_axis, [(1, 0.0), (END, roll)]))
+                add_clip(obj, clip, curves)
+
+        front = [w for w, _ in road_wheels if '_f' in w.name] or \
+                [min(road_wheels, key=lambda wr: fwd * -wr[0].location.x)[0]]
+        front_names = {w.name for w in front}
+        rear = [w for w, _ in road_wheels if w.name not in front_names]
+
+        def mean_loc(ws):
+            return sum((w.location for w in ws), Vector()) / len(ws)
+
+        # Turning needs both axles. Without rear wheels (when separation
+        # found only the front ones) the rear axle is taken as the front one
+        # for the steering angles, and the turn clips are skipped: a
+        # near-zero wheelbase would spin the vehicle on the spot.
+        rear_c, front_c = mean_loc(rear or front), mean_loc(front)
+        wheelbase = abs(front_c.x - rear_c.x)
+        can_turn  = bool(rear) and wheelbase > 1e-3
+        wheelbase = max(wheelbase, 1e-6)
+
+        def wheel_steer(wheel, delta):
+            """
+            Ackermann steering: the bicycle-model angle delta at the front
+            axle's centre becomes, for each front wheel, the angle that points
+            it along its own circle round the turn centre, so the inner wheel
+            turns more and neither scrubs. Left of the vehicle is +Y·fwd.
+            """
+            if not can_turn or len(front) < 2:
+                return delta   # no rear axle, or one front wheel (a bike)
+            t    = math.tan(delta)
+            left = fwd * (wheel.location.y - rear_c.y)
+            return math.atan2(wheelbase * t, wheelbase - left * t)
+
+        for clip, sign in (('steer_left', 1.0), ('steer_right', -1.0)):
+            for wheel in front:
+                a = wheel_steer(wheel, sign * STEER)
+                add_clip(wheel, clip, [('rotation_euler', 2,
+                                        [(1, 0.0), (21, a), (41, a), (END, 0.0)])],
+                         interpolation='BEZIER')
+
+        # ── Turning while driving: bicycle model, integrated per frame ────────
+        # The rear axle's centre P moves along the heading psi; psi turns at
+        # tan(delta) / wheelbase per unit distance (reversing with the wheel
+        # left yaws the other way, as a real car does). Every object keeps its
+        # rest offset from P, rotated by psi. Each wheel rolls the distance its
+        # own centre moves along the way it points, over its radius: outer
+        # wheels turn more than inner ones. Steering eases in over 15 frames
+        # and back out over the last 15. Assumes the imported objects have no
+        # rest rotation (the glTF importer bakes the axis change into the mesh).
+        TURN_END  = 91
+        turn_dist = 2 * distance
+        rest      = {o.name: o.location.copy() for o in movers}
+        radius    = {w.name: r for w, r in road_wheels}
+
+        def ease(f, a, b):
+            t = min(max((f - a) / (b - a), 0.0), 1.0)
+            return t * t * (3 - 2 * t)
+
+        turn_clips = (('turn_left_forward',   1.0,  1.0),
+                      ('turn_right_forward', -1.0,  1.0),
+                      ('turn_left_backward',  1.0, -1.0),
+                      ('turn_right_backward', -1.0, -1.0)) if can_turn else ()
+        if not can_turn:
+            print("  turn clips skipped: no separate front and rear wheels")
+        for clip, steer_sign, direction in turn_clips:
+            ds   = direction * turn_dist / (TURN_END - 1)
+            P    = rear_c.copy()
+            psi  = 0.0
+            roll = {n: 0.0 for n in radius}
+            prev = {n: rest[n].copy() for n in radius}
+            keys = {o.name: {'x': [], 'y': [], 'roll': [], 'yaw': []} for o in movers}
+            for f in range(1, TURN_END + 1):
+                delta = steer_sign * STEER * (ease(f, 1, 16) - ease(f, TURN_END - 15, TURN_END))
+                if f > 1:
+                    dpsi = ds * math.tan(delta) / wheelbase
+                    mid  = psi + dpsi / 2
+                    P   += Vector((fwd * math.cos(mid), fwd * math.sin(mid), 0.0)) * ds
+                    psi += dpsi
+                yaw = Matrix.Rotation(psi, 3, 'Z')
+                for o in movers:
+                    loc   = P + yaw @ (rest[o.name] - rear_c)
+                    steer = wheel_steer(o, delta) if o.name in front_names else 0.0
+                    if o.name in radius and f > 1:
+                        heading = Matrix.Rotation(psi + steer, 3, 'Z') @ Vector((1.0, 0.0, 0.0))
+                        roll[o.name] += (loc - prev[o.name]).dot(heading) / radius[o.name]
+                        prev[o.name] = loc.copy()
+                    k = keys[o.name]
+                    k['x'].append((f, loc.x))
+                    k['y'].append((f, loc.y))
+                    k['yaw'].append((f, psi + steer))
+                    if o.name in radius:
+                        k['roll'].append((f, roll[o.name]))
+            for o in movers:
+                k = keys[o.name]
+                curves = [('location', 0, k['x']), ('location', 1, k['y']),
+                          ('rotation_euler', 2, k['yaw'])]
+                if k['roll']:
+                    curves.append(('rotation_euler', rotation_axis, k['roll']))
+                add_clip(o, clip, curves)
+            print(f"  {clip}: yaw {math.degrees(psi):+.1f} deg over {turn_dist:.3f}")
+
+        print(f"  clips: drive, drive_forward/backward, steer_left/right, "
+              f"turn_left/right_forward/backward (steering {sorted(front_names)}, "
+              f"wheelbase {wheelbase:.3f})")
+
 # ── Export ────────────────────────────────────────────────────────────────────
+# A clip keys only the channels it moves (drive keys just the roll); the
+# rest come from each object's stored transform, which Blender overwrites
+# whenever it plays the NLA stack: a turn clip's final yaw ended up in
+# drive. Put every object back at rest, in Euler mode like the clips.
+for o in bpy.data.objects:
+    if o.name in rest_pose:
+        loc, _, rot, _ = rest_pose[o.name]
+        o.rotation_mode  = 'XYZ'
+        o.location       = loc
+        o.rotation_euler = rot
 bpy.ops.export_scene.gltf(
     filepath=output_path,
     export_format='GLB',
     export_animations=True,
+    # One animation per NLA track (= clip), each sampled with the object's
+    # other tracks muted. The default ACTIONS mode sampled each action with
+    # the other tracks still playing, so a turn clip's yaw leaked into drive.
+    export_animation_mode='NLA_TRACKS',
     export_nla_strips=True,
     export_current_frame=False,
     export_force_sampling=True,

@@ -1,8 +1,8 @@
 """
 blender_pipeline.py
 
-Shared script pipeline loop used by both run_vehicle_pipeline.py and
-run_mechanical_pipeline.py.  Import and call run_blender_pipeline().
+Script pipeline loop used by mechanical_pipeline.py.  Import and call
+run_blender_pipeline().
 """
 
 import os
@@ -47,7 +47,6 @@ def run_blender_pipeline(
     classify_json: str,
     results_dir: str,
     vehicle_dir: str,
-    mask_dir_valid: str | None,
     mechanical: bool = False,
 ) -> str:
     """
@@ -79,11 +78,6 @@ def run_blender_pipeline(
         if runner == 'blender':
             if script_name == 'classify_wheels.py':
                 extra = [tire_verts]
-                if mask_dir_valid and os.path.isdir(mask_dir_valid):
-                    extra.append(mask_dir_valid)
-                    log.info(f"classify_wheels: SAM2 mask_dir={mask_dir_valid}")
-                else:
-                    log.info("classify_wheels: no mask_dir, radius fallback")
             elif script_name == 'animatesam.py' and mechanical:
                 extra = ['--mechanical']
             else:
@@ -95,11 +89,6 @@ def run_blender_pipeline(
         else:  # python
             if script_name == 'find_tire_verts.py':
                 args = [glb_path, classify_json, tire_verts, texture_path]
-                if mask_dir_valid and os.path.isdir(mask_dir_valid):
-                    args.append(os.path.abspath(mask_dir_valid))
-                    log.info(f"find_tire_verts: SAM2 mask_dir={os.path.abspath(mask_dir_valid)}")
-                else:
-                    log.info("find_tire_verts: geometry-only (no mask_dir)")
             else:
                 args = [animated_path, rigged_path]
             cmd = [sys.executable, script] + args

@@ -131,7 +131,7 @@ def _build_skeleton(ss, utils, fx):
         copy.deepcopy(fx['joints']), glb, fx['classify'].get('rigid_parts', []))
     if skel is None:
         raise RuntimeError('skeleton_from_joints returned None')
-    return utils.inject_keyframes(skel)
+    return utils.inject_keyframes(skel, fx['classify'].get('object_type', ''))
 
 
 def stage_skeleton(ss, mesh, fx, skel):

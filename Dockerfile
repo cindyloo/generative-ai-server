@@ -25,17 +25,7 @@ RUN f=blender-${BLENDER_VERSION}-linux-x64.tar.xz; \
     && blender --background --factory-startup --version
 ENV BLENDER_PATH=/usr/local/bin/blender
 
-# SAM2 weights aren't in git; fetch the same checkpoint seg_server.py loads
-RUN mkdir -p /app/checkpoints \
-    && curl -fsSL -o /app/checkpoints/sam2.1_hiera_small.pt \
-         https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_small.pt
-
-# CPU-only torch (Railway has no GPU). The env var also reaches the isolated
-# build env pip creates for sam2, which needs torch to build; SAM2_BUILD_CUDA=0
-# skips its optional CUDA extension.
-ENV PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cpu \
-    SAM2_BUILD_CUDA=0 \
-    PIP_NO_CACHE_DIR=1 \
+ENV PIP_NO_CACHE_DIR=1 \
     PYTHONUNBUFFERED=1
 
 WORKDIR /app

@@ -982,6 +982,93 @@ def _validate_heat_weights(mesh_objects, armature_obj,
     return bad_fraction <= leak_fraction
 
 
+def tail_keep_fraction(along, bone_length, blend=0.25):
+    """
+    How much of a tail bone's weight a vertex keeps, from how far `along` the
+    bone's direction it sits from the bone's head: all of it behind the head
+    (along >= 0), none further forward than `blend` of the bone's length, and
+    a linear ramp between so the join doesn't crease. Pure numpy, so it can
+    be tested outside Blender.
+    """
+    import numpy as np
+    margin = max(blend * bone_length, 1e-6)
+    return np.clip((np.asarray(along) + margin) / margin, 0.0, 1.0)
+
+
+#: Bone-name parts for appendages that stick out of a body and should move
+#: on their own: a fish's or bird's tail, a fish's fins.
+APPENDAGE_PARTS = frozenset({'tail', 'fin', 'dorsal'})
+
+
+def confine_appendage_weights(mesh_objects, armature_obj):
+    """
+    Keep an appendage's weights on the appendage: tails and fins.
+
+    Skinning gives each vertex to the nearest bone. On a round body — a
+    pufferfish — the spine runs up the middle while the body bulges out
+    behind and to the sides, so the back of the body is nearer the tail
+    than the spine, and the sides are nearer the fins: the tail took 37% of
+    the fish and the fins 55%, and paddling a fin moved the side of the body
+    with it. Here an appendage bone keeps only the vertices beyond its own
+    head (plus a short blend); the rest of its weight goes to its parent.
+
+    Bones are matched on whole name parts (joint_fin_left_base), so a
+    finger is not a fin.
+    """
+    import numpy as np
+
+    appendage_bones = [b for b in armature_obj.data.bones
+                       if APPENDAGE_PARTS & set(b.name.lower().split('_'))
+                       and b.parent is not None]
+    if not appendage_bones:
+        return
+    world = armature_obj.matrix_world
+    for mesh_obj in mesh_objects:
+        groups = mesh_obj.vertex_groups
+        mat = mesh_obj.matrix_world
+        coords = np.array([tuple(mat @ v.co) for v in mesh_obj.data.vertices])
+        moved = 0.0
+        # Root-most first, so weight passed up from a tip can't land on a
+        # tail base that has already been confined.
+        for bone in sorted(appendage_bones, key=lambda b: len(b.parent_recursive)):
+            group = groups.get(bone.name)
+            parent = groups.get(bone.parent.name) or groups.new(name=bone.parent.name)
+            if group is None:
+                continue
+            head = np.array(tuple(world @ bone.head_local))
+            tail = np.array(tuple(world @ bone.tail_local))
+            length = float(np.linalg.norm(tail - head))
+            # The cut is square to the way the tail leaves its parent (body
+            # centre -> tail base), not to the tail bone itself: a tail that
+            # angles upward would otherwise tilt the cut through the top of
+            # the back and take that too.
+            outward = head - np.array(tuple(world @ bone.parent.head_local))
+            reach = float(np.linalg.norm(outward))
+            if length < 1e-6 or reach < 1e-6:
+                continue
+            along = (coords - head) @ (outward / reach)
+            keep = tail_keep_fraction(along, length)
+            for v in mesh_obj.data.vertices:
+                if keep[v.index] >= 1.0:
+                    continue
+                # Read membership from the vertex: group.weight() on a vertex
+                # outside the group raises, and Blender logs every one of
+                # those as "Error: Vertex not in group" even when caught.
+                w = next((g.weight for g in v.groups
+                          if g.group == group.index), None)
+                if w is None:
+                    continue   # not in this group
+                give = w * (1.0 - keep[v.index])
+                if keep[v.index] <= 0.0:
+                    group.remove([v.index])
+                else:
+                    group.add([v.index], w - give, 'REPLACE')
+                parent.add([v.index], give, 'ADD')
+                moved += give
+        print(f"  Appendage weights confined on {mesh_obj.name}: "
+              f"{moved:.1f} vertex-weight moved to parent bones")
+
+
 def skin_mesh(mesh_objects, armature_obj, skeleton_joints_data):
     """
     Try heat weighting first, fall back to segment weighting.
@@ -1086,11 +1173,12 @@ def build_armature(arm_data, joints, hierarchy, bone_names):
         if pb and cb:
             cb.parent = pb
             # use_connect=True snaps child head to parent tail.
-            # Only use it for straight chains (spine, leg, arm).
-            # Branching joints (hip, shoulder) must be False or they
-            # get snapped to the wrong position.
-            branch_parts = {'hip', 'shoulder', 'wing_base'}
-            is_branch = any(p in cname.lower() for p in branch_parts)
+            # Only use it for straight chains (spine, leg, arm): the child
+            # the parent's tail was built to point at. Any other child is a
+            # branch (hip, shoulder, fin, tail) and must be False or its head
+            # gets snapped to the wrong position — a fin's head pulled into
+            # the middle of the body, where it skinned the body's sides.
+            is_branch = children_map[parent_idx][0] != child_idx
             cb.use_connect = not is_branch
 
     n_bones = len(arm_data.edit_bones)
@@ -1289,6 +1377,7 @@ def rig_in_blender(mesh_path: str, joints: list, hierarchy: list,
 
         # ── Skin mesh to armature ─────────────────────────────────
         skin_mesh(mesh_objects, armature_obj, skeleton_joints_data)
+        confine_appendage_weights(mesh_objects, armature_obj)
 
         # ── Animations ────────────────────────────────────────────
         joint_hints = [j.get('hint') for j in skeleton_joints_data] if skeleton_joints_data else []
