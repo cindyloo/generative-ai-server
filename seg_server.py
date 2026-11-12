@@ -146,6 +146,8 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 _store        = ps.get_store()        # FIX 1: was ms.get_store()
 _rig_tasks    = {}
 _mesh_tasks   = {}
+_mesh_running = {}   # classify_id -> task_id of its mesh task still in progress
+_mesh_lock    = threading.Lock()
 _blender_lock = threading.Lock()
 
 
@@ -1771,6 +1773,10 @@ def _run_mesh_task(task_id: str, classify_id: str, img: Image.Image,
             os.unlink(pending_path)
         log.error(f"Mesh task {task_id} failed: {e}")
         _mesh_tasks[task_id] = {'status': 'error', 'error': str(e)}
+    finally:
+        with _mesh_lock:
+            if _mesh_running.get(classify_id) == task_id:
+                del _mesh_running[classify_id]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3017,8 +3023,19 @@ def mesh():
         # never arrived (the server restarted mid-task): poll it, don't resubmit.
         resume_id = None if force else pending_meshy_task(classify_id, mesh_hash)
 
-        task_id = str(uuid.uuid4())[:8]
-        _mesh_tasks[task_id] = {'status': 'started', 'progress': 0}
+        # One mesh task per record: a second /mesh while the first is still
+        # running (a client retry) gets that task back. Two would each
+        # download the mesh and decimate it in Blender at once, which can
+        # run a small container out of memory.
+        with _mesh_lock:
+            running = _mesh_running.get(classify_id)
+            if running:
+                log.info(f"Mesh task {running} already running for {classify_id}")
+                return jsonify({'status': 'processing', 'task_id': running,
+                                'classify_id': classify_id, 'already_running': True})
+            task_id = str(uuid.uuid4())[:8]
+            _mesh_running[classify_id] = task_id
+            _mesh_tasks[task_id] = {'status': 'started', 'progress': 0}
         threading.Thread(
             target=_run_mesh_task,
             args=(task_id, classify_id, img, object_type, mesh_hash, request.host,

@@ -281,8 +281,12 @@ STEER   = math.radians(25)
 END     = 61
 
 
+clip_range = {}   # clip -> (first, last) frame, for the holds added before export
+
+
 def add_clip(obj, clip, curves, interpolation='LINEAR'):
-    """curves: [(data_path, index, [(frame, value), ...]), ...]"""
+    """curves: [(data_path, index, [(frame, value), ...]), ...]; empty holds
+    obj at rest for the clip's whole range."""
     # The glTF importer leaves objects in quaternion mode, where Euler
     # keyframes are ignored: the body would slide round a turn without yawing.
     obj.rotation_mode = 'XYZ'
@@ -290,8 +294,10 @@ def add_clip(obj, clip, curves, interpolation='LINEAR'):
     # otherwise the exporter fills it from whatever the previous track it
     # sampled left behind (a turn clip's 44 deg yaw ended up in drive).
     loc, _, rot, _ = rest_pose[obj.name]
-    first = min(k[0][0] for _, _, k in curves)
-    last  = max(k[-1][0] for _, _, k in curves)
+    first = min((k[0][0] for _, _, k in curves), default=clip_range.get(clip, (1,))[0])
+    last  = max((k[-1][0] for _, _, k in curves), default=clip_range.get(clip, (0, END))[1])
+    lo, hi = clip_range.get(clip, (first, last))
+    clip_range[clip] = (min(lo, first), max(hi, last))
     given = {(path, idx) for path, idx, _ in curves}
     curves = list(curves) + [(path, i, [(first, base[i]), (last, base[i])])
                              for path, base in (('location', loc), ('rotation_euler', rot))
@@ -440,6 +446,20 @@ if road_wheels:
               f"turn_left/right_forward/backward (steering {sorted(front_names)}, "
               f"wheelbase {wheelbase:.3f})")
 
+# ── Every clip keys every moving part ─────────────────────────────────────────
+# A viewer switching clips leaves any channel the new clip doesn't key where
+# the old one left it: after turn_right, drive kept the body turned and moved
+# off, and steer_left the rear wheels mid-roll. So each part that moves in
+# any clip gets a track, held at rest, in every clip it isn't part of.
+animated = [o for o in bpy.data.objects
+            if o.name in rest_pose and o.animation_data and o.animation_data.nla_tracks]
+for clip in clip_range:
+    for o in animated:
+        if clip not in {t.name for t in o.animation_data.nla_tracks}:
+            add_clip(o, clip, [])
+if clip_range:
+    print(f"  every clip keys {sorted(o.name for o in animated)}")
+
 # ── Export ────────────────────────────────────────────────────────────────────
 # A clip keys only the channels it moves (drive keys just the roll); the
 # rest come from each object's stored transform, which Blender overwrites
@@ -462,6 +482,10 @@ bpy.ops.export_scene.gltf(
     export_nla_strips=True,
     export_current_frame=False,
     export_force_sampling=True,
+    # Keep channels that hold still (a wheel's position in drive): dropped,
+    # a viewer switching clips would leave them where the last clip put them.
+    export_optimize_animation_size=False,
+    export_optimize_animation_keep_anim_object=True,
     export_image_format='JPEG',
     export_jpeg_quality=75,
 )
