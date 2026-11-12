@@ -1898,6 +1898,7 @@ def augment_image():
     Generate two augmented variants of the active image via fal.ai.
     Reads active_image_path from the store.
     Client calls /augment_image/confirm to lock in choice.
+    Cached per record and prompt; ?force=true regenerates.
     """
     if request.method == 'GET':
         return jsonify({'status': 'ok'}), 200
@@ -1956,17 +1957,44 @@ def augment_image():
             pose_prompt = f"Repose the {object_type} in a neutral spread pose for 3D rigging."
  
         prompt = style_anchor + pose_prompt + " Clear white background."
- 
+
+        path_a = os.path.join(_rdir(classify_id), f"{classify_id}_augmented_a.png")
+        path_b = os.path.join(_rdir(classify_id), f"{classify_id}_augmented_b.png")
+        prompt_path = os.path.join(_rdir(classify_id), f"{classify_id}_augment_prompt.txt")
+
+        # Reuse the pair already made for this prompt. Regenerating costs a
+        # fal.ai call, and the new image, once confirmed, is newer than the
+        # record's mesh and differs from it, so /mesh would pay Meshy again
+        # for the same drawing. Regenerating would also re-pose the confirmed
+        # augmented image rather than the drawing. A pair from before the
+        # prompt was saved counts as made for this prompt.
+        force = request.args.get('force', '').lower() in ('1', 'true', 'yes')
+        if not force and os.path.exists(path_a) and os.path.exists(path_b):
+            try:
+                with open(prompt_path) as f:
+                    same_prompt = f.read() == prompt
+            except OSError:
+                same_prompt = True
+            if same_prompt:
+                log.info(f"Augment cache hit: {classify_id}")
+                return jsonify({
+                    'status':      'ok',
+                    'classify_id': classify_id,
+                    'image_a_url': _local_url(path_a, request.host),
+                    'image_b_url': _local_url(path_b, request.host),
+                    'cached':      True,
+                })
+
         log.info(f"Augment prompt: {prompt[:120]}...")
- 
+
         img        = Image.open(active_path).convert('RGB')
         img        = utils.resize_if_needed(img, max_size=1024)
         img_a, img_b = edit_image_fal(img, prompt)
- 
-        path_a = os.path.join(_rdir(classify_id), f"{classify_id}_augmented_a.png")
-        path_b = os.path.join(_rdir(classify_id), f"{classify_id}_augmented_b.png")
+
         img_a.save(path_a)
         img_b.save(path_b)
+        with open(prompt_path, 'w') as f:
+            f.write(prompt)
 
         # The user explicitly requested augmentation by calling this endpoint —
         # record that, regardless of what /classify originally decided. This
